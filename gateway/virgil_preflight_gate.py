@@ -102,6 +102,10 @@ _CACHE: Optional[tuple] = None  # (build_fn, render_fn, failures_dir, patterns_d
 _RECORDED_MODULES: set[str] = set()  # exact module keys we added during a successful exec
 
 
+def _cogitator_root() -> Path:
+    return Path(os.environ.get("COGITATOR_REPO_ROOT", DEFAULT_ROOT)).resolve()
+
+
 def _load_preflight() -> tuple:
     """Load + cache (build_fn, render_fn, failures_dir, patterns_dir) from COGITATOR_REPO_ROOT.
 
@@ -115,7 +119,7 @@ def _load_preflight() -> tuple:
     if _CACHE is not None:
         return _CACHE
 
-    root = Path(os.environ.get("COGITATOR_REPO_ROOT", DEFAULT_ROOT)).resolve()
+    root = _cogitator_root()
     if not root.is_dir():
         raise PreflightError("COGITATOR_ROOT_UNAVAILABLE", f"root not a dir: {root}")
     builder_path = (root / _BUILDER_FILE).resolve()
@@ -262,6 +266,91 @@ async def _send_failure(adapter, event, code: str, task: str) -> None:
         logger.exception("[virgil_preflight] failure-packet delivery raised; suppressed")
 
 
+def _preflight_event_id(event) -> str:
+    """Stable, safe correlation ID for one incoming /repo message.
+
+    Hashes platform/chat/thread/message identifiers so metrics can correlate build
+    and delivery events without persisting raw task text, message content, or IDs.
+    """
+    source = getattr(event, "source", None)
+    platform = getattr(getattr(source, "platform", None), "value", getattr(source, "platform", ""))
+    parts = [
+        "virgil-preflight-v1",
+        str(platform or ""),
+        str(getattr(source, "chat_id", "") or ""),
+        str(getattr(source, "thread_id", "") or ""),
+        str(getattr(event, "message_id", "") or ""),
+    ]
+    return hashlib.sha256("\x1f".join(parts).encode("utf-8")).hexdigest()
+
+
+def _empty_counts() -> dict[str, int]:
+    return {"failures:lesson": 0, "operating_patterns:pattern": 0, "skills:adopted": 0}
+
+
+def _base_loop_health_event(event, *, event_id: str) -> dict[str, Any]:
+    return {
+        "event_id": event_id,
+        "source": "hermes_gate",
+        "stage": "failed",
+        "outcome": "failed",
+        "no_match_reason": "",
+        "failure_code": "",
+        "packet_type": _PACKET_TYPE,
+        "records_considered_by_source_type": _empty_counts(),
+        "records_selected_by_source_type": _empty_counts(),
+        "corpus_sizes_by_source_type": _empty_counts(),
+        "render_succeeded": None,
+        "delivery_before_model": None,
+        "delivery_succeeded": None,
+    }
+
+
+def _event_from_packet_diagnostics(packet: dict[str, Any], event, *, event_id: str) -> dict[str, Any]:
+    payload = _base_loop_health_event(event, event_id=event_id)
+    diagnostics = packet.get("loop_health_diagnostics") if isinstance(packet, dict) else None
+    if isinstance(diagnostics, dict):
+        for key in (
+            "outcome",
+            "no_match_reason",
+            "records_considered_by_source_type",
+            "records_selected_by_source_type",
+            "corpus_sizes_by_source_type",
+        ):
+            if key in diagnostics:
+                payload[key] = diagnostics[key]
+    return payload
+
+
+def _record_loop_health_event(root: Path, payload: dict[str, Any]) -> None:
+    """Best-effort bridge into Cogitator PR #816's JSONL recorder.
+
+    Metrics failure must never unblock, block, or otherwise alter the fail-closed
+    gate decision. It is deliberately after delivery success and before model/tool
+    execution, or on failure paths before the failure notice is attempted.
+    """
+    try:
+        metrics_path = root / "cogitator_loop_health.py"
+        if not metrics_path.is_file():
+            logger.warning("[virgil_preflight] loop-health recorder missing at %s", metrics_path)
+            return
+        digest = hashlib.sha256(str(root).encode("utf-8")).hexdigest()[:16]
+        mod_name = f"cogitator_loop_health__{digest}"
+        spec = importlib.util.spec_from_file_location(mod_name, str(metrics_path))
+        if spec is None or spec.loader is None:
+            logger.warning("[virgil_preflight] loop-health recorder spec unavailable")
+            return
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        record_fn = getattr(module, "record_preflight_event", None)
+        if not callable(record_fn):
+            logger.warning("[virgil_preflight] loop-health recorder function missing")
+            return
+        record_fn(payload, log_path=root / "storage" / "metrics" / "virgil_preflight_events.jsonl")
+    except Exception:
+        logger.exception("[virgil_preflight] loop-health record failed; suppressed")
+
+
 # --------------------------------------------------------------------------- #
 # 4. Gate orchestration                                                       #
 # --------------------------------------------------------------------------- #
@@ -274,8 +363,20 @@ async def run_gate(adapter, event, parsed: RepoParse) -> bool:
     and task extraction cannot diverge.
     """
     task = parsed.task
+    root = _cogitator_root()
+    event_id = _preflight_event_id(event)
+    loop_payload = _base_loop_health_event(event, event_id=event_id)
     try:
         if parsed.outcome is RepoOutcome.MISSING_TASK:
+            loop_payload.update({
+                "stage": "failed",
+                "outcome": "failed",
+                "no_match_reason": "missing_task",
+                "failure_code": "MISSING_TASK",
+                "delivery_before_model": False,
+                "delivery_succeeded": False,
+            })
+            _record_loop_health_event(root, loop_payload)
             raise PreflightError("MISSING_TASK")
 
         build_fn, render_fn, failures_dir, patterns_dir = _load_preflight()
@@ -285,15 +386,42 @@ async def run_gate(adapter, event, parsed: RepoParse) -> bool:
                 task, failures_dir=str(failures_dir), patterns_dir=str(patterns_dir)
             )
         except Exception as e:
+            loop_payload.update({
+                "stage": "failed",
+                "outcome": "failed",
+                "failure_code": "PREFLIGHT_BUILD_FAILED",
+                "delivery_before_model": False,
+                "delivery_succeeded": False,
+            })
+            _record_loop_health_event(root, loop_payload)
             raise PreflightError("PREFLIGHT_BUILD_FAILED", repr(e))
         if not isinstance(packet, dict) or packet.get("packet_type") != _PACKET_TYPE:
+            loop_payload.update({
+                "stage": "failed",
+                "outcome": "failed",
+                "failure_code": "PREFLIGHT_BUILD_FAILED",
+                "delivery_before_model": False,
+                "delivery_succeeded": False,
+            })
+            _record_loop_health_event(root, loop_payload)
             raise PreflightError("PREFLIGHT_BUILD_FAILED", "invalid packet result")
+
+        loop_payload = _event_from_packet_diagnostics(packet, event, event_id=event_id)
 
         try:
             message = render_fn(packet)
             if not isinstance(message, str) or not message.strip():
                 raise ValueError("empty render")
         except Exception as e:
+            loop_payload.update({
+                "stage": "failed",
+                "outcome": "failed",
+                "failure_code": "PREFLIGHT_RENDER_FAILED",
+                "render_succeeded": False,
+                "delivery_before_model": False,
+                "delivery_succeeded": False,
+            })
+            _record_loop_health_event(root, loop_payload)
             raise PreflightError("PREFLIGHT_RENDER_FAILED", repr(e))
 
         try:
@@ -301,13 +429,49 @@ async def run_gate(adapter, event, parsed: RepoParse) -> bool:
                 chat_id=event.source.chat_id, content=message, **_send_kwargs(adapter, event)
             )
         except Exception as e:  # success-packet send RAISES
+            loop_payload.update({
+                "stage": "failed",
+                "outcome": "failed",
+                "failure_code": "PREFLIGHT_DELIVERY_FAILED",
+                "render_succeeded": True,
+                "delivery_before_model": False,
+                "delivery_succeeded": False,
+            })
+            _record_loop_health_event(root, loop_payload)
             raise PreflightError("PREFLIGHT_DELIVERY_FAILED", repr(e))
         if not getattr(result, "success", False):  # success-packet send returns success=False
+            loop_payload.update({
+                "stage": "failed",
+                "outcome": "failed",
+                "failure_code": "PREFLIGHT_DELIVERY_FAILED",
+                "render_succeeded": True,
+                "delivery_before_model": False,
+                "delivery_succeeded": False,
+            })
+            _record_loop_health_event(root, loop_payload)
             raise PreflightError("PREFLIGHT_DELIVERY_FAILED", getattr(result, "error", "") or "")
 
+        loop_payload.update({
+            "source": "hermes_gate",
+            "stage": "delivered",
+            "render_succeeded": True,
+            "delivery_before_model": True,
+            "delivery_succeeded": True,
+            "failure_code": "",
+        })
+        _record_loop_health_event(root, loop_payload)
         return True
 
     except PreflightError as pe:
+        if pe.code in {"COGITATOR_ROOT_UNAVAILABLE", "PREFLIGHT_IMPORT_FAILED"}:
+            loop_payload.update({
+                "stage": "failed",
+                "outcome": "failed",
+                "failure_code": pe.code,
+                "delivery_before_model": False,
+                "delivery_succeeded": False,
+            })
+            _record_loop_health_event(root, loop_payload)
         logger.warning("[virgil_preflight] gate failed code=%s detail=%s", pe.code, pe.detail)
         await _send_failure(adapter, event, pe.code, task)
         return False
