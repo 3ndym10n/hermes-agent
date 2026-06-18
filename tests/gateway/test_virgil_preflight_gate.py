@@ -39,10 +39,13 @@ from gateway.virgil_preflight_gate import (
 # Fixtures / helpers                                                          #
 # --------------------------------------------------------------------------- #
 @pytest.fixture(autouse=True)
-def _clean_gate_state():
-    """Each test starts and ends with a pristine loader cache."""
+def _clean_gate_state(monkeypatch, tmp_path):
+    """Each test starts and ends with a pristine loader cache and no real metrics writes."""
     reset_preflight_cache_for_tests()
     gate._CACHE = None
+    fake_root = tmp_path / "default_cogitator_root"
+    fake_root.mkdir()
+    monkeypatch.setenv("COGITATOR_REPO_ROOT", str(fake_root))
     yield
     reset_preflight_cache_for_tests()
     gate._CACHE = None
@@ -175,6 +178,151 @@ async def test_run_gate_success_orders_build_render_send():
     assert [e[0] for e in adapter.events] == ["build", "render", "send"]
     assert adapter.events[0] == ("build", "fix it")
     assert "PREFLIGHT MESSAGE" in adapter.events[2][1]
+
+
+@pytest.mark.asyncio
+async def test_success_records_delivery_after_send_before_normal_processing(monkeypatch):
+    adapter = DummyTelegramAdapter()
+
+    def _build(task, failures_dir=None, patterns_dir=None):
+        adapter.events.append(("build", task))
+        return {
+            "packet_type": "virgil_preflight_v0",
+            "task_description": task,
+            "loop_health_diagnostics": {
+                "source": "cogitator_builder",
+                "stage": "built",
+                "outcome": "matched",
+                "records_considered_by_source_type": {"failures:lesson": 2},
+                "records_selected_by_source_type": {"failures:lesson": 1},
+            },
+        }
+
+    records = []
+
+    def _record(root, payload):
+        adapter.events.append(("record", payload.get("stage")))
+        records.append(dict(payload))
+
+    monkeypatch.setattr(gate, "_record_loop_health_event", _record, raising=False)
+    _install_cache(adapter, build=_build)
+    _instrument_normal_path(adapter)
+    event = _make_event("/repo fix it", chat_id="chat-secret", message_id="msg-1")
+
+    await adapter.handle_message(event)
+    await _drain(adapter)
+
+    assert [e[0] for e in adapter.events] == ["build", "render", "send", "record", "start_processing", "handler"]
+    assert len(records) == 1
+    record = records[0]
+    assert record["stage"] == "delivered"
+    assert record["outcome"] == "matched"
+    assert record["delivery_succeeded"] is True
+    assert record["delivery_before_model"] is True
+    assert record["render_succeeded"] is True
+    assert record["failure_code"] == ""
+    assert record["records_considered_by_source_type"] == {"failures:lesson": 2}
+    assert record["records_selected_by_source_type"] == {"failures:lesson": 1}
+    assert record["event_id"]
+    assert "fix it" not in str(record)
+    assert "chat-secret" not in str(record)
+    assert "msg-1" not in str(record)
+
+
+@pytest.mark.asyncio
+async def test_delivery_failure_records_failure_and_never_reaches_handler(monkeypatch):
+    adapter = DummyTelegramAdapter(send_behavior="fail")
+    records = []
+    monkeypatch.setattr(gate, "_record_loop_health_event", lambda root, payload: records.append(dict(payload)), raising=False)
+    _install_cache(adapter)
+    _instrument_normal_path(adapter)
+    event = _make_event("/repo do x")
+
+    await adapter.handle_message(event)
+    await _drain(adapter)
+
+    kinds = [e[0] for e in adapter.events]
+    assert "start_processing" not in kinds
+    assert "handler" not in kinds
+    assert len(records) == 1
+    assert records[0]["stage"] == "failed"
+    assert records[0]["outcome"] == "failed"
+    assert records[0]["failure_code"] == "PREFLIGHT_DELIVERY_FAILED"
+    assert records[0]["delivery_succeeded"] is False
+    assert records[0]["delivery_before_model"] is False
+
+
+@pytest.mark.asyncio
+async def test_render_failure_records_failure_without_delivery_or_handler(monkeypatch):
+    adapter = DummyTelegramAdapter()
+    records = []
+    monkeypatch.setattr(gate, "_record_loop_health_event", lambda root, payload: records.append(dict(payload)), raising=False)
+
+    def _boom_render(packet):
+        raise ValueError("render boom")
+
+    _install_cache(adapter, render=_boom_render)
+    _instrument_normal_path(adapter)
+    event = _make_event("/repo do x")
+
+    await adapter.handle_message(event)
+    await _drain(adapter)
+
+    kinds = [e[0] for e in adapter.events]
+    assert "start_processing" not in kinds
+    assert "handler" not in kinds
+    assert len(records) == 1
+    assert records[0]["stage"] == "failed"
+    assert records[0]["failure_code"] == "PREFLIGHT_RENDER_FAILED"
+    assert records[0]["render_succeeded"] is False
+    assert records[0]["delivery_succeeded"] is False
+
+
+@pytest.mark.asyncio
+async def test_import_load_failure_records_failure_when_cogitator_root_exists(monkeypatch, tmp_path):
+    (tmp_path / "cogitator_virgil_preflight.py").write_text("raise RuntimeError('boom import')\n")
+    monkeypatch.setenv("COGITATOR_REPO_ROOT", str(tmp_path))
+    reset_preflight_cache_for_tests()
+    adapter = DummyTelegramAdapter()
+    records = []
+    monkeypatch.setattr(gate, "_record_loop_health_event", lambda root, payload: records.append(dict(payload)), raising=False)
+    event = _make_event("/repo do x")
+    parsed = parse_repo_command(event.text, "hermes_bot")
+
+    assert await run_gate(adapter, event, parsed) is False
+
+    assert len(records) == 1
+    assert records[0]["stage"] == "failed"
+    assert records[0]["failure_code"] == "PREFLIGHT_IMPORT_FAILED"
+    assert records[0]["event_id"]
+    assert "do x" not in str(records[0])
+
+
+def test_record_loop_health_event_imports_cogitator_recorder_and_writes_jsonl(tmp_path):
+    (tmp_path / "cogitator_loop_health.py").write_text(
+        "import json\n"
+        "from pathlib import Path\n"
+        "def record_preflight_event(payload, *, log_path):\n"
+        "    p = Path(log_path)\n"
+        "    p.parent.mkdir(parents=True, exist_ok=True)\n"
+        "    with p.open('a', encoding='utf-8') as fh:\n"
+        "        fh.write(json.dumps(payload, sort_keys=True) + '\\\\n')\n",
+        encoding="utf-8",
+    )
+
+    gate._record_loop_health_event(
+        tmp_path,
+        {
+            "event_id": "safe-id",
+            "stage": "delivered",
+            "outcome": "matched",
+            "delivery_before_model": True,
+        },
+    )
+
+    metrics_path = tmp_path / "storage" / "metrics" / "virgil_preflight_events.jsonl"
+    assert metrics_path.exists()
+    assert '"event_id": "safe-id"' in metrics_path.read_text(encoding="utf-8")
 
 
 # --------------------------------------------------------------------------- #
