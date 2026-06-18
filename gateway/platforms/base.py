@@ -3941,6 +3941,34 @@ class BasePlatformAdapter(ABC):
         # downstream delivery all agree on the same lane.
         self._apply_topic_recovery(event)
 
+        # --- Virgil repository-task preflight gate (Telegram-only, fail-closed) ---
+        # Runs after coerce_plaintext_gateway_command + _apply_topic_recovery (both
+        # deterministic, no model/planner/tool/external-write activity) so recovered
+        # topic/thread metadata is available for the preflight reply — but before
+        # session-key construction, the active-session guard, hooks, the background
+        # task, and every _message_handler call. On preflight failure we return here
+        # and never reach any model/planner/tool-lookup activity. V0 is intentionally
+        # restricted to Telegram; other platforms keep their normal /repo behaviour.
+        if event.source is not None and event.source.platform == Platform.TELEGRAM:
+            from gateway.virgil_preflight_gate import (
+                RepoOutcome,
+                parse_repo_command,
+                run_gate,
+            )
+
+            _bot_username = getattr(getattr(self, "_bot", None), "username", None)
+            _repo_parsed = parse_repo_command(event.text, _bot_username)  # parsed exactly once
+            if _repo_parsed.outcome is not RepoOutcome.NO_MATCH:
+                if not await run_gate(self, event, _repo_parsed):
+                    return  # preflight failed -> never reach hook / model / planner / tools
+                # Replace with a clean, internally consistent event: clean task text +
+                # TEXT type so get_command()/is_command() (pure functions of text) and
+                # message_type all agree. Preserves source/message_id/raw_message/etc.
+                event = dataclasses.replace(
+                    event, text=_repo_parsed.task, message_type=MessageType.TEXT
+                )
+        # --- end Virgil preflight gate ---
+
         session_key = build_session_key(
             event.source,
             group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
