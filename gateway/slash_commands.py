@@ -1104,6 +1104,173 @@ class GatewaySlashCommandsMixin:
             "Next action: inspect Cogitator loop-health report builder."
         )
 
+    def _load_cogitator_app_module(self):
+        """Load Cogitator's app.py lazily for gateway command proxying."""
+        import importlib.util
+
+        root = Path(os.environ.get("COGITATOR_REPO_ROOT", "/home/v0id/Projects/Cogitator_clean")).resolve()
+        module_path = root / "app.py"
+        if not module_path.is_file():
+            raise FileNotFoundError(f"Cogitator app.py not found at {module_path}")
+
+        try:
+            from dotenv import load_dotenv
+            load_dotenv(root / ".env", override=False)
+        except Exception:
+            logger.debug("Cogitator .env preload skipped", exc_info=True)
+
+        digest = hashlib.sha256(str(module_path).encode("utf-8")).hexdigest()[:12]
+        spec = importlib.util.spec_from_file_location(
+            f"cogitator_gateway_app__{digest}",
+            module_path,
+        )
+        if spec is None or spec.loader is None:
+            raise RuntimeError(f"Could not load Cogitator app module from {module_path}")
+
+        module = importlib.util.module_from_spec(spec)
+        old_path = list(sys.path)
+        old_dont_write_bytecode = sys.dont_write_bytecode
+        sys.dont_write_bytecode = True
+        sys.path.insert(0, str(root))
+        try:
+            spec.loader.exec_module(module)
+        finally:
+            sys.path[:] = old_path
+            sys.dont_write_bytecode = old_dont_write_bytecode
+        return module
+
+    def _cogitator_review_state_for(self, event: MessageEvent) -> dict[str, Any]:
+        states = getattr(self, "_cogitator_review_pages", None)
+        if not isinstance(states, dict):
+            states = {}
+            setattr(self, "_cogitator_review_pages", states)
+        key = build_session_key(event.source)
+        state = states.get(key)
+        if not isinstance(state, dict):
+            state = {}
+            states[key] = state
+        return state
+
+    def _clear_cogitator_review_state(self, event: MessageEvent) -> None:
+        states = getattr(self, "_cogitator_review_pages", None)
+        if isinstance(states, dict):
+            states.pop(build_session_key(event.source), None)
+
+    async def _handle_cogitator_review_command(self, event: MessageEvent) -> str:
+        """Proxy /review to Cogitator without entering the model loop."""
+        try:
+            cog = self._load_cogitator_app_module()
+            results = cog.get_review_notes()
+        except Exception as exc:
+            logger.exception("Cogitator /review proxy failed")
+            return (
+                "Cogitator review queue unavailable.\n"
+                f"Reason: {type(exc).__name__}.\n"
+                "Next action: inspect Cogitator runtime/import configuration."
+            )
+
+        if not results:
+            self._clear_cogitator_review_state(event)
+            return "No review items."
+
+        enrichment_by_note_id = cog.get_enrichment_review_summaries([row[0] for row in results])
+        state = self._cogitator_review_state_for(event)
+        state["rows"] = results
+        state["enrichment"] = enrichment_by_note_id
+        state["page"] = 1
+
+        msg = (
+            "📌 Review Queue (page 1):\n"
+            "Actions apply to the items shown on this page until you run /review or another /review_page.\n\n"
+        )
+        msg += cog.render_review_rows(results, start_index=1, enrichment_by_note_id=enrichment_by_note_id)
+        return msg.strip()
+
+    async def _handle_cogitator_review_page_command(self, event: MessageEvent) -> str:
+        """Proxy /review_page <n> to Cogitator without entering the model loop."""
+        raw_args = event.get_command_args().strip()
+        if not raw_args:
+            return "Usage: /review_page <page_number>  Example: /review_page 2"
+        try:
+            page = int(raw_args.split()[0])
+        except ValueError:
+            return "Page number must be a whole number. Example: /review_page 2"
+        if page < 1:
+            return "Page number must be 1 or higher."
+
+        try:
+            cog = self._load_cogitator_app_module()
+            total = cog.get_review_notes_count()
+            page_size = getattr(cog, "REVIEW_PAGE_SIZE", 10)
+            total_pages = max(1, (total + page_size - 1) // page_size)
+            results = cog.get_review_notes_page(page)
+        except Exception as exc:
+            logger.exception("Cogitator /review_page proxy failed")
+            return (
+                "Cogitator review page unavailable.\n"
+                f"Reason: {type(exc).__name__}.\n"
+                "Next action: inspect Cogitator runtime/import configuration."
+            )
+
+        start = (page - 1) * page_size + 1
+        end = start + len(results) - 1
+        if not results:
+            return f"No items on page {page}. Total: {total} item(s) across {total_pages} page(s)."
+
+        enrichment_by_note_id = cog.get_enrichment_review_summaries([row[0] for row in results])
+        state = self._cogitator_review_state_for(event)
+        state["rows"] = results
+        state["enrichment"] = enrichment_by_note_id
+        state["page"] = page
+
+        header = (
+            f"Review Queue — Page {page}/{total_pages} (items {start}–{end} of {total})\n"
+            "Actions apply to the items shown on this page until you run /review or another /review_page.\n\n"
+        )
+        body = cog.render_review_rows(results, start_index=1, enrichment_by_note_id=enrichment_by_note_id)
+        return (header + body).strip()
+
+    async def _handle_cogitator_promote_command(self, event: MessageEvent) -> str:
+        """Proxy /promote <n>, resolving n against the visible review page."""
+        raw_args = event.get_command_args().strip()
+        if not raw_args:
+            return "Usage: /promote <current-page-number>"
+        try:
+            index = int(raw_args.split()[0]) - 1
+        except ValueError:
+            return "Use a current-page number. Example: /promote 1"
+
+        state = self._cogitator_review_state_for(event)
+        review_items = state.get("rows")
+        if not review_items:
+            return "Run /review or /review_page <n> first so /promote can use the currently visible page numbers."
+        if index < 0 or index >= len(review_items):
+            return "Invalid review item number."
+
+        note_id = review_items[index][0]
+        try:
+            cog = self._load_cogitator_app_module()
+            if not cog.get_note_by_id(note_id):
+                return "Could not find source note."
+            result = cog.promote_note_by_id(note_id)
+        except Exception as exc:
+            if type(exc).__name__ == "PromotedRetrievalMetadataError":
+                logger.exception("Cogitator /promote retrieval metadata failed")
+                return "⚠️ Promote failed: retrieval metadata/keys missing or invalid. Check runtime logs."
+            if type(exc).__name__ == "PromotedAssetGenerationError":
+                logger.exception("Cogitator /promote asset generation failed")
+                return "⚠️ Promoted asset generation failed. Check runtime logs."
+            logger.exception("Cogitator /promote proxy failed")
+            return "⚠️ Promote failed. Check runtime logs."
+
+        self._clear_cogitator_review_state(event)
+        return (
+            f"Promoted to {result['promotion_type']}:\n{result['title']}\n\n"
+            f"Saved to:\n{result['promoted_path']}"
+            f"\nRetrieval record:\n{result['retrieval_record_path']}"
+            "\n\nRun /review or /review_page <n> to refresh the queue."
+        )
+
     async def _handle_model_command(self, event: MessageEvent) -> Optional[str]:
         """Handle /model command — switch model for this session.
 

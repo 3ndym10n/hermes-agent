@@ -212,6 +212,12 @@ COMMAND_REGISTRY: list[CommandDef] = [
                gateway_only=True, args_hint="[page]"),
     CommandDef("loop-health", "Show Cogitator /repo preflight loop-health report", "Info",
                gateway_only=True, aliases=("loop_health",)),
+    CommandDef("review", "Show Cogitator review queue page 1", "Info",
+               gateway_only=True),
+    CommandDef("review-page", "Show a Cogitator review queue page", "Info",
+               gateway_only=True, aliases=("review_page",), args_hint="<page_number>"),
+    CommandDef("promote", "Promote a Cogitator item from the current review page", "Info",
+               gateway_only=True, args_hint="<current-page-number>"),
     CommandDef("help", "Show available commands", "Info"),
     CommandDef("restart", "Gracefully restart the gateway after draining active runs", "Session",
                gateway_only=True),
@@ -357,6 +363,9 @@ ACTIVE_SESSION_BYPASS_COMMANDS: frozenset[str] = frozenset(
         "deny",
         "help",
         "loop-health",
+        "promote",
+        "review",
+        "review-page",
         "new",
         "profile",
         "queue",
@@ -1057,7 +1066,10 @@ _SLACK_PRIORITY_ALIASES = ("btw", "bg")
 # "Slack-via-/hermes" decision, not a silent clamp.
 #   - credits: the billing/top-up surface; reached via /hermes credits on Slack.
 #   - debug: the log/report upload surface; reached via /hermes debug on Slack.
-_SLACK_VIA_HERMES_ONLY = frozenset({"credits", "debug"})
+#   - review/review-page/promote: Cogitator Telegram runtime-proof commands;
+#     Slack can still type /hermes review, but these should not evict general
+#     Hermes controls from the 50-command native Slack manifest.
+_SLACK_VIA_HERMES_ONLY = frozenset({"credits", "debug", "promote", "review", "review-page"})
 
 
 def _sanitize_slack_name(raw: str) -> str:

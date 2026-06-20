@@ -7283,6 +7283,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     return await self._handle_commands_command(event)
                 if _cmd_def_inner.name == "loop-health":
                     return await self._handle_loop_health_command(event)
+                if _cmd_def_inner.name == "review":
+                    return await self._handle_cogitator_review_command(event)
+                if _cmd_def_inner.name == "review-page":
+                    return await self._handle_cogitator_review_page_command(event)
+                if _cmd_def_inner.name == "promote":
+                    return await self._handle_cogitator_promote_command(event)
                 if _cmd_def_inner.name == "profile":
                     return await self._handle_profile_command(event)
                 if _cmd_def_inner.name == "update":
@@ -7546,6 +7552,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if canonical == "loop-health":
             return await self._handle_loop_health_command(event)
+
+        if canonical == "review":
+            return await self._handle_cogitator_review_command(event)
+
+        if canonical == "review-page":
+            return await self._handle_cogitator_review_page_command(event)
+
+        if canonical == "promote":
+            return await self._handle_cogitator_promote_command(event)
         
         if canonical == "profile":
             return await self._handle_profile_command(event)
