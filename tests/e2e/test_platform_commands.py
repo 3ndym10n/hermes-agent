@@ -11,6 +11,7 @@ Tests are parametrized over platforms via the ``platform`` fixture in conftest.
 """
 
 import asyncio
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -121,6 +122,103 @@ class TestSlashCommands:
         response_text = send.call_args[1].get("content") or send.call_args[0][1]
         assert "Unknown command" in response_text
         assert "/not_loop_health" in response_text
+        runner._handle_message_with_agent.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_cogitator_review_returns_queue_without_agent(self, adapter, runner, platform):
+        rows = [(42, "Issue 4 proof note", "summary", 5, 0)]
+        cog = SimpleNamespace(
+            get_review_notes=MagicMock(return_value=rows),
+            get_enrichment_review_summaries=MagicMock(return_value={}),
+            render_review_rows=MagicMock(return_value="1. Issue 4 proof note (Score: 5)\n"),
+        )
+        runner._load_cogitator_app_module = MagicMock(return_value=cog)
+        runner._handle_message_with_agent = AsyncMock(
+            side_effect=AssertionError("/review must not call the model/agent")
+        )
+
+        send = await send_and_capture(adapter, "/review", platform)
+
+        send.assert_called_once()
+        response_text = send.call_args[1].get("content") or send.call_args[0][1]
+        assert "Review Queue (page 1)" in response_text
+        assert "Issue 4 proof note" in response_text
+        assert runner._cogitator_review_pages
+        runner._handle_message_with_agent.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_cogitator_review_page_returns_queue_without_agent(self, adapter, runner, platform):
+        rows = [(202, "Page 2 proof note", "summary", 4, 0)]
+        cog = SimpleNamespace(
+            REVIEW_PAGE_SIZE=10,
+            get_review_notes_count=MagicMock(return_value=11),
+            get_review_notes_page=MagicMock(return_value=rows),
+            get_enrichment_review_summaries=MagicMock(return_value={}),
+            render_review_rows=MagicMock(return_value="1. Page 2 proof note (Score: 4)\n"),
+        )
+        runner._load_cogitator_app_module = MagicMock(return_value=cog)
+        runner._handle_message_with_agent = AsyncMock(
+            side_effect=AssertionError("/review_page must not call the model/agent")
+        )
+
+        send = await send_and_capture(adapter, "/review_page 2", platform)
+
+        send.assert_called_once()
+        response_text = send.call_args[1].get("content") or send.call_args[0][1]
+        assert "Review Queue — Page 2/2" in response_text
+        assert "Page 2 proof note" in response_text
+        cog.get_review_notes_page.assert_called_once_with(2)
+        runner._handle_message_with_agent.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_cogitator_promote_requires_current_review_page(self, adapter, runner, platform):
+        runner._load_cogitator_app_module = MagicMock(
+            side_effect=AssertionError("/promote without review page must not load Cogitator")
+        )
+        runner._handle_message_with_agent = AsyncMock(
+            side_effect=AssertionError("/promote must not call the model/agent")
+        )
+
+        send = await send_and_capture(adapter, "/promote 1", platform)
+
+        send.assert_called_once()
+        response_text = send.call_args[1].get("content") or send.call_args[0][1]
+        assert "Run /review or /review_page" in response_text
+        runner._handle_message_with_agent.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_cogitator_promote_uses_selected_visible_review_note_id(self, adapter, runner, platform):
+        rows = [
+            (101, "First visible note", "summary", 5, 0),
+            (202, "Second visible note", "summary", 5, 0),
+        ]
+        cog = SimpleNamespace(
+            get_review_notes=MagicMock(return_value=rows),
+            get_enrichment_review_summaries=MagicMock(return_value={}),
+            render_review_rows=MagicMock(return_value="1. First visible note\n2. Second visible note\n"),
+            get_note_by_id=MagicMock(return_value=(202, "Second visible note")),
+            promote_note_by_id=MagicMock(return_value={
+                "promotion_type": "cogitator_design_principle",
+                "title": "Second visible note",
+                "promoted_path": "storage/promoted/second.md",
+                "retrieval_record_path": "storage/promoted/second.retrieval.md",
+            }),
+        )
+        runner._load_cogitator_app_module = MagicMock(return_value=cog)
+        runner._handle_message_with_agent = AsyncMock(
+            side_effect=AssertionError("/promote must not call the model/agent")
+        )
+
+        await send_and_capture(adapter, "/review", platform)
+        send = await send_and_capture(adapter, "/promote 2", platform)
+
+        send.assert_called_once()
+        response_text = send.call_args[1].get("content") or send.call_args[0][1]
+        assert "Promoted to cogitator_design_principle" in response_text
+        assert "Saved to:\nstorage/promoted/second.md" in response_text
+        assert "Retrieval record:\nstorage/promoted/second.retrieval.md" in response_text
+        cog.get_note_by_id.assert_called_once_with(202)
+        cog.promote_note_by_id.assert_called_once_with(202)
         runner._handle_message_with_agent.assert_not_awaited()
 
     @pytest.mark.asyncio

@@ -198,6 +198,21 @@ class TestGatewayKnownCommands:
         assert cmd.name == "loop-health"
         assert cmd.gateway_only is True
 
+    def test_cogitator_review_promote_commands_are_gateway_known(self):
+        assert "review" in GATEWAY_KNOWN_COMMANDS
+        assert "review-page" in GATEWAY_KNOWN_COMMANDS
+        assert "review_page" in GATEWAY_KNOWN_COMMANDS
+        assert "promote" in GATEWAY_KNOWN_COMMANDS
+
+        review_page = resolve_command("review_page")
+        assert review_page is not None
+        assert review_page.name == "review-page"
+        assert review_page.gateway_only is True
+
+        promote = resolve_command("promote")
+        assert promote is not None
+        assert promote.gateway_only is True
+
     def test_is_frozenset(self):
         assert isinstance(GATEWAY_KNOWN_COMMANDS, frozenset)
 
