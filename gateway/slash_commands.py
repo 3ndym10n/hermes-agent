@@ -1271,6 +1271,93 @@ class GatewaySlashCommandsMixin:
             "\n\nRun /review or /review_page <n> to refresh the queue."
         )
 
+    def _context_checkpoint_config(self) -> tuple[bool, str]:
+        """Resolve the default-off ``context_checkpoint`` gate and bridge base URL.
+
+        Returns ``(enabled, base_url)``. Fails closed (disabled) on any config
+        error. Never reads or requires secrets/``.env`` — only the plain,
+        non-secret gateway config keys. The bearer token is sourced separately,
+        from the environment only.
+        """
+        try:
+            from gateway.run import _load_gateway_config
+
+            config = _load_gateway_config()
+        except Exception:
+            return False, ""
+        enabled = is_truthy_value(
+            cfg_get(config, "context_checkpoint", "enabled", default=False), default=False
+        )
+        base_url = str(cfg_get(config, "context_checkpoint", "base_url", default="") or "").strip()
+        return enabled, base_url
+
+    async def _handle_context_checkpoint_command(self, event: MessageEvent) -> str:
+        """Handle /context_checkpoint — request a read-only Cogitator checkpoint.
+
+        Context Rotation V0-D, manual only. When disabled (the default) this
+        returns a short notice and never contacts Cogitator. When enabled it
+        POSTs a draft-only ``build_context_checkpoint`` bridge request (bearer
+        token from the COGITATOR_BRIDGE_TOKEN environment variable only),
+        validates the read-only response fail-closed, and renders the checkpoint
+        back to this chat. It does NOT enter the model loop, rotate context,
+        create a thread/session, inject a checkpoint, persist anything, or call a
+        provider/model.
+        """
+        import os
+
+        enabled, base_url = self._context_checkpoint_config()
+        if not enabled:
+            return (
+                "Context checkpoint is disabled.\n"
+                "Enable it with context_checkpoint.enabled: true in the gateway config to "
+                "request a read-only Cogitator checkpoint.\n"
+                "Auto-rotation is not implemented and remains off."
+            )
+
+        from gateway.cogitator_checkpoint_bridge import (
+            CheckpointBridgeError,
+            TOKEN_ENV,
+            render_checkpoint_message,
+            request_context_checkpoint,
+        )
+
+        token = str(os.environ.get(TOKEN_ENV, "") or "").strip()
+        if not base_url or not token:
+            return (
+                "Context checkpoint is not configured.\n"
+                "Set context_checkpoint.base_url in the gateway config and the "
+                f"{TOKEN_ENV} environment variable to enable read-only checkpoint requests.\n"
+                "Auto-rotation is not implemented and remains off."
+            )
+
+        current_state = event.get_command_args().strip()
+        if not current_state:
+            return (
+                "Usage: /context_checkpoint <current state to checkpoint>\n"
+                "Provide the current-state text to include in the read-only checkpoint."
+            )
+
+        try:
+            response = request_context_checkpoint(
+                {"current_state": current_state}, base_url=base_url, token=token
+            )
+        except CheckpointBridgeError as exc:
+            logger.warning("[context_checkpoint] bridge error code=%s", exc.code)
+            return (
+                "Context checkpoint unavailable.\n"
+                f"Reason: {exc.code}.\n"
+                "Next action: verify context_checkpoint.base_url and the deployed Cogitator bridge."
+            )
+        except Exception:
+            logger.exception("[context_checkpoint] unexpected error")
+            return (
+                "Context checkpoint failed.\n"
+                "Reason: unexpected error.\n"
+                "Next action: inspect gateway logs."
+            )
+
+        return render_checkpoint_message(response)
+
     async def _handle_model_command(self, event: MessageEvent) -> Optional[str]:
         """Handle /model command — switch model for this session.
 

@@ -213,6 +213,20 @@ class TestGatewayKnownCommands:
         assert promote is not None
         assert promote.gateway_only is True
 
+    def test_context_checkpoint_command_is_gateway_known_with_alias(self):
+        assert "context-checkpoint" in GATEWAY_KNOWN_COMMANDS
+        assert "context_checkpoint" in GATEWAY_KNOWN_COMMANDS
+
+        canonical = resolve_command("context-checkpoint")
+        assert canonical is not None
+        assert canonical.name == "context-checkpoint"
+        assert canonical.gateway_only is True
+
+        alias = resolve_command("context_checkpoint")
+        assert alias is not None
+        assert alias.name == "context-checkpoint"
+        assert alias.gateway_only is True
+
     def test_is_frozenset(self):
         assert isinstance(GATEWAY_KNOWN_COMMANDS, frozenset)
 

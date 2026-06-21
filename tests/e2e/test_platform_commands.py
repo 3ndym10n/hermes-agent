@@ -222,6 +222,227 @@ class TestSlashCommands:
         runner._handle_message_with_agent.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_context_checkpoint_disabled_by_default_returns_notice(
+        self, adapter, runner, platform, monkeypatch
+    ):
+        """Default-off: returns a disabled notice and never contacts Cogitator."""
+        import gateway.cogitator_checkpoint_bridge as bridge_mod
+        from gateway import run as gateway_run
+
+        # Real default-off gate: no context_checkpoint config present.
+        monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
+        monkeypatch.setenv("COGITATOR_BRIDGE_TOKEN", "should-not-be-used")
+        monkeypatch.setattr(
+            bridge_mod,
+            "request_context_checkpoint",
+            MagicMock(side_effect=AssertionError("disabled command must not contact the bridge")),
+        )
+        monkeypatch.setattr(
+            bridge_mod,
+            "_post_bridge",
+            MagicMock(side_effect=AssertionError("disabled command must not POST to the bridge")),
+        )
+        runner._handle_message_with_agent = AsyncMock(
+            side_effect=AssertionError("/context_checkpoint must not call the model/agent")
+        )
+
+        send = await send_and_capture(adapter, "/context_checkpoint working on rotation", platform)
+
+        send.assert_called_once()
+        response_text = send.call_args[1].get("content") or send.call_args[0][1]
+        assert "disabled" in response_text.lower()
+        assert "Auto-rotation is not implemented" in response_text
+        runner._handle_message_with_agent.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_context_checkpoint_enabled_missing_token_fails_closed(
+        self, adapter, runner, platform, monkeypatch
+    ):
+        """Enabled but no COGITATOR_BRIDGE_TOKEN env → fail closed, never POSTs."""
+        import gateway.cogitator_checkpoint_bridge as bridge_mod
+        from gateway import run as gateway_run
+
+        monkeypatch.setattr(
+            gateway_run,
+            "_load_gateway_config",
+            lambda: {"context_checkpoint": {"enabled": True, "base_url": "https://cog.example"}},
+        )
+        monkeypatch.delenv("COGITATOR_BRIDGE_TOKEN", raising=False)
+        monkeypatch.setattr(
+            bridge_mod,
+            "_post_bridge",
+            MagicMock(side_effect=AssertionError("must not POST without a token")),
+        )
+        runner._handle_message_with_agent = AsyncMock(
+            side_effect=AssertionError("/context_checkpoint must not call the model/agent")
+        )
+
+        send = await send_and_capture(adapter, "/context_checkpoint state", platform)
+
+        send.assert_called_once()
+        response_text = send.call_args[1].get("content") or send.call_args[0][1]
+        assert "not configured" in response_text.lower()
+        assert "COGITATOR_BRIDGE_TOKEN" in response_text
+        runner._handle_message_with_agent.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_context_checkpoint_enabled_builds_packet_and_renders(
+        self, adapter, runner, platform, monkeypatch, caplog
+    ):
+        """Enabled: POSTs the exact draft-only packet and renders the checkpoint."""
+        import gateway.cogitator_checkpoint_bridge as bridge_mod
+        from gateway import run as gateway_run
+
+        monkeypatch.setattr(
+            gateway_run,
+            "_load_gateway_config",
+            lambda: {"context_checkpoint": {"enabled": True, "base_url": "https://cog.example"}},
+        )
+        secret_token = "tok-DO-NOT-LEAK-12345"
+        monkeypatch.setenv("COGITATOR_BRIDGE_TOKEN", secret_token)
+
+        captured = {}
+
+        def fake_post(packet, *, base_url, token, urlopen=None):
+            captured["packet"] = packet
+            captured["base_url"] = base_url
+            captured["token"] = token
+            return {
+                "status": "ok",
+                "requested_action": "build_context_checkpoint",
+                "mutated": False,
+                "proposal_only": True,
+                "checkpoint": {
+                    "purpose": "",
+                    "current_state": packet["context"].get("current_state", ""),
+                    "active_constraints": ["read-only"],
+                    "decisions_made": [],
+                    "open_questions": [],
+                    "artifact_paths": [],
+                    "verification": [],
+                    "next_recommended_action": "",
+                    "safety": {"mutation_allowed": False, "mutation_performed": False},
+                },
+            }
+
+        monkeypatch.setattr(bridge_mod, "_post_bridge", fake_post)
+        runner._handle_message_with_agent = AsyncMock(
+            side_effect=AssertionError("/context_checkpoint must not call the model/agent")
+        )
+
+        with caplog.at_level("DEBUG"):
+            send = await send_and_capture(
+                adapter, "/context_checkpoint rotating the context window", platform
+            )
+
+        send.assert_called_once()
+        response_text = send.call_args[1].get("content") or send.call_args[0][1]
+
+        packet = captured["packet"]
+        assert packet["source_agent"] == "hermes"
+        assert packet["requested_action"] == "build_context_checkpoint"
+        assert packet["user_intent"] == (
+            "Build a read-only checkpoint for the current Hermes conversation; "
+            "do not rotate or inject."
+        )
+        assert packet["content"] == ""
+        assert packet["approval_status"] == "draft_only"
+        assert packet["risk_level"] == "low"
+        assert set(packet["context"]) == {
+            "purpose",
+            "current_state",
+            "active_constraints",
+            "decisions_made",
+            "open_questions",
+            "artifact_paths",
+            "verification",
+            "next_recommended_action",
+        }
+        assert packet["context"]["current_state"] == "rotating the context window"
+        assert captured["base_url"] == "https://cog.example"
+        assert captured["token"] == secret_token
+
+        assert "Context Checkpoint" in response_text
+        assert "Current state: rotating the context window" in response_text
+        assert "Active constraints:" in response_text
+        # Token must never reach the chat or the logs.
+        assert secret_token not in response_text
+        assert secret_token not in caplog.text
+        runner._handle_message_with_agent.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_context_checkpoint_enabled_rejects_mutated_response(
+        self, adapter, runner, platform, monkeypatch
+    ):
+        """A mutated/unsafe bridge response is rejected, never rendered as a checkpoint."""
+        import gateway.cogitator_checkpoint_bridge as bridge_mod
+        from gateway import run as gateway_run
+
+        monkeypatch.setattr(
+            gateway_run,
+            "_load_gateway_config",
+            lambda: {"context_checkpoint": {"enabled": True, "base_url": "https://cog.example"}},
+        )
+        monkeypatch.setenv("COGITATOR_BRIDGE_TOKEN", "tok")
+        monkeypatch.setattr(
+            bridge_mod,
+            "_post_bridge",
+            lambda packet, *, base_url, token, urlopen=None: {
+                "status": "ok",
+                "requested_action": "build_context_checkpoint",
+                "mutated": True,  # contract violation
+                "checkpoint": {"safety": {"mutation_allowed": True, "mutation_performed": True}},
+            },
+        )
+        runner._handle_message_with_agent = AsyncMock(
+            side_effect=AssertionError("/context_checkpoint must not call the model/agent")
+        )
+
+        send = await send_and_capture(adapter, "/context_checkpoint state", platform)
+
+        send.assert_called_once()
+        response_text = send.call_args[1].get("content") or send.call_args[0][1]
+        assert "unavailable" in response_text.lower()
+        assert "BRIDGE_MUTATION_REPORTED" in response_text
+        assert "Context Checkpoint (read-only" not in response_text
+        runner._handle_message_with_agent.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_context_checkpoint_enabled_rejects_missing_checkpoint(
+        self, adapter, runner, platform, monkeypatch
+    ):
+        """A response with no checkpoint object is rejected and not rendered."""
+        import gateway.cogitator_checkpoint_bridge as bridge_mod
+        from gateway import run as gateway_run
+
+        monkeypatch.setattr(
+            gateway_run,
+            "_load_gateway_config",
+            lambda: {"context_checkpoint": {"enabled": True, "base_url": "https://cog.example"}},
+        )
+        monkeypatch.setenv("COGITATOR_BRIDGE_TOKEN", "tok")
+        monkeypatch.setattr(
+            bridge_mod,
+            "_post_bridge",
+            lambda packet, *, base_url, token, urlopen=None: {
+                "status": "ok",
+                "requested_action": "build_context_checkpoint",
+                "mutated": False,
+            },
+        )
+        runner._handle_message_with_agent = AsyncMock(
+            side_effect=AssertionError("/context_checkpoint must not call the model/agent")
+        )
+
+        send = await send_and_capture(adapter, "/context_checkpoint state", platform)
+
+        send.assert_called_once()
+        response_text = send.call_args[1].get("content") or send.call_args[0][1]
+        assert "unavailable" in response_text.lower()
+        assert "BRIDGE_CHECKPOINT_MISSING" in response_text
+        runner._handle_message_with_agent.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_sequential_commands_share_session(self, adapter, platform):
         """Two commands from the same chat_id should both succeed."""
         send_help = await send_and_capture(adapter, "/help", platform)
