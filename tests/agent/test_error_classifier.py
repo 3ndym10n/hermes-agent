@@ -53,6 +53,7 @@ class TestFailoverReason:
     def test_enum_members_exist(self):
         expected = {
             "auth", "auth_permanent", "billing", "rate_limit",
+            "usage_limit_reached",
             "overloaded", "server_error", "timeout",
             "context_overflow", "payload_too_large", "image_too_large",
             "model_not_found", "format_error",
@@ -307,6 +308,57 @@ class TestClassifyApiError:
         result = classify_api_error(e)
         assert result.reason == FailoverReason.rate_limit
         assert result.should_fallback is True
+
+    # ── Usage limit reached (scheduled plan/subscription cap) ──
+
+    def test_429_usage_limit_reached_body_type_not_retryable(self):
+        """GPT-5.5 / openai-codex plan cap: 429 + body type usage_limit_reached.
+
+        Must NOT be classified as a retryable rate_limit, and must NOT request
+        same-provider credential rotation (the plan cap is shared across keys).
+        Fallback to a different provider is allowed.
+        """
+        e = MockAPIError(
+            "Too Many Requests",
+            status_code=429,
+            body={"error": {"type": "usage_limit_reached", "resets_in_seconds": 7200}},
+        )
+        result = classify_api_error(e, provider="openai-codex", model="gpt-5.5")
+        assert result.reason == FailoverReason.usage_limit_reached
+        assert result.retryable is False
+        assert result.should_rotate_credential is False
+        assert result.should_fallback is True
+
+    def test_402_usage_limit_reached_body_type_not_retryable(self):
+        """Same scheduled cap surfaced as 402 is still non-retryable."""
+        e = MockAPIError(
+            "Payment Required",
+            status_code=402,
+            body={"error": {"code": "usage_limit_reached"}},
+        )
+        result = classify_api_error(e)
+        assert result.reason == FailoverReason.usage_limit_reached
+        assert result.retryable is False
+
+    def test_usage_limit_reached_prose_without_transient_is_hard_cap(self):
+        """Explicit plan-cap prose with no transient signal → hard cap."""
+        e = MockAPIError(
+            "You hit your usage limit.",
+            status_code=429,
+        )
+        result = classify_api_error(e)
+        assert result.reason == FailoverReason.usage_limit_reached
+        assert result.retryable is False
+
+    def test_usage_limit_reached_prose_with_transient_stays_rate_limit(self):
+        """Plan-cap prose that includes a transient signal stays retryable."""
+        e = MockAPIError(
+            "The usage limit has been reached, try again in 30s.",
+            status_code=429,
+        )
+        result = classify_api_error(e)
+        assert result.reason == FailoverReason.rate_limit
+        assert result.retryable is True
 
     def test_alibaba_rate_increased_too_quickly(self):
         """Alibaba/DashScope returns a unique throttling message.

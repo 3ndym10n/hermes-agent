@@ -31,6 +31,7 @@ class FailoverReason(enum.Enum):
     # Billing / quota
     billing = "billing"                  # 402 or confirmed credit exhaustion — rotate immediately
     rate_limit = "rate_limit"            # 429 or quota-based throttling — backoff then rotate
+    usage_limit_reached = "usage_limit_reached"  # Scheduled plan/subscription cap (resets on a clock) — do NOT retry the same provider, fallback once then hard-stop
 
     # Server-side
     overloaded = "overloaded"            # 503/529 — provider overloaded, backoff
@@ -152,6 +153,51 @@ _USAGE_LIMIT_TRANSIENT_SIGNALS = [
     "periodic",
     "window",
 ]
+
+# Structured error codes/types that unambiguously mean "scheduled plan cap" —
+# a subscription/plan usage limit that resets on a clock (e.g. GPT-5.5 /
+# openai-codex returns HTTP 429 with body {"error": {"type":
+# "usage_limit_reached", "resets_in_seconds": N}}).  These are NOT transient
+# throttles: retrying the same provider before the reset is pointless, so the
+# retry loop must stop immediately (fallback once, then hard-stop). See
+# FailoverReason.usage_limit_reached and Context Rotation V0-A.
+_USAGE_LIMIT_HARD_CODES = (
+    "usage_limit_reached",
+    "gousagelimit",
+)
+
+# Explicit hard-cap PHRASES (not single words) used when no structured code is
+# present.  Deliberately specific so they match the codex/Anthropic plan-cap
+# wording ("The usage limit has been reached", "You hit your usage limit")
+# without swallowing the generic credit-exhaustion phrasing ("usage limit
+# reached") that already classifies as ``billing``.
+_USAGE_LIMIT_HARD_PHRASES = (
+    "usage limit has been reached",
+    "plan's usage limit",
+    "plan usage limit",
+    "hit your usage limit",
+    "reached your usage limit",
+    "usage limit reached. it resets",
+)
+
+
+def _is_hard_usage_limit(error_code: str, error_msg: str) -> bool:
+    """True when the error is a confirmed scheduled plan/subscription cap.
+
+    Highest-confidence signal is the structured error code/type
+    (``usage_limit_reached``).  When only prose is available, require an explicit
+    hard-cap phrase AND the *absence* of any transient signal — so genuine
+    "usage limit, try again in 20s" throttles keep their retryable
+    ``rate_limit`` classification and bare "usage limit reached" credit
+    exhaustion keeps its ``billing`` classification.
+    """
+    code_lower = (error_code or "").strip().lower()
+    if any(c in code_lower for c in _USAGE_LIMIT_HARD_CODES):
+        return True
+    if any(p in error_msg for p in _USAGE_LIMIT_HARD_PHRASES):
+        has_transient = any(p in error_msg for p in _USAGE_LIMIT_TRANSIENT_SIGNALS)
+        return not has_transient
+    return False
 
 # Payload-too-large patterns detected from message text (no status_code attr).
 # Proxies and some backends embed the HTTP status in the error message.
@@ -546,6 +592,22 @@ def classify_api_error(
         return _result(
             FailoverReason.content_policy_blocked,
             retryable=False,
+            should_fallback=True,
+        )
+
+    # Scheduled plan/subscription usage cap (e.g. GPT-5.5 / openai-codex
+    # "usage_limit_reached", commonly HTTP 429 with resets_in_seconds). Must run
+    # before status-based classification so the 429/402 handlers don't downgrade
+    # it to a retryable ``rate_limit``.  Policy (Context Rotation V0-A): NOT
+    # retryable, do NOT rotate the same provider's credentials (the plan cap is
+    # shared across keys), allow the fallback chain once, then hard-stop with the
+    # reset time.  Transient "usage limit, try again" throttles are excluded by
+    # _is_hard_usage_limit and keep their retryable rate_limit classification.
+    if _is_hard_usage_limit(error_code, error_msg):
+        return _result(
+            FailoverReason.usage_limit_reached,
+            retryable=False,
+            should_rotate_credential=False,
             should_fallback=True,
         )
 

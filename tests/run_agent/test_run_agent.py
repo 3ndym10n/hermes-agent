@@ -3807,6 +3807,136 @@ class TestRunConversation:
         assert result["final_response"] != "(empty)"
         assert "No reply:" in result["final_response"]
 
+    def test_usage_limit_reached_stops_without_retry_or_backoff(self, agent):
+        """A scheduled plan cap (usage_limit_reached) must abort after exactly
+        one API attempt — no retries, no backoff sleep — and surface the reset
+        time. (Context Rotation V0-A.)"""
+        from agent import conversation_loop
+
+        self._setup_agent(agent)
+        agent.base_url = "http://127.0.0.1:1234/v1"
+        agent._fallback_chain = []
+        agent._fallback_index = 0
+
+        class _UsageLimitError(Exception):
+            def __init__(self):
+                super().__init__("Too Many Requests")
+                self.status_code = 429
+                self.body = {
+                    "error": {
+                        "type": "usage_limit_reached",
+                        "resets_in_seconds": 7200,
+                    }
+                }
+
+        agent.client.chat.completions.create.side_effect = _UsageLimitError()
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch.object(conversation_loop, "jittered_backoff") as mock_backoff,
+        ):
+            result = agent.run_conversation("do something")
+
+        assert result["completed"] is False
+        assert result["failed"] is True
+        assert result["api_calls"] == 1  # one attempt, no retries
+        assert result["failure_reason"] == "usage_limit_reached"
+        assert "usage limit" in (result["final_response"] or "").lower()
+        mock_backoff.assert_not_called()  # no backoff for a plan cap
+
+    def test_usage_limit_reached_falls_back_once_then_continues(self, agent):
+        """With a fallback chain configured, a plan cap activates the fallback
+        provider exactly once and continues there."""
+        self._setup_agent(agent)
+        agent.base_url = "http://127.0.0.1:1234/v1"
+        agent._fallback_chain = [
+            {"provider": "openrouter", "model": "anthropic/claude-sonnet-4"}
+        ]
+        agent._fallback_index = 0
+        agent._fallback_activated = False
+
+        class _UsageLimitError(Exception):
+            def __init__(self):
+                super().__init__("Too Many Requests")
+                self.status_code = 429
+                self.body = {"error": {"type": "usage_limit_reached"}}
+
+        content_resp = _mock_response(content="Fallback answer.", finish_reason="stop")
+        agent.client.chat.completions.create.side_effect = [
+            _UsageLimitError(), content_resp,
+        ]
+
+        fallback_called = {"called": False}
+
+        def _mock_fallback(*args, **kwargs):
+            fallback_called["called"] = True
+            agent._fallback_index = 1
+            agent._fallback_activated = True
+            agent.model = "anthropic/claude-sonnet-4"
+            agent.provider = "openrouter"
+            return True
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch.object(agent, "_has_pending_fallback", return_value=True),
+            patch.object(agent, "_try_activate_fallback", side_effect=_mock_fallback),
+        ):
+            result = agent.run_conversation("do something")
+
+        assert fallback_called["called"], "Fallback should have been triggered once"
+        assert result["completed"] is True
+        assert result["final_response"] == "Fallback answer."
+
+    def test_usage_limit_reached_fallback_also_capped_hard_stops(self, agent):
+        """If the fallback provider is also capped and the chain is exhausted,
+        hard-stop with failure_reason — no fallback-loop."""
+        self._setup_agent(agent)
+        agent.base_url = "http://127.0.0.1:1234/v1"
+        agent._fallback_chain = [
+            {"provider": "openrouter", "model": "anthropic/claude-sonnet-4"}
+        ]
+        agent._fallback_index = 0
+        agent._fallback_activated = False
+
+        class _UsageLimitError(Exception):
+            def __init__(self):
+                super().__init__("Too Many Requests")
+                self.status_code = 429
+                self.body = {"error": {"type": "usage_limit_reached"}}
+
+        agent.client.chat.completions.create.side_effect = [
+            _UsageLimitError(), _UsageLimitError(),
+        ]
+
+        def _mock_has_pending():
+            return agent._fallback_index < len(agent._fallback_chain)
+
+        def _mock_fallback(*args, **kwargs):
+            if agent._fallback_index >= len(agent._fallback_chain):
+                return False
+            agent._fallback_index += 1
+            agent._fallback_activated = True
+            agent.model = "anthropic/claude-sonnet-4"
+            agent.provider = "openrouter"
+            return True
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch.object(agent, "_has_pending_fallback", side_effect=_mock_has_pending),
+            patch.object(agent, "_try_activate_fallback", side_effect=_mock_fallback),
+        ):
+            result = agent.run_conversation("do something")
+
+        assert result["completed"] is False
+        assert result["failed"] is True
+        assert result["failure_reason"] == "usage_limit_reached"
+
     def test_empty_response_emits_status_for_gateway(self, agent):
         """_emit_status is called during empty retries so gateway users see feedback."""
         self._setup_agent(agent)
@@ -5034,6 +5164,28 @@ class TestCredentialPoolRecovery:
 
         assert context["reason"] == "GoUsageLimitError"
         assert context["reset_at"] == 1_000.0 + (6 * 60 * 60) + (29 * 60)
+
+    def test_extract_api_error_context_parses_resets_in_seconds(self, agent, monkeypatch):
+        """Numeric resets_in_seconds body field (codex usage_limit_reached) →
+        an absolute reset_at relative to now."""
+        from agent import agent_runtime_helpers
+
+        monkeypatch.setattr(agent_runtime_helpers.time, "time", lambda: 1_000.0)
+        error = SimpleNamespace(
+            body={
+                "error": {
+                    "type": "usage_limit_reached",
+                    "message": "The usage limit has been reached",
+                    "resets_in_seconds": 7200,
+                }
+            },
+            response=SimpleNamespace(headers={}),
+        )
+
+        context = agent._extract_api_error_context(error)
+
+        assert context["reason"] == "usage_limit_reached"
+        assert context["reset_at"] == 1_000.0 + 7200
 
     def test_recover_with_pool_passes_error_context_on_rotated_429(self, agent):
         next_entry = SimpleNamespace(label="secondary")
