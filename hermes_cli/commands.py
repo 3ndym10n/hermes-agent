@@ -218,6 +218,10 @@ COMMAND_REGISTRY: list[CommandDef] = [
                gateway_only=True, aliases=("review_page",), args_hint="<page_number>"),
     CommandDef("promote", "Promote a Cogitator item from the current review page", "Info",
                gateway_only=True, args_hint="<current-page-number>"),
+    CommandDef("context-checkpoint",
+               "Request a read-only Cogitator context checkpoint (default off)", "Info",
+               gateway_only=True, aliases=("context_checkpoint",),
+               args_hint="<current state to checkpoint>"),
     CommandDef("help", "Show available commands", "Info"),
     CommandDef("restart", "Gracefully restart the gateway after draining active runs", "Session",
                gateway_only=True),
@@ -360,6 +364,7 @@ ACTIVE_SESSION_BYPASS_COMMANDS: frozenset[str] = frozenset(
         "approve",
         "background",
         "commands",
+        "context-checkpoint",
         "deny",
         "help",
         "loop-health",
@@ -1069,7 +1074,11 @@ _SLACK_PRIORITY_ALIASES = ("btw", "bg")
 #   - review/review-page/promote: Cogitator Telegram runtime-proof commands;
 #     Slack can still type /hermes review, but these should not evict general
 #     Hermes controls from the 50-command native Slack manifest.
-_SLACK_VIA_HERMES_ONLY = frozenset({"credits", "debug", "promote", "review", "review-page"})
+#   - context-checkpoint: default-off manual Cogitator checkpoint request; same
+#     rationale — keep it off the native Slack manifest, reachable via /hermes.
+_SLACK_VIA_HERMES_ONLY = frozenset(
+    {"credits", "debug", "promote", "review", "review-page", "context-checkpoint"}
+)
 
 
 def _sanitize_slack_name(raw: str) -> str:

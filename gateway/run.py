@@ -7289,6 +7289,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     return await self._handle_cogitator_review_page_command(event)
                 if _cmd_def_inner.name == "promote":
                     return await self._handle_cogitator_promote_command(event)
+                if _cmd_def_inner.name == "context-checkpoint":
+                    return await self._handle_context_checkpoint_command(event)
                 if _cmd_def_inner.name == "profile":
                     return await self._handle_profile_command(event)
                 if _cmd_def_inner.name == "update":
@@ -7561,7 +7563,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if canonical == "promote":
             return await self._handle_cogitator_promote_command(event)
-        
+
+        if canonical == "context-checkpoint":
+            return await self._handle_context_checkpoint_command(event)
+
         if canonical == "profile":
             return await self._handle_profile_command(event)
 
