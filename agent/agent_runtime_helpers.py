@@ -2400,6 +2400,18 @@ def extract_api_error_context(error: Exception) -> Dict[str, Any]:
             if value not in {None, ""}:
                 context["reset_at"] = value
                 break
+        # Numeric relative reset (e.g. Anthropic/codex usage_limit_reached body
+        # carries "resets_in_seconds": N rather than an absolute timestamp).
+        if "reset_at" not in context:
+            for key in ("resets_in_seconds", "reset_in_seconds"):
+                resets_in = payload.get(key)
+                if resets_in not in {None, ""}:
+                    try:
+                        context["reset_at"] = time.time() + float(resets_in)
+                    except (TypeError, ValueError):
+                        pass
+                    else:
+                        break
         retry_after = payload.get("retry_after")
         if retry_after not in {None, ""} and "reset_at" not in context:
             try:

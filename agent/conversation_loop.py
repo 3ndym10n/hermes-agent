@@ -430,6 +430,66 @@ def _get_continuation_prompt(is_partial_stub: bool, dropped_tools: Optional[List
         )
 
 
+def _format_reset_delta(reset_at: Any) -> Optional[str]:
+    """Render a human "~Nh Nm" delta from a reset timestamp, or None.
+
+    ``reset_at`` may be an absolute epoch float/int, a numeric string, or an
+    ISO-8601 string (e.g. "2026-04-12T10:30:00Z").  Returns None when the value
+    is missing, unparseable, or already in the past.
+    """
+    if reset_at in {None, ""}:
+        return None
+    epoch: Optional[float] = None
+    if isinstance(reset_at, (int, float)):
+        epoch = float(reset_at)
+    elif isinstance(reset_at, str):
+        text = reset_at.strip()
+        try:
+            epoch = float(text)
+        except ValueError:
+            try:
+                from datetime import datetime, timezone
+                epoch = datetime.fromisoformat(
+                    text.replace("Z", "+00:00")
+                ).timestamp()
+            except (ValueError, OverflowError):
+                epoch = None
+    if epoch is None:
+        return None
+    remaining = epoch - time.time()
+    if remaining <= 0:
+        return None
+    hours = int(remaining // 3600)
+    minutes = int((remaining % 3600) // 60)
+    if hours and minutes:
+        return f"~{hours}h {minutes}m"
+    if hours:
+        return f"~{hours}h"
+    if minutes:
+        return f"~{minutes}m"
+    return "less than a minute"
+
+
+def _format_usage_limit_message(error_context: Optional[Dict[str, Any]]) -> str:
+    """Build the user-facing message for a scheduled plan/subscription cap.
+
+    Surfaces the reset time when available and makes clear retrying won't help
+    (Context Rotation V0-A — usage_limit_reached hard-stop after fallback).
+    """
+    delta = _format_reset_delta(
+        (error_context or {}).get("reset_at")
+    )
+    if delta:
+        when = f" It resets in {delta}."
+    else:
+        when = ""
+    return (
+        "⏳ Plan usage limit reached. Your provider's usage limit has been hit, "
+        f"so I've stopped retrying — this won't clear by retrying.{when} "
+        "You can wait until it resets, or switch models with /model."
+    )
+
+
 # Shared recovery hint appended to every content-policy refusal message. Both
 # the HTTP-200 refusal path (``finish_reason=content_filter``) and the
 # exception path (a provider moderation error classified as
@@ -2639,6 +2699,51 @@ def run_conversation(
                         "interrupted": True,
                     }
                 
+                # ── Usage limit reached (scheduled plan/subscription cap) ──
+                # A plan cap (e.g. GPT-5.5 / openai-codex "usage_limit_reached")
+                # resets on a clock — retrying the same provider is pointless and
+                # the classifier already declined same-provider credential
+                # rotation (should_rotate_credential=False).  Policy (Context
+                # Rotation V0-A): try the configured fallback chain exactly once;
+                # if no fallback exists or the chain is exhausted, hard-stop and
+                # report the reset time.  No backoff, no sleeps, no retry against
+                # the capped provider, and no repeated fallback-loop (each
+                # _try_activate_fallback advances the chain index).
+                if classified.reason == FailoverReason.usage_limit_reached:
+                    if agent._has_pending_fallback() and agent._try_activate_fallback(
+                        reason=classified.reason
+                    ):
+                        agent._buffer_status(
+                            "⚠️ Plan usage limit reached — switching to fallback provider..."
+                        )
+                        retry_count = 0
+                        compression_attempts = 0
+                        _retry.primary_recovery_attempted = False
+                        continue
+                    # No fallback available or chain exhausted — hard stop.
+                    agent._flush_status_buffer()
+                    _usage_limit_msg = _format_usage_limit_message(error_context)
+                    agent._emit_status(f"❌ {_usage_limit_msg}")
+                    if api_kwargs is not None:
+                        agent._dump_api_request_debug(
+                            api_kwargs, reason="usage_limit_reached", error=api_error,
+                        )
+                    agent._persist_session(messages, conversation_history)
+                    logger.error(
+                        "%sUsage limit reached — stopped without retry. "
+                        "provider=%s model=%s",
+                        agent.log_prefix, _provider, _model,
+                    )
+                    return {
+                        "final_response": _usage_limit_msg,
+                        "messages": messages,
+                        "api_calls": api_call_count,
+                        "completed": False,
+                        "failed": True,
+                        "error": _error_summary,
+                        "failure_reason": classified.reason.value,
+                    }
+
                 # Check for 413 payload-too-large BEFORE generic 4xx handler.
                 # A 413 is a payload-size error — the correct response is to
                 # compress history and retry, not abort immediately.
