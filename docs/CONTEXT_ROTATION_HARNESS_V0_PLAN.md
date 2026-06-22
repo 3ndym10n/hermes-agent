@@ -94,6 +94,43 @@ V0-F is the next slice: define and test a safe automatic injection/continuation
 mechanism so Hermes can create the clean continuation itself instead of asking
 Cal to run `/new` and paste the packet manually.
 
+### V0-E runtime smoke proof
+
+The V0-E automatic checkpoint path was exercised end-to-end on the live Virgil
+gateway and behaved exactly as designed:
+
+- **Stimulus:** a normal Telegram message, `Say test only`.
+- **Normal turn:** Virgil replied normally with `Test only.` — the regular
+  agent response is unchanged by V0-E.
+- **Separate notice:** Virgil then sent a **distinct** `Automatic Context
+  Protection (V0-E)` notice as its own message, after the normal reply.
+- **Trigger:** `token_threshold` (the post-turn `last_prompt_tokens /
+  context_length` gate).
+- **Source:** the Cogitator `build_context_checkpoint` bridge action, in
+  bridge-only mode (Railway).
+- **Output confirmed safe — the read-only contract held:**
+  - no mutation (`mutated: false`, `checkpoint.safety.mutation_performed: false`),
+  - no persistence (the notice is post-persistence and never written to the
+    transcript/session storage),
+  - no rotation (no session swap occurred),
+  - no injection (nothing was seeded into a new context),
+  - no automatic `/new` (the user is *asked* to run `/new`; the harness does not).
+- The checkpoint/handoff packet rendered successfully, including the exact
+  clean-continuation action shown below.
+- **Manual `/context_checkpoint` still works** and is unchanged by the
+  automatic path.
+
+**Deployment at time of proof:** Hermes PR #8 (auto checkpoint notice) and
+PR #9 (async post-delivery callback hotfix) are deployed; the Railway Cogitator
+bridge runs in bridge-only mode.
+
+> **Note — smoke threshold was test-only.** To force the `token_threshold`
+> trigger on a tiny message, the smoke temporarily set
+> `context_checkpoint.auto_trigger.threshold` to `0.0001`. That value is **test
+> only and must not remain** in the live config — the live/recommended threshold
+> is `0.80` (as documented under *Config* above), and the live config has been
+> confirmed back at `0.80`.
+
 ---
 
 ## 2. Goal (the six steps this plan designs)
