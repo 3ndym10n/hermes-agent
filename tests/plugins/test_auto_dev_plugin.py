@@ -97,6 +97,47 @@ def test_protected_allowed_path_fails_closed():
     assert "allowed_files intersects protected surfaces" in result["errors"]
 
 
+def test_broad_allowed_glob_that_can_reach_protected_paths_fails_closed():
+    result = command.validate_task_packet(
+        _packet(allowed_files=["**/*"]), _enabled_config()
+    )
+
+    assert result["valid"] is False
+    assert result["protected_conflicts"] == ["**/*"]
+    assert result["policy_preview_eligible"] is False
+
+
+def test_markdown_glob_that_reaches_storage_fails_closed():
+    result = command.validate_task_packet(
+        _packet(allowed_files=["**/*.md"]), _enabled_config()
+    )
+
+    assert result["valid"] is False
+    assert result["protected_conflicts"] == ["**/*.md"]
+
+
+def test_string_sequence_fields_are_rejected_instead_of_split_into_characters():
+    result = command.validate_task_packet(
+        _packet(allowed_files="docs/**", tests="pytest -q"), _enabled_config()
+    )
+
+    assert result["valid"] is False
+    assert "allowed_files must be an array of non-empty strings" in result["errors"]
+    assert "tests must be an array of non-empty strings" in result["errors"]
+    assert result["policy_preview_eligible"] is False
+
+
+def test_empty_items_in_sequence_fields_are_rejected():
+    result = command.validate_task_packet(
+        _packet(forbidden_surfaces=["storage/**", ""]), _enabled_config()
+    )
+
+    assert result["valid"] is False
+    assert (
+        "forbidden_surfaces must contain only non-empty strings" in result["errors"]
+    )
+
+
 def test_unknown_packet_field_is_rejected():
     result = command.validate_task_packet(
         _packet(deploy_now=True), _enabled_config()
@@ -125,6 +166,18 @@ def test_handler_validates_json_without_echoing_objective(monkeypatch):
     assert "Repo: hermes — allowed" in reply
     assert "Execution performed: no" in reply
     assert "sk-example-secret-value" not in reply
+
+
+def test_handler_redacts_secret_shaped_values_in_rendered_errors(monkeypatch):
+    monkeypatch.setattr(command, "_load_config", _enabled_config)
+    secret = "sk-ant-example-secret-value-1234567890"
+    packet = _packet(repo=secret, risk_classification=secret)
+
+    reply = command.handle_auto_dev("dry_run " + json.dumps(packet))
+
+    assert secret not in reply
+    assert "***REDACTED***" in reply
+    assert "Status: invalid" in reply
 
 
 def test_handler_has_no_live_execution_subcommand():
