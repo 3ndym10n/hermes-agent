@@ -23,8 +23,8 @@ from automation import (
     classify_changed_files,
     is_destructive_git,
 )
-from automation.adapters import _scrub_auth
-from automation.safety import DEFAULT_PROTECTED_GLOBS
+from automation.adapters import _scrub_auth, default_subprocess_runner
+from automation.safety import DEFAULT_PROTECTED_GLOBS, match_any
 from automation.worker import GitRunner
 
 
@@ -460,3 +460,152 @@ def test_env_var_isolation_sanity():
     # Guard: tests must never depend on real provider creds being set.
     # (The controller itself never reads them; this documents the contract.)
     assert "AUTOMATION_FORCE_REAL_CLI" not in os.environ
+
+
+# ---------------------------------------------------------------------------
+# Hardening: root-level protected globs
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "secrets.txt",
+        "secret_keys.json",
+        "migrations/001_init.sql",
+        "storage/db.sqlite",
+        "app.service",
+        "deploy.pem",
+        "id_rsa",
+    ],
+)
+def test_root_level_protected_paths_are_caught(path):
+    # Regression: ``**/x`` protected globs must also catch a repo-ROOT ``x``
+    # (PurePath.match treats ** like * on 3.11, so the matcher strips a leading
+    # ``**/`` and retries). Without this, root-level secrets/storage/migrations
+    # would bypass the defense-in-depth net.
+    assert match_any(path, DEFAULT_PROTECTED_GLOBS) is True
+
+
+@pytest.mark.parametrize(
+    "path", ["sub/secrets.txt", "a/b/storage/x.db", "deep/nested/.env"]
+)
+def test_nested_protected_paths_still_caught(path):
+    assert match_any(path, DEFAULT_PROTECTED_GLOBS) is True
+
+
+def test_ordinary_source_paths_not_protected():
+    assert match_any("src/app.py", DEFAULT_PROTECTED_GLOBS) is False
+    assert match_any("README.md", DEFAULT_PROTECTED_GLOBS) is False
+
+
+# ---------------------------------------------------------------------------
+# Hardening: broadened auth scrubbing
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "prefix,body",
+    [
+        ("glpat-", "A" * 22),
+        ("AKIA", "B" * 16),
+        ("xoxb-", "1" * 12 + "-" + "c" * 12),
+        ("ghp_", "D" * 36),
+        ("sk-ant-", "api03x" + "E" * 16),
+    ],
+)
+def test_scrub_redacts_token_shapes(prefix, body):
+    # Build the token-shaped string at RUNTIME so no contiguous secret literal
+    # lives in source (avoids tripping GitHub push-protection on a fake token).
+    secret = prefix + body
+    out = _scrub_auth(f"the leaked value is {secret} end")
+    assert secret not in out
+    assert "***REDACTED***" in out
+
+
+def test_scrub_redacts_credential_key_values_preserving_key():
+    assert "hunter2secret" not in _scrub_auth("DB_PASSWORD=hunter2secret")
+    out = _scrub_auth("client_secret: super-secret-value-123")
+    assert "super-secret-value-123" not in out
+
+
+def test_scrub_leaves_prose_and_shas_intact():
+    s = "fixed in commit a1b2c3d4e5f6 and PR #12 with 1234 changes"
+    assert _scrub_auth(s) == s
+
+
+# ---------------------------------------------------------------------------
+# Hardening: fail-closed live-worker gate
+# ---------------------------------------------------------------------------
+
+
+class _LiveNamedFakeAdapter(FakeWorkerAdapter):
+    """A fake adapter that reports a *live* name so the sandbox gate applies.
+
+    Still in-process (no real CLI) — it just lets us exercise the gate that
+    keys on the adapter name (``claude``/``codex``).
+    """
+
+    def __init__(self, live_name: str, apply) -> None:
+        super().__init__(apply=apply)
+        self._live_name = live_name
+
+    @property
+    def name(self) -> str:
+        return self._live_name
+
+
+def test_live_worker_refused_without_sandbox(repo):
+    publisher = FakePublisher()
+    worker = BackendWorker(
+        allowed_repos={"sample": repo},
+        adapters=[_LiveNamedFakeAdapter("claude", edit_app)],
+        publisher=publisher,
+        # allow_live_workers defaults False -> fail closed.
+    )
+    ev = worker.execute(make_packet(worker_kind="claude"))
+
+    assert ev.status == "blocked_no_sandbox"
+    # Nothing was published, and no worktree work happened.
+    assert publisher.push_calls == []
+    assert publisher.pr_calls == []
+    assert any("sandbox" in n for n in ev.notes)
+
+
+def test_live_worker_allowed_when_explicitly_enabled(repo):
+    publisher = FakePublisher()
+    worker = BackendWorker(
+        allowed_repos={"sample": repo},
+        adapters=[_LiveNamedFakeAdapter("claude", edit_app)],
+        publisher=publisher,
+        allow_live_workers=True,
+    )
+    ev = worker.execute(make_packet(worker_kind="claude"))
+
+    assert ev.status == "pr_opened"
+    assert len(publisher.push_calls) == 1
+    assert len(publisher.pr_calls) == 1
+
+
+def test_fake_worker_is_not_gated_by_sandbox(repo):
+    # The in-process fake adapter is not a "live" CLI and runs without the flag.
+    worker = worker_for(repo, FakeWorkerAdapter(apply=edit_app))
+    ev = worker.execute(make_packet())
+    assert ev.status == "pr_opened"
+
+
+# ---------------------------------------------------------------------------
+# Hardening: real subprocess timeout enforcement
+# ---------------------------------------------------------------------------
+
+
+def test_default_subprocess_runner_enforces_real_timeout():
+    import sys
+
+    rc, out, err, timed_out = default_subprocess_runner(
+        [sys.executable, "-c", "import time; time.sleep(5)"],
+        cwd=".",
+        timeout=1,
+    )
+    assert timed_out is True
+    assert rc == 124

@@ -70,16 +70,27 @@ def match_any(path: str, globs) -> bool:
     basename = pp.name
 
     for glob in globs:
-        # Full-path match (handles ``**`` and directory-spanning patterns).
-        if pp.match(glob):
+        if _glob_matches(pp, basename, glob):
             return True
-        # Basename match for patterns that have no slash (e.g. ``Dockerfile*``,
-        # ``.env*``) — PurePosixPath.match already matches the trailing
-        # component for slashless patterns, but matching the basename
-        # explicitly keeps behaviour obvious and robust.
-        if "/" not in glob and PurePosixPath(basename).match(glob):
+        # A leading ``**/`` is meant to match "any depth, including the repo
+        # root", but ``PurePath.match`` on Python 3.11 treats ``**`` like a
+        # single ``*`` component, so ``**/secret*`` would NOT match a top-level
+        # ``secrets.txt``. Retry with the ``**/`` stripped so a protected glob
+        # like ``**/storage/**`` or ``**/*.pem`` still catches root-level files.
+        if glob.startswith("**/") and _glob_matches(pp, basename, glob[3:]):
             return True
     return False
+
+
+def _glob_matches(pp: PurePosixPath, basename: str, glob: str) -> bool:
+    """Match a path (and, for slashless globs, its basename) against one glob."""
+
+    # Full-path match (handles ``**`` and directory-spanning patterns).
+    if pp.match(glob):
+        return True
+    # Basename match for patterns that have no slash (e.g. ``Dockerfile*``,
+    # ``.env*``) — keeps behaviour obvious and robust.
+    return "/" not in glob and PurePosixPath(basename).match(glob)
 
 
 # ---------------------------------------------------------------------------
