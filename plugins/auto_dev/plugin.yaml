@@ -1,0 +1,4 @@
+name: auto_dev
+version: "0.1.0"
+description: Read-only backend automation status and task-packet dry-run command.
+kind: standalone
