@@ -637,6 +637,104 @@ class TestSlashCommands:
         assert "Clean continuation action:" in notice_text
 
     @pytest.mark.asyncio
+    async def test_auto_context_checkpoint_notice_delivered_when_chained_behind_existing_callback(
+        self, runner, adapter, platform, session_entry, monkeypatch
+    ):
+        """Regression (V0-E1): when another post-delivery callback is already
+        registered for the session, the auto-checkpoint notice is *chained*
+        behind it. The chained wrapper must be awaitable so the async notice is
+        actually delivered (not orphaned as "coroutine ... was never awaited"),
+        while still being a separate platform notice that is not persisted.
+        """
+        import gateway.cogitator_checkpoint_bridge as bridge_mod
+        from gateway import run as gateway_run
+        from gateway.run import GatewayRunner
+
+        monkeypatch.setattr(
+            gateway_run,
+            "_load_gateway_config",
+            lambda: {
+                "context_checkpoint": {
+                    "enabled": True,
+                    "base_url": "https://cog.example",
+                    "auto_trigger": {"enabled": True, "threshold": 0.75},
+                }
+            },
+        )
+        monkeypatch.setenv("COGITATOR_BRIDGE_TOKEN", "tok-chained")
+
+        def fake_request(context_fields, *, base_url, token, urlopen=None):
+            return {
+                "status": "ok",
+                "requested_action": "build_context_checkpoint",
+                "mutated": False,
+                "proposal_only": True,
+                "checkpoint": {
+                    "purpose": context_fields["purpose"],
+                    "current_state": context_fields["current_state"],
+                    "active_constraints": context_fields["active_constraints"],
+                    "decisions_made": context_fields["decisions_made"],
+                    "open_questions": context_fields["open_questions"],
+                    "artifact_paths": context_fields["artifact_paths"],
+                    "verification": context_fields["verification"],
+                    "next_recommended_action": context_fields["next_recommended_action"],
+                    "safety": {"mutation_allowed": False, "mutation_performed": False},
+                },
+            }
+
+        monkeypatch.setattr(bridge_mod, "request_context_checkpoint", fake_request)
+        runner.session_store.load_transcript.return_value = []
+        runner.session_store.has_any_sessions.return_value = True
+        runner._run_agent = AsyncMock(
+            return_value={
+                "final_response": "normal response",
+                "messages": [],
+                "tools": [],
+                "last_prompt_tokens": 800,
+                "context_length": 1000,
+            }
+        )
+        runner._session_run_generation = {session_entry.session_key: 1}
+
+        # A pre-existing post-delivery callback forces the chained path.
+        prior_fired = []
+        adapter.register_post_delivery_callback(
+            session_entry.session_key,
+            lambda: prior_fired.append("prior"),
+            generation=1,
+        )
+
+        event = make_event(platform, text="continue the task")
+        returned = await GatewayRunner._handle_message_with_agent(
+            runner,
+            event,
+            event.source,
+            session_entry.session_key,
+            1,
+        )
+
+        assert returned == "normal response"
+
+        callback = adapter.pop_post_delivery_callback(session_entry.session_key, generation=1)
+        assert callback is not None
+        result = callback()
+        # The chained wrapper must report as awaitable, or call sites drop it.
+        import inspect as _inspect
+        assert _inspect.isawaitable(result)
+        await result
+
+        # Both the prior callback and the async checkpoint delivery ran.
+        assert prior_fired == ["prior"]
+        notice_text = adapter.send.call_args[1].get("content") or adapter.send.call_args[0][1]
+        assert "Automatic Context Protection" in notice_text
+        assert "Clean continuation action:" in notice_text
+
+        # The checkpoint text is never persisted to the transcript.
+        persisted_entries = [call.args[1] for call in runner.session_store.append_to_transcript.call_args_list]
+        assert all("Automatic Context Protection" not in str(entry) for entry in persisted_entries)
+        assert all("Clean continuation action" not in str(entry) for entry in persisted_entries)
+
+    @pytest.mark.asyncio
     async def test_auto_context_checkpoint_threshold_missing_token_fails_closed_without_post(
         self, runner, platform, monkeypatch
     ):
