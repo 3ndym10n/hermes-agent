@@ -6,15 +6,42 @@ import json
 from dataclasses import fields
 from typing import Any, Mapping
 
+from automation.adapters import _scrub_auth
 from automation.safety import DEFAULT_PROTECTED_GLOBS, match_any
 from automation.task_packet import WorkerTaskPacket
 
 API_VERSION = "phase3c-dry-run-v1"
 _PACKET_FIELDS = frozenset(f.name for f in fields(WorkerTaskPacket))
+_SEQUENCE_FIELDS = ("allowed_files", "forbidden_surfaces", "tests")
+
+# Representative protected paths used to catch broad allow-list globs such as
+# ``*``, ``**/*`` or ``**/*.md``.  The worker still enforces the real protected
+# path policy after edits; this dry-run check prevents us from presenting an
+# obviously over-broad packet as a GREEN-safe candidate before execution.
+_PROTECTED_SAMPLE_PATHS = (
+    ".env",
+    ".env.production",
+    "secrets.txt",
+    "config.yaml",
+    ".github/workflows/ci.yml",
+    "deploy/hermes.service",
+    "Dockerfile",
+    "railway.toml",
+    "migrations/001.sql",
+    "storage/runtime.json",
+    "storage/notes/checkpoint.md",
+    "certs/private.pem",
+    "id_rsa",
+)
 
 
 def _truthy(value: Any) -> bool:
-    return value is True or str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+    return value is True or str(value or "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
 
 def _load_config() -> Mapping[str, Any]:
@@ -44,7 +71,7 @@ def _allowed_repos(config: Mapping[str, Any]) -> tuple[str, ...]:
         values = ()
     result: list[str] = []
     for value in values:
-        text = str(value or "").strip()
+        text = _scrub_auth(str(value or "").strip())
         if text and text not in result:
             result.append(text)
     return tuple(result)
@@ -67,6 +94,45 @@ def status_packet(config: Mapping[str, Any] | None = None) -> dict[str, Any]:
     }
 
 
+def _payload_shape_errors(payload: Mapping[str, Any]) -> list[str]:
+    """Reject malformed JSON shapes before constructing ``WorkerTaskPacket``.
+
+    ``WorkerTaskPacket.from_dict`` normalizes sequence fields with ``tuple(value)``.
+    Without this guard, a JSON string would become a tuple of characters and could
+    incorrectly look non-empty to the structural validator.
+    """
+
+    errors: list[str] = []
+    for field_name in _SEQUENCE_FIELDS:
+        if field_name not in payload:
+            continue
+        value = payload[field_name]
+        if not isinstance(value, (list, tuple)):
+            errors.append(f"{field_name} must be an array of non-empty strings")
+            continue
+        if any(not isinstance(item, str) or not item.strip() for item in value):
+            errors.append(f"{field_name} must contain only non-empty strings")
+
+    timeout = payload.get("timeout_seconds")
+    if timeout is not None and (
+        isinstance(timeout, bool) or not isinstance(timeout, int) or timeout <= 0
+    ):
+        errors.append("timeout_seconds must be a positive integer")
+    return errors
+
+
+def _allow_pattern_intersects_protected(pattern: str) -> bool:
+    normalized = str(pattern or "").replace("\\", "/").strip()
+    if not normalized:
+        return False
+    if match_any(normalized, DEFAULT_PROTECTED_GLOBS):
+        return True
+    return any(
+        match_any(sample_path, (normalized,))
+        for sample_path in _PROTECTED_SAMPLE_PATHS
+    )
+
+
 def validate_task_packet(
     payload: Mapping[str, Any], config: Mapping[str, Any] | None = None
 ) -> dict[str, Any]:
@@ -77,6 +143,7 @@ def validate_task_packet(
     unknown = sorted(set(payload) - _PACKET_FIELDS)
     if unknown:
         errors.append("unknown fields: " + ", ".join(unknown))
+    errors.extend(_payload_shape_errors(payload))
 
     packet: WorkerTaskPacket | None = None
     if not errors:
@@ -99,33 +166,40 @@ def validate_task_packet(
 
     protected: list[str] = []
     if packet is not None:
-        for pattern in packet.allowed_files:
-            normalized = str(pattern).replace("\\", "/").strip()
-            if normalized and match_any(normalized, DEFAULT_PROTECTED_GLOBS):
-                protected.append(normalized)
+        protected = [
+            pattern
+            for pattern in packet.allowed_files
+            if _allow_pattern_intersects_protected(pattern)
+        ]
     if protected:
         errors.append("allowed_files intersects protected surfaces")
 
     tests_present = bool(packet is not None and packet.tests)
     green = bool(packet is not None and packet.risk_classification == "GREEN")
     valid = not errors
-    preview_eligible = valid and repo_allowed and green and tests_present and not protected
+    preview_eligible = (
+        valid and repo_allowed and green and tests_present and not protected
+    )
 
     summary = {
-        "repo": packet.repo if packet is not None else "",
-        "risk": packet.risk_classification if packet is not None else "",
+        "repo": _scrub_auth(packet.repo) if packet is not None else "",
+        "risk": (
+            _scrub_auth(packet.risk_classification) if packet is not None else ""
+        ),
         "allowed_file_count": len(packet.allowed_files) if packet is not None else 0,
-        "forbidden_surface_count": len(packet.forbidden_surfaces) if packet is not None else 0,
+        "forbidden_surface_count": (
+            len(packet.forbidden_surfaces) if packet is not None else 0
+        ),
         "test_count": len(packet.tests) if packet is not None else 0,
     }
     return {
         "valid": valid,
         "repo_allowed": repo_allowed,
-        "protected_conflicts": protected,
+        "protected_conflicts": [_scrub_auth(item) for item in protected],
         "policy_preview_eligible": preview_eligible,
         "requires_cal": not preview_eligible,
-        "errors": errors,
-        "warnings": warnings,
+        "errors": [_scrub_auth(item) for item in errors],
+        "warnings": [_scrub_auth(item) for item in warnings],
         "summary": summary,
         "live_execution_available": False,
         "worker_called": False,
@@ -139,7 +213,7 @@ def validate_task_packet(
 def _render_status(result: Mapping[str, Any]) -> str:
     repos = result.get("allowed_repos") or []
     gate = "enabled" if result.get("command_enabled") else "disabled (default)"
-    return "\n".join(
+    rendered = "\n".join(
         [
             "Backend Development Automation",
             f"Package: available ({result.get('api_version')})",
@@ -150,6 +224,7 @@ def _render_status(result: Mapping[str, Any]) -> str:
             "Usage: /auto_dev status | /auto_dev dry_run <task-packet-json>",
         ]
     )
+    return _scrub_auth(rendered)
 
 
 def _render_validation(result: Mapping[str, Any]) -> str:
@@ -160,9 +235,14 @@ def _render_validation(result: Mapping[str, Any]) -> str:
         f"Repo: {summary.get('repo') or '(missing)'} — "
         + ("allowed" if result.get("repo_allowed") else "not allowed"),
         f"Risk: {summary.get('risk') or '(missing)'}",
-        f"Allowed files: {summary.get('allowed_file_count', 0)}; tests: {summary.get('test_count', 0)}",
+        f"Allowed files: {summary.get('allowed_file_count', 0)}; "
+        f"tests: {summary.get('test_count', 0)}",
         "Policy preview: "
-        + ("GREEN-safe candidate" if result.get("policy_preview_eligible") else "escalate / not eligible"),
+        + (
+            "GREEN-safe candidate"
+            if result.get("policy_preview_eligible")
+            else "escalate / not eligible"
+        ),
         "Execution performed: no",
     ]
     if result.get("errors"):
@@ -171,7 +251,7 @@ def _render_validation(result: Mapping[str, Any]) -> str:
     if result.get("warnings"):
         lines.append("Warnings:")
         lines.extend(f"- {item}" for item in result["warnings"])
-    return "\n".join(lines)
+    return _scrub_auth("\n".join(lines))
 
 
 def handle_auto_dev(raw_args: str) -> str:
@@ -188,7 +268,10 @@ def handle_auto_dev(raw_args: str) -> str:
 
     config = _load_config()
     if not status_packet(config)["command_enabled"]:
-        return "Backend automation dry-run is disabled by default. Live execution remains unavailable."
+        return (
+            "Backend automation dry-run is disabled by default. "
+            "Live execution remains unavailable."
+        )
     if not remainder.strip():
         return "Usage: /auto_dev dry_run <task-packet-json>"
     try:
