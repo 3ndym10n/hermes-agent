@@ -734,6 +734,163 @@ class TestSlashCommands:
         assert all("Automatic Context Protection" not in str(entry) for entry in persisted_entries)
         assert all("Clean continuation action" not in str(entry) for entry in persisted_entries)
 
+    # ── Usage Budget Guard (V0-E2) ──────────────────────────────────────
+    def _budget_agent_result(self, *, usage_budget_stopped=None):
+        """A normal agent result, optionally flagged as budget-stopped."""
+        result = {
+            "final_response": "normal response",
+            "messages": [],
+            "tools": [],
+            "last_prompt_tokens": 950,
+            "context_length": 1000,
+        }
+        if usage_budget_stopped is not None:
+            result["usage_budget_stopped"] = usage_budget_stopped
+        return result
+
+    @pytest.mark.asyncio
+    async def test_usage_budget_handoff_produced_and_not_persisted_when_configured(
+        self, runner, adapter, platform, session_entry, monkeypatch
+    ):
+        """Budget stop + checkpoint configured -> a Cogitator handoff notice is
+        produced and delivered as a separate, non-persisted platform notice."""
+        import gateway.cogitator_checkpoint_bridge as bridge_mod
+        from gateway import run as gateway_run
+        from gateway.run import GatewayRunner
+
+        monkeypatch.setattr(
+            gateway_run,
+            "_load_gateway_config",
+            lambda: {
+                "context_checkpoint": {
+                    "enabled": True,
+                    "base_url": "https://cog.example",
+                }
+            },
+        )
+        monkeypatch.setenv("COGITATOR_BRIDGE_TOKEN", "tok-budget")
+
+        captured = {}
+
+        def fake_request(context_fields, *, base_url, token, urlopen=None):
+            captured["context"] = context_fields
+            return {
+                "status": "ok",
+                "requested_action": "build_context_checkpoint",
+                "mutated": False,
+                "proposal_only": True,
+                "checkpoint": {
+                    "purpose": context_fields["purpose"],
+                    "current_state": context_fields["current_state"],
+                    "active_constraints": context_fields["active_constraints"],
+                    "decisions_made": context_fields["decisions_made"],
+                    "open_questions": context_fields["open_questions"],
+                    "artifact_paths": context_fields["artifact_paths"],
+                    "verification": context_fields["verification"],
+                    "next_recommended_action": context_fields["next_recommended_action"],
+                    "safety": {"mutation_allowed": False, "mutation_performed": False},
+                },
+            }
+
+        monkeypatch.setattr(bridge_mod, "request_context_checkpoint", fake_request)
+        runner.session_store.load_transcript.return_value = []
+        runner.session_store.has_any_sessions.return_value = True
+        runner._run_agent = AsyncMock(
+            return_value=self._budget_agent_result(usage_budget_stopped="iteration_cap")
+        )
+        runner._session_run_generation = {session_entry.session_key: 1}
+
+        event = make_event(platform, text="keep going")
+        returned = await GatewayRunner._handle_message_with_agent(
+            runner, event, event.source, session_entry.session_key, 1,
+        )
+
+        assert returned == "normal response"
+        # The handoff is labelled with the budget-stop cause.
+        assert "usage_budget:iteration_cap" in captured["context"]["current_state"]
+
+        # Delivered as a separate, non-persisted post-delivery notice.
+        persisted_entries = [call.args[1] for call in runner.session_store.append_to_transcript.call_args_list]
+        assert all("Automatic Context Protection" not in str(entry) for entry in persisted_entries)
+        assert all("usage_budget" not in str(entry) for entry in persisted_entries)
+
+        callback = adapter.pop_post_delivery_callback(session_entry.session_key, generation=1)
+        assert callback is not None
+        await callback()
+        notice_text = adapter.send.call_args[1].get("content") or adapter.send.call_args[0][1]
+        assert "Automatic Context Protection" in notice_text
+        assert "usage_budget:iteration_cap" in notice_text
+
+    @pytest.mark.asyncio
+    async def test_usage_budget_handoff_local_notice_when_bridge_not_configured(
+        self, runner, adapter, platform, session_entry, monkeypatch
+    ):
+        """Budget stop with no checkpoint bridge configured still delivers a
+        local, non-persisted handoff notice (no bridge call, no injection)."""
+        from gateway import run as gateway_run
+        from gateway.run import GatewayRunner
+
+        # No context_checkpoint config -> bridge not configured.
+        monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
+        monkeypatch.delenv("COGITATOR_BRIDGE_TOKEN", raising=False)
+
+        runner.session_store.load_transcript.return_value = []
+        runner.session_store.has_any_sessions.return_value = True
+        runner._run_agent = AsyncMock(
+            return_value=self._budget_agent_result(usage_budget_stopped="token_cap")
+        )
+        runner._session_run_generation = {session_entry.session_key: 1}
+
+        event = make_event(platform, text="keep going")
+        returned = await GatewayRunner._handle_message_with_agent(
+            runner, event, event.source, session_entry.session_key, 1,
+        )
+
+        assert returned == "normal response"
+        callback = adapter.pop_post_delivery_callback(session_entry.session_key, generation=1)
+        assert callback is not None
+        await callback()
+        notice_text = adapter.send.call_args[1].get("content") or adapter.send.call_args[0][1]
+        assert "Usage budget reached" in notice_text
+        assert "token_cap" in notice_text
+
+        persisted_entries = [call.args[1] for call in runner.session_store.append_to_transcript.call_args_list]
+        assert all("Usage budget reached" not in str(entry) for entry in persisted_entries)
+
+    @pytest.mark.asyncio
+    async def test_usage_budget_default_off_produces_no_handoff(
+        self, runner, adapter, platform, session_entry, monkeypatch
+    ):
+        """Default-off: an agent result with no budget-stop signal produces no
+        handoff and no post-delivery notice — behavior is unchanged."""
+        from gateway import run as gateway_run
+        from gateway.run import GatewayRunner
+
+        # Checkpoint auto_trigger off too, so neither path fires.
+        monkeypatch.setattr(
+            gateway_run,
+            "_load_gateway_config",
+            lambda: {"context_checkpoint": {"enabled": True, "base_url": "https://cog.example"}},
+        )
+        runner.session_store.load_transcript.return_value = []
+        runner.session_store.has_any_sessions.return_value = True
+        runner._run_agent = AsyncMock(return_value=self._budget_agent_result())
+        runner._session_run_generation = {session_entry.session_key: 1}
+
+        event = make_event(platform, text="hello")
+        returned = await GatewayRunner._handle_message_with_agent(
+            runner, event, event.source, session_entry.session_key, 1,
+        )
+
+        assert returned == "normal response"
+        # No budget handoff registered as a post-delivery notice.
+        callback = adapter.pop_post_delivery_callback(session_entry.session_key, generation=1)
+        if callback is not None:
+            await callback()
+            for c in adapter.send.call_args_list:
+                text = (c.kwargs.get("content") if c.kwargs else None) or (c.args[1] if len(c.args) > 1 else "")
+                assert "Usage budget reached" not in str(text)
+
     @pytest.mark.asyncio
     async def test_auto_context_checkpoint_threshold_missing_token_fails_closed_without_post(
         self, runner, platform, monkeypatch

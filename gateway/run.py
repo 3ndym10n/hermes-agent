@@ -1903,6 +1903,56 @@ def _load_gateway_config() -> dict:
     return {}
 
 
+# Usage Budget Guard (V0-E2) defaults applied when the guard is enabled but a
+# cap is left unspecified. Derived from observed runaway logs (a task hit the
+# 90/90 iteration ceiling at ~208k-token context). These bound a task well below
+# 90 iterations while staying generous enough not to interrupt ordinary short
+# chat (which uses a handful of calls). An operator can override either, or set
+# it to 0 to disable that single cap explicitly.
+_USAGE_BUDGET_DEFAULT_MAX_ITERATIONS = 30
+_USAGE_BUDGET_DEFAULT_MAX_PROMPT_TOKENS = 2_000_000
+
+
+def _build_usage_budget(config: dict):
+    """Build a per-task :class:`UsageBudget` from config; default-off.
+
+    Reads the optional ``usage_budget`` config block (V0-E2)::
+
+        usage_budget:
+          enabled: false          # master switch (kill switch) — default off
+          max_iterations: 30      # omit -> sane default; 0 = disable this cap
+          max_prompt_tokens: 2000000  # omit -> sane default; 0 = disable this cap
+
+    When the block is absent or ``enabled`` is falsy, returns an inert
+    ``UsageBudget()`` (no caps) so the agent behaves exactly as before — ordinary
+    chat is untouched. When ``enabled`` is true, an omitted cap takes the sane
+    default above (never 90 iterations); an explicit ``0`` disables just that
+    cap. Fails open to a disabled budget on any malformed config.
+    """
+    from agent.usage_budget import UsageBudget
+
+    try:
+        cfg = config.get("usage_budget", {}) if isinstance(config, dict) else {}
+        if not isinstance(cfg, dict):
+            return UsageBudget()
+        if not is_truthy_value(cfg.get("enabled", False), default=False):
+            return UsageBudget()
+        # Enabled: omitted caps take the sane default; explicit values (incl. 0
+        # to disable a single cap) are honored verbatim.
+        max_iter = (
+            cfg["max_iterations"] if "max_iterations" in cfg
+            else _USAGE_BUDGET_DEFAULT_MAX_ITERATIONS
+        )
+        max_tok = (
+            cfg["max_prompt_tokens"] if "max_prompt_tokens" in cfg
+            else _USAGE_BUDGET_DEFAULT_MAX_PROMPT_TOKENS
+        )
+        return UsageBudget(max_iterations=max_iter, max_prompt_tokens=max_tok)
+    except Exception:
+        logger.debug("usage_budget config parse failed; defaulting to disabled")
+        return UsageBudget()
+
+
 def _load_gateway_runtime_config() -> dict:
     """Load gateway config for runtime reads, expanding supported ``${VAR}`` refs.
 
@@ -9198,7 +9248,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # normal transcript persistence so checkpoint output stays a
             # non-persisted platform notice.
             try:
-                _auto_checkpoint_message = self._maybe_render_auto_context_checkpoint(
+                # Usage Budget Guard (V0-E2) takes precedence: if the agent loop
+                # stopped the task on a per-task budget cap, render that handoff.
+                # Otherwise fall back to the V0-E token-threshold auto-checkpoint.
+                # Both flow through the same non-persisted delivery below.
+                _auto_checkpoint_message = self._maybe_render_usage_budget_handoff(
                     event=event,
                     response=response,
                     agent_result=agent_result,
@@ -9206,6 +9260,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     session_id=session_entry.session_id,
                     session_key=session_key,
                 )
+                if not _auto_checkpoint_message:
+                    _auto_checkpoint_message = self._maybe_render_auto_context_checkpoint(
+                        event=event,
+                        response=response,
+                        agent_result=agent_result,
+                        history=history,
+                        session_id=session_entry.session_id,
+                        session_key=session_key,
+                    )
             except Exception as _auto_ckpt_exc:
                 logger.debug("auto context checkpoint hook failed: %s", _auto_ckpt_exc)
                 _auto_checkpoint_message = ""
@@ -10713,11 +10776,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     except Exception as e:
                         logger.warning("Background task vision enrichment failed: %s", e)
 
+            _usage_budget = _build_usage_budget(user_config)
+
             def run_sync():
                 agent = AIAgent(
                     model=turn_route["model"],
                     **turn_route["runtime"],
                     max_iterations=max_iterations,
+                    usage_budget=_usage_budget,
                     quiet_mode=True,
                     verbose_logging=False,
                     enabled_toolsets=enabled_toolsets,
@@ -14900,6 +14966,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             # Per-message state — callbacks and reasoning config change every
             # turn and must not be baked into the cached agent constructor.
+            # Usage Budget Guard (V0-E2): rebuild the per-task budget from
+            # current config each turn so a cached agent honors live caps and
+            # (when off) stays inert. Reset of the per-task token counter happens
+            # at the top of run_conversation.
+            agent.usage_budget = _build_usage_budget(user_config)
             agent.tool_progress_callback = progress_callback if tool_progress_enabled else None
             # Discord voice verbal-ack hook (fires once per turn on first tool
             # call; armed only when in a voice channel with the mixer running).
