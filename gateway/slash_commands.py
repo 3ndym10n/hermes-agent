@@ -1291,6 +1291,99 @@ class GatewaySlashCommandsMixin:
         base_url = str(cfg_get(config, "context_checkpoint", "base_url", default="") or "").strip()
         return enabled, base_url
 
+    def _maybe_render_auto_context_checkpoint(
+        self,
+        *,
+        event: MessageEvent,
+        response: str,
+        agent_result: dict,
+        history: list,
+        session_id: str,
+        session_key: str,
+    ) -> str:
+        """Return a V0-E automatic checkpoint handoff message, or empty string.
+
+        This is read-only protection only. It never resets, rotates, injects,
+        writes storage, or creates a new session. The only external call is the
+        already-existing Cogitator ``build_context_checkpoint`` bridge action.
+        """
+        import os
+
+        try:
+            from gateway.run import _load_gateway_config
+
+            config = _load_gateway_config()
+        except Exception:
+            return ""
+        checkpoint_cfg = config.get("context_checkpoint", {}) if isinstance(config, dict) else {}
+        if not isinstance(checkpoint_cfg, dict):
+            return ""
+
+        enabled = is_truthy_value(
+            cfg_get(config, "context_checkpoint", "enabled", default=False), default=False
+        )
+        base_url = str(cfg_get(config, "context_checkpoint", "base_url", default="") or "").strip()
+
+        from gateway.cogitator_checkpoint_bridge import (
+            CheckpointBridgeError,
+            TOKEN_ENV,
+            build_auto_checkpoint_context,
+            evaluate_auto_checkpoint_trigger,
+            render_auto_checkpoint_message,
+            request_context_checkpoint,
+        )
+
+        decision = evaluate_auto_checkpoint_trigger(
+            checkpoint_cfg,
+            prompt_tokens=(agent_result or {}).get("last_prompt_tokens", 0),
+            context_length=(agent_result or {}).get("context_length", 0),
+            message_count=len(history or []),
+        )
+        if not decision.get("should_trigger"):
+            return ""
+
+        if not enabled or not base_url:
+            return (
+                "🛟 Automatic Context Protection triggered, but context checkpoint is not configured.\n"
+                "No automatic injection or rotation has happened.\n"
+                "Next action: set context_checkpoint.enabled/base_url, or run /context_checkpoint manually after configuring the bridge."
+            )
+
+        token = str(os.environ.get(TOKEN_ENV, "") or "").strip()
+        if not token:
+            return (
+                "🛟 Automatic Context Protection triggered, but context checkpoint is not configured.\n"
+                "Reason: COGITATOR_BRIDGE_TOKEN is missing.\n"
+                "No automatic injection or rotation has happened."
+            )
+
+        context_fields = build_auto_checkpoint_context(
+            current_user_message=getattr(event, "text", ""),
+            final_response=response,
+            trigger_decision=decision,
+            session_id=session_id,
+            session_key=session_key,
+        )
+        try:
+            bridge_response = request_context_checkpoint(
+                context_fields, base_url=base_url, token=token
+            )
+        except CheckpointBridgeError as exc:
+            logger.warning("[context_checkpoint:auto] bridge error code=%s", exc.code)
+            return (
+                "🛟 Automatic Context Protection triggered, but checkpoint creation is unavailable.\n"
+                f"Reason: {exc.code}.\n"
+                "No automatic injection or rotation has happened."
+            )
+        except Exception:
+            logger.exception("[context_checkpoint:auto] unexpected error")
+            return (
+                "🛟 Automatic Context Protection triggered, but checkpoint creation failed.\n"
+                "Reason: unexpected error.\n"
+                "No automatic injection or rotation has happened."
+            )
+        return render_auto_checkpoint_message(bridge_response, trigger_decision=decision)
+
     async def _handle_context_checkpoint_command(self, event: MessageEvent) -> str:
         """Handle /context_checkpoint — request a read-only Cogitator checkpoint.
 
