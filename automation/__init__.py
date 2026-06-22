@@ -20,6 +20,13 @@ from .safety import (
     match_any,
 )
 from .task_packet import WorkerTaskPacket
+from .validator import (
+    EvidenceValidator,
+    FixLoopResult,
+    Verdict,
+    build_fix_packet,
+    run_fix_loop,
+)
 from .worker import (
     BackendWorker,
     DestructiveGitError,
@@ -35,13 +42,18 @@ __all__ = [
     "CodexWorkerAdapter",
     "DEFAULT_PROTECTED_GLOBS",
     "DestructiveGitError",
+    "EvidenceValidator",
     "FakeWorkerAdapter",
+    "FixLoopResult",
     "GhPublisher",
     "GitRunner",
+    "Verdict",
     "WorkerAdapter",
     "WorkerEvidence",
     "WorkerTaskPacket",
+    "build_fix_packet",
     "classify_changed_files",
     "is_destructive_git",
     "match_any",
+    "run_fix_loop",
 ]
