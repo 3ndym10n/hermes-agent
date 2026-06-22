@@ -3318,13 +3318,24 @@ class BasePlatformAdapter(ABC):
                 _prev = existing_cb
                 _new = callback
 
-                def _chained() -> None:
+                # Async-safe chaining: either chained callback may be a
+                # coroutine function (e.g. the auto context-checkpoint notice
+                # delivery). Awaiting their results here — and returning a
+                # coroutine from ``_chained`` — ensures the invocation sites,
+                # which gate on ``inspect.isawaitable``, actually await the
+                # work. A plain ``def`` swallowed async callbacks, leaving an
+                # orphaned coroutine ("coroutine ... was never awaited").
+                async def _chained() -> None:
                     try:
-                        _prev()
+                        _prev_result = _prev()
+                        if inspect.isawaitable(_prev_result):
+                            await _prev_result
                     except Exception:
                         logger.debug("Post-delivery callback failed", exc_info=True)
                     try:
-                        _new()
+                        _new_result = _new()
+                        if inspect.isawaitable(_new_result):
+                            await _new_result
                     except Exception:
                         logger.debug("Post-delivery callback failed", exc_info=True)
 
