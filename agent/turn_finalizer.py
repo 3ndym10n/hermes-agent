@@ -330,6 +330,10 @@ def finalize_turn(
         "api_calls": api_call_count,
         "completed": completed,
         "turn_exit_reason": _turn_exit_reason,
+        # Usage Budget Guard (V0-E2): the per-task cap that stopped this run,
+        # or None. The gateway uses this to render a non-persisted handoff
+        # notice. None on every normal (default-off) run.
+        "usage_budget_stopped": getattr(agent, "_usage_budget_stop_reason", None),
         "failed": failed,
         "partial": False,  # True only when stopped due to invalid tool calls
         "interrupted": interrupted,

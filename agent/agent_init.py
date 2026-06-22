@@ -32,6 +32,7 @@ from urllib.parse import urlparse, parse_qs, urlunparse
 
 from agent.context_compressor import ContextCompressor
 from agent.iteration_budget import IterationBudget
+from agent.usage_budget import UsageBudget
 from agent.memory_manager import StreamingContextScrubber
 from agent.model_metadata import (
     MINIMUM_CONTEXT_LENGTH,
@@ -216,6 +217,7 @@ def init_agent(
     session_db=None,
     parent_session_id: str = None,
     iteration_budget: "IterationBudget" = None,
+    usage_budget: "UsageBudget" = None,
     fallback_model: Dict[str, Any] = None,
     credential_pool=None,
     checkpoints_enabled: bool = False,
@@ -279,6 +281,11 @@ def init_agent(
     # Shared iteration budget — parent creates, children inherit.
     # Consumed by every LLM turn across parent + all subagents.
     agent.iteration_budget = iteration_budget or IterationBudget(max_iterations)
+    # Usage Budget Guard (V0-E2): default-off per-task iteration / prompt-token
+    # cap, checked before every provider call. A bare ``UsageBudget()`` has no
+    # caps and is inert, so unconfigured agents behave exactly as before.
+    agent.usage_budget = usage_budget or UsageBudget()
+    agent._usage_budget_stop_reason = None
     agent.tool_delay = tool_delay
     agent.save_trajectories = save_trajectories
     agent.verbose_logging = verbose_logging

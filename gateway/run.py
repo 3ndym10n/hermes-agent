@@ -1903,6 +1903,37 @@ def _load_gateway_config() -> dict:
     return {}
 
 
+def _build_usage_budget(config: dict):
+    """Build a per-task :class:`UsageBudget` from config; default-off.
+
+    Reads the optional ``usage_budget`` config block (V0-E2)::
+
+        usage_budget:
+          enabled: false          # master switch — default off
+          max_iterations: 0       # 0 = no iteration cap
+          max_prompt_tokens: 0    # 0 = no cumulative-prompt-token cap
+
+    When the block is absent or ``enabled`` is falsy, returns an inert
+    ``UsageBudget()`` (no caps) so the agent behaves exactly as before. Fails
+    open to a disabled budget on any malformed config.
+    """
+    from agent.usage_budget import UsageBudget
+
+    try:
+        cfg = config.get("usage_budget", {}) if isinstance(config, dict) else {}
+        if not isinstance(cfg, dict):
+            return UsageBudget()
+        if not is_truthy_value(cfg.get("enabled", False), default=False):
+            return UsageBudget()
+        return UsageBudget(
+            max_iterations=cfg.get("max_iterations", 0),
+            max_prompt_tokens=cfg.get("max_prompt_tokens", 0),
+        )
+    except Exception:
+        logger.debug("usage_budget config parse failed; defaulting to disabled")
+        return UsageBudget()
+
+
 def _load_gateway_runtime_config() -> dict:
     """Load gateway config for runtime reads, expanding supported ``${VAR}`` refs.
 
@@ -9198,7 +9229,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # normal transcript persistence so checkpoint output stays a
             # non-persisted platform notice.
             try:
-                _auto_checkpoint_message = self._maybe_render_auto_context_checkpoint(
+                # Usage Budget Guard (V0-E2) takes precedence: if the agent loop
+                # stopped the task on a per-task budget cap, render that handoff.
+                # Otherwise fall back to the V0-E token-threshold auto-checkpoint.
+                # Both flow through the same non-persisted delivery below.
+                _auto_checkpoint_message = self._maybe_render_usage_budget_handoff(
                     event=event,
                     response=response,
                     agent_result=agent_result,
@@ -9206,6 +9241,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     session_id=session_entry.session_id,
                     session_key=session_key,
                 )
+                if not _auto_checkpoint_message:
+                    _auto_checkpoint_message = self._maybe_render_auto_context_checkpoint(
+                        event=event,
+                        response=response,
+                        agent_result=agent_result,
+                        history=history,
+                        session_id=session_entry.session_id,
+                        session_key=session_key,
+                    )
             except Exception as _auto_ckpt_exc:
                 logger.debug("auto context checkpoint hook failed: %s", _auto_ckpt_exc)
                 _auto_checkpoint_message = ""
@@ -10713,11 +10757,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     except Exception as e:
                         logger.warning("Background task vision enrichment failed: %s", e)
 
+            _usage_budget = _build_usage_budget(user_config)
+
             def run_sync():
                 agent = AIAgent(
                     model=turn_route["model"],
                     **turn_route["runtime"],
                     max_iterations=max_iterations,
+                    usage_budget=_usage_budget,
                     quiet_mode=True,
                     verbose_logging=False,
                     enabled_toolsets=enabled_toolsets,
@@ -14900,6 +14947,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             # Per-message state — callbacks and reasoning config change every
             # turn and must not be baked into the cached agent constructor.
+            # Usage Budget Guard (V0-E2): rebuild the per-task budget from
+            # current config each turn so a cached agent honors live caps and
+            # (when off) stays inert. Reset of the per-task token counter happens
+            # at the top of run_conversation.
+            agent.usage_budget = _build_usage_budget(user_config)
             agent.tool_progress_callback = progress_callback if tool_progress_enabled else None
             # Discord voice verbal-ack hook (fires once per turn on first tool
             # call; armed only when in a voice channel with the mixer running).

@@ -594,6 +594,14 @@ def run_conversation(
     _plugin_user_context = _ctx.plugin_user_context
     _ext_prefetch_cache = _ctx.ext_prefetch_cache
 
+    # Usage Budget Guard (V0-E2): reset the per-task cumulative prompt-token
+    # counter and clear any prior stop reason. Default-off when no caps are set.
+    try:
+        agent.usage_budget.reset()
+        agent._usage_budget_stop_reason = None
+    except AttributeError:
+        pass
+
     # Main conversation loop counters (pure locals consumed by the loop below).
     api_call_count = 0
     final_response = None
@@ -631,7 +639,31 @@ def run_conversation(
             if not agent.quiet_mode:
                 agent._safe_print("\n⚡ Breaking out of tool loop due to interrupt...")
             break
-        
+
+        # ── Usage Budget Guard (V0-E2) ─────────────────────────────────
+        # Default-off per-task budget, checked BEFORE every provider call.
+        # When the configured iteration or cumulative-prompt-token cap is
+        # reached, stop the task cleanly: make no further provider call and do
+        # not retry. The gateway then renders the existing read-only Cogitator
+        # checkpoint (if configured) and delivers a separate, non-persisted
+        # handoff notice. ``api_call_count`` here is the number of provider
+        # calls already completed this task (it is incremented just below for
+        # the call this iteration would make).
+        _budget_stop = None
+        try:
+            _budget_stop = agent.usage_budget.exceeded(api_call_count)
+        except AttributeError:
+            _budget_stop = None
+        if _budget_stop is not None:
+            agent._usage_budget_stop_reason = _budget_stop
+            _turn_exit_reason = f"usage_budget_reached:{_budget_stop}"
+            if not agent.quiet_mode:
+                agent._safe_print(
+                    f"\n⚠️  Usage budget reached ({_budget_stop}) — stopping task "
+                    f"before another provider call (no retry)."
+                )
+            break
+
         api_call_count += 1
         agent._api_call_count = api_call_count
         agent._touch_activity(f"starting API call #{api_call_count}")
@@ -1873,6 +1905,12 @@ def run_conversation(
                     agent.session_completion_tokens += completion_tokens
                     agent.session_total_tokens += total_tokens
                     agent.session_api_calls += 1
+                    # Usage Budget Guard (V0-E2): accumulate this call's prompt
+                    # tokens so the next pre-call check can enforce the token cap.
+                    try:
+                        agent.usage_budget.record_prompt_tokens(prompt_tokens)
+                    except AttributeError:
+                        pass
                     agent.session_input_tokens += canonical_usage.input_tokens
                     agent.session_output_tokens += canonical_usage.output_tokens
                     agent.session_cache_read_tokens += canonical_usage.cache_read_tokens

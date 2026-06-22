@@ -101,6 +101,7 @@ from agent.process_bootstrap import (
     _get_proxy_for_base_url,
 )
 from agent.iteration_budget import IterationBudget
+from agent.usage_budget import UsageBudget
 
 
 from hermes_cli.env_loader import load_hermes_dotenv
@@ -405,6 +406,7 @@ class AIAgent:
         session_db=None,
         parent_session_id: str = None,
         iteration_budget: "IterationBudget" = None,
+        usage_budget: "UsageBudget" = None,
         fallback_model: Dict[str, Any] = None,
         credential_pool=None,
         checkpoints_enabled: bool = False,
@@ -480,6 +482,7 @@ class AIAgent:
             session_db=session_db,
             parent_session_id=parent_session_id,
             iteration_budget=iteration_budget,
+            usage_budget=usage_budget,
             fallback_model=fallback_model,
             credential_pool=credential_pool,
             checkpoints_enabled=checkpoints_enabled,

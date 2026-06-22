@@ -1384,6 +1384,112 @@ class GatewaySlashCommandsMixin:
             )
         return render_auto_checkpoint_message(bridge_response, trigger_decision=decision)
 
+    def _maybe_render_usage_budget_handoff(
+        self,
+        *,
+        event: MessageEvent,
+        response: str,
+        agent_result: dict,
+        history: list,
+        session_id: str,
+        session_key: str,
+    ) -> str:
+        """Return a Usage Budget Guard (V0-E2) handoff message, or empty string.
+
+        Triggered when the agent loop stopped the task because a per-task usage
+        budget (iteration or cumulative-prompt-token cap) was reached — signaled
+        by ``agent_result["usage_budget_stopped"]``. Like the V0-E automatic
+        checkpoint, this is read-only: it never resets, rotates, injects, writes
+        storage, or creates a new session. If the Cogitator checkpoint bridge is
+        safely configured it renders the existing ``build_context_checkpoint``
+        handoff packet; otherwise it returns a minimal local notice. The caller
+        delivers this as a separate, non-persisted platform notice.
+        """
+        import os
+
+        reason = (agent_result or {}).get("usage_budget_stopped")
+        if not reason:
+            return ""
+
+        try:
+            from gateway.run import _load_gateway_config
+
+            config = _load_gateway_config()
+        except Exception:
+            config = {}
+        checkpoint_cfg = config.get("context_checkpoint", {}) if isinstance(config, dict) else {}
+        if not isinstance(checkpoint_cfg, dict):
+            checkpoint_cfg = {}
+
+        enabled = is_truthy_value(
+            cfg_get(config, "context_checkpoint", "enabled", default=False), default=False
+        )
+        base_url = str(cfg_get(config, "context_checkpoint", "base_url", default="") or "").strip()
+
+        from gateway.cogitator_checkpoint_bridge import (
+            CheckpointBridgeError,
+            TOKEN_ENV,
+            build_auto_checkpoint_context,
+            render_auto_checkpoint_message,
+            request_context_checkpoint,
+        )
+
+        prompt_tokens = (agent_result or {}).get("last_prompt_tokens", 0)
+        context_length = (agent_result or {}).get("context_length", 0)
+        # Synthesize a decision so the shared context builder / renderer label the
+        # handoff with the budget-stop cause rather than a token threshold.
+        decision = {
+            "enabled": True,
+            "should_trigger": True,
+            "reason": f"usage_budget:{reason}",
+            "prompt_tokens": prompt_tokens,
+            "context_length": context_length,
+            "threshold": 0,
+            "threshold_tokens": 0,
+            "message_count": len(history or []),
+            "hard_message_limit": 0,
+        }
+
+        # The bridge call is the only external dependency. When the checkpoint
+        # bridge is not safely configured, still deliver a local handoff notice
+        # so the user knows the task stopped on budget — no bridge, no injection.
+        token = str(os.environ.get(TOKEN_ENV, "") or "").strip()
+        if not enabled or not base_url or not token:
+            return (
+                "🛟 Usage budget reached — task stopped before another model call (no retry).\n"
+                f"Reason: {reason}.\n"
+                "No automatic checkpoint, injection, rotation, or /new has happened.\n"
+                "Next action: run /context_checkpoint to capture a handoff, then start a "
+                "fresh chat with /new and paste it as the first message."
+            )
+
+        context_fields = build_auto_checkpoint_context(
+            current_user_message=getattr(event, "text", ""),
+            final_response=response,
+            trigger_decision=decision,
+            session_id=session_id,
+            session_key=session_key,
+        )
+        try:
+            bridge_response = request_context_checkpoint(
+                context_fields, base_url=base_url, token=token
+            )
+        except CheckpointBridgeError as exc:
+            logger.warning("[usage_budget:handoff] bridge error code=%s", exc.code)
+            return (
+                "🛟 Usage budget reached — task stopped before another model call (no retry).\n"
+                f"Reason: {reason}. Checkpoint creation is unavailable ({exc.code}).\n"
+                "No automatic injection or rotation has happened."
+            )
+        except Exception:
+            logger.exception("[usage_budget:handoff] unexpected error")
+            return (
+                "🛟 Usage budget reached — task stopped before another model call (no retry).\n"
+                f"Reason: {reason}. Checkpoint creation failed.\n"
+                "No automatic injection or rotation has happened."
+            )
+        return render_auto_checkpoint_message(bridge_response, trigger_decision=decision)
+
     async def _handle_context_checkpoint_command(self, event: MessageEvent) -> str:
         """Handle /context_checkpoint — request a read-only Cogitator checkpoint.
 
