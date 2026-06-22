@@ -15,7 +15,10 @@ from gateway.cogitator_checkpoint_bridge import (
     BRIDGE_PATH,
     CHECKPOINT_CONTEXT_FIELDS,
     CheckpointBridgeError,
+    build_auto_checkpoint_context,
     build_checkpoint_request,
+    evaluate_auto_checkpoint_trigger,
+    render_auto_checkpoint_message,
     render_checkpoint_message,
     request_context_checkpoint,
     validate_checkpoint_response,
@@ -99,6 +102,96 @@ class TestBuildRequest:
         assert set(packet["context"]) == set(CHECKPOINT_CONTEXT_FIELDS)
         assert "token" not in packet["context"]
         assert "secrets" not in packet["context"]
+
+
+class TestAutoCheckpointTrigger:
+    def test_default_off_does_not_trigger(self):
+        decision = evaluate_auto_checkpoint_trigger(
+            {},
+            prompt_tokens=900,
+            context_length=1000,
+            message_count=12,
+        )
+        assert decision["enabled"] is False
+        assert decision["should_trigger"] is False
+
+    def test_enabled_token_threshold_triggers(self):
+        decision = evaluate_auto_checkpoint_trigger(
+            {"auto_trigger": {"enabled": True, "threshold": 0.75}},
+            prompt_tokens=800,
+            context_length=1000,
+            message_count=12,
+        )
+        assert decision["enabled"] is True
+        assert decision["should_trigger"] is True
+        assert decision["reason"] == "token_threshold"
+        assert decision["threshold_tokens"] == 750
+        assert decision["prompt_tokens"] == 800
+        assert decision["context_length"] == 1000
+
+    def test_enabled_below_threshold_does_not_trigger(self):
+        decision = evaluate_auto_checkpoint_trigger(
+            {"auto_trigger": {"enabled": True, "threshold": 0.90}},
+            prompt_tokens=800,
+            context_length=1000,
+            message_count=12,
+        )
+        assert decision["should_trigger"] is False
+        assert decision["reason"] == "below_threshold"
+
+    def test_enabled_hard_message_limit_triggers_without_token_data(self):
+        decision = evaluate_auto_checkpoint_trigger(
+            {"auto_trigger": {"enabled": True, "hard_message_limit": 5}},
+            prompt_tokens=0,
+            context_length=0,
+            message_count=6,
+        )
+        assert decision["should_trigger"] is True
+        assert decision["reason"] == "message_count_threshold"
+
+    def test_build_auto_checkpoint_context_contains_handoff_instruction(self):
+        context = build_auto_checkpoint_context(
+            current_user_message="keep going",
+            final_response="done for now",
+            trigger_decision={
+                "reason": "token_threshold",
+                "prompt_tokens": 800,
+                "context_length": 1000,
+                "threshold_tokens": 750,
+                "message_count": 12,
+            },
+            session_id="sess-1",
+            session_key="telegram:chat:user",
+        )
+        assert "approaching unsafe context size" in context["purpose"]
+        assert "keep going" in context["current_state"]
+        assert "done for now" in context["current_state"]
+        assert "No storage/db mutation" in context["active_constraints"]
+        assert context["next_recommended_action"] == (
+            "Start a clean continuation with /new, then paste this checkpoint/handoff packet as the first message."
+        )
+        assert any("sess-1" in path for path in context["artifact_paths"])
+
+    def test_render_auto_checkpoint_message_includes_exact_clean_continuation_action(self):
+        message = render_auto_checkpoint_message(
+            _ok_response(
+                checkpoint=_checkpoint(
+                    next_recommended_action=(
+                        "Start a clean continuation with /new, then paste this checkpoint/handoff packet as the first message."
+                    )
+                )
+            ),
+            trigger_decision={
+                "prompt_tokens": 800,
+                "context_length": 1000,
+                "threshold_tokens": 750,
+                "reason": "token_threshold",
+            },
+        )
+        assert "Automatic Context Protection" in message
+        assert "No automatic injection or rotation has happened" in message
+        assert "Clean continuation action:" in message
+        assert "/new" in message
 
 
 class TestRequestTransport:

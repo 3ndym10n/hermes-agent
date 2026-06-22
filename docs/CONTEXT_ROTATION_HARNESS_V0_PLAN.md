@@ -1,7 +1,7 @@
 # Context Rotation — Harness-Side V0 Plan
 
-**Status:** Planning only (docs). No runtime code, tests, config, or secrets are
-touched by this document.
+**Status:** V0-E implemented as a safe automatic checkpoint trigger only. Full
+auto-rotation remains off/unimplemented.
 **Owner area:** Hermes/Virgil runtime (the live agent loop), not Cogitator.
 **Related:** Cogitator PR #831 (merged). The Cogitator "Context Window
 Management" plan places the *live* detect → rotate → inject → continue loop in
@@ -32,6 +32,67 @@ says `usage_limit_reached` (a scheduled plan cap, not a transient blip).
 
 Context Rotation V0 is the controlled middle path between "compress in place" and
 "throw it all away."
+
+---
+
+## V0-E implemented slice — automatic checkpoint trigger only
+
+V0-E is deliberately smaller than full Context Rotation. Hermes now has an
+operator-facing automatic protection hook that can build and return a Cogitator
+checkpoint/handoff packet when a gateway turn reports prompt-token usage near a
+configured context threshold.
+
+### What is automated
+
+- After a gateway agent turn completes, Hermes reads the turn's
+  `last_prompt_tokens` and `context_length` from the agent result.
+- If `context_checkpoint.auto_trigger.enabled: true` and the configured threshold
+  is reached, Hermes calls the existing Cogitator bridge action
+  `build_context_checkpoint`.
+- Hermes validates the bridge response with the existing read-only contract
+  (`mutated: false`, no stateful response fields, and
+  `checkpoint.safety.mutation_performed: false`).
+- Hermes delivers a visible **Automatic Context Protection (V0-E)** handoff as
+  a post-persistence, non-transcript platform notice. On adapters without the
+  one-shot post-delivery callback path, the fallback append happens only after
+  transcript/session persistence has already completed.
+
+### What is still manual / not implemented
+
+- No automatic `/new`, `/reset`, `/compress`, session rotation, or destructive
+  action.
+- No automatic checkpoint injection into a new context.
+- No storage/db mutation by the checkpoint trigger itself.
+- Manual `/context_checkpoint <state>` remains available and unchanged.
+
+### Config
+
+The bridge token remains a secret environment variable:
+
+```bash
+COGITATOR_BRIDGE_TOKEN=...
+```
+
+Non-secret behavior lives in `config.yaml`:
+
+```yaml
+context_checkpoint:
+  enabled: true
+  base_url: "https://worker-production-42f3.up.railway.app"
+  auto_trigger:
+    enabled: true
+    threshold: 0.80       # fraction of context_length; 80 is also accepted
+    hard_message_limit: 400
+```
+
+The exact clean-continuation action shown in the V0-E output is:
+
+> Start a clean continuation with `/new`, then paste this checkpoint/handoff
+> packet as the first message.
+
+V0-F is the next slice: define and test a safe automatic injection/continuation
+mechanism so Hermes can create the clean continuation itself instead of asking
+Cal to run `/new` and paste the packet manually.
 
 ---
 

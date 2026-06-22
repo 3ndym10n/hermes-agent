@@ -9191,6 +9191,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if _footer_line and response and not agent_result.get("already_sent") and not _intentional_silence:
                 response = f"{response}\n\n{_footer_line}"
 
+            # Context Rotation V0-E: automatic checkpoint trigger only. Build
+            # the optional notice now, but do NOT mutate ``response`` here: the
+            # transcript persistence block below may persist ``response`` as the
+            # assistant row on fallback paths. Delivery is deferred until after
+            # normal transcript persistence so checkpoint output stays a
+            # non-persisted platform notice.
+            try:
+                _auto_checkpoint_message = self._maybe_render_auto_context_checkpoint(
+                    event=event,
+                    response=response,
+                    agent_result=agent_result,
+                    history=history,
+                    session_id=session_entry.session_id,
+                    session_key=session_key,
+                )
+            except Exception as _auto_ckpt_exc:
+                logger.debug("auto context checkpoint hook failed: %s", _auto_ckpt_exc)
+                _auto_checkpoint_message = ""
+
             # Emit agent:end hook
             await self.hooks.emit("agent:end", {
                 **hook_ctx,
@@ -9461,6 +9480,45 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _already_sent = bool(agent_result.get("already_sent"))
             if self._should_send_voice_reply(event, response, agent_messages, already_sent=_already_sent):
                 await self._send_voice_reply(event, response)
+
+            # Context Rotation V0-E checkpoint notices are delivered only after
+            # transcript/session persistence above. Prefer the existing
+            # post-delivery callback path so the checkpoint appears as a
+            # separate, non-persisted platform notice after the normal response.
+            # If a platform adapter lacks callbacks, append only here (after
+            # persistence), never before transcript writes.
+            if _auto_checkpoint_message and not _intentional_silence:
+                _ckpt_adapter = self.adapters.get(source.platform)
+
+                async def _deliver_auto_checkpoint_notice() -> None:
+                    try:
+                        if _ckpt_adapter:
+                            await _ckpt_adapter.send(
+                                source.chat_id,
+                                _auto_checkpoint_message,
+                                metadata=self._thread_metadata_for_source(
+                                    source, self._reply_anchor_for_event(event)
+                                ),
+                            )
+                    except Exception as _ckpt_send_exc:
+                        logger.debug("auto context checkpoint send failed: %s", _ckpt_send_exc)
+
+                if agent_result.get("already_sent") and not agent_result.get("failed"):
+                    await _deliver_auto_checkpoint_notice()
+                elif response and _ckpt_adapter and hasattr(_ckpt_adapter, "register_post_delivery_callback"):
+                    try:
+                        _ckpt_adapter.register_post_delivery_callback(
+                            session_key,
+                            _deliver_auto_checkpoint_notice,
+                            generation=run_generation,
+                        )
+                    except Exception as _ckpt_reg_exc:
+                        logger.debug("auto context checkpoint callback registration failed: %s", _ckpt_reg_exc)
+                        response = f"{response}\n\n{_auto_checkpoint_message}"
+                elif response:
+                    response = f"{response}\n\n{_auto_checkpoint_message}"
+                else:
+                    await _deliver_auto_checkpoint_notice()
 
             # If streaming already delivered the response, extract and
             # deliver any MEDIA: files before returning None.  Streaming

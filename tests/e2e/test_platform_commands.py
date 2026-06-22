@@ -443,6 +443,240 @@ class TestSlashCommands:
         runner._handle_message_with_agent.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_auto_context_checkpoint_default_off_does_not_contact_bridge(
+        self, runner, platform, monkeypatch
+    ):
+        """V0-E default-off: normal turns do not contact Cogitator."""
+        import gateway.cogitator_checkpoint_bridge as bridge_mod
+        from gateway import run as gateway_run
+
+        monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
+        monkeypatch.setenv("COGITATOR_BRIDGE_TOKEN", "should-not-be-used")
+        monkeypatch.setattr(
+            bridge_mod,
+            "request_context_checkpoint",
+            MagicMock(side_effect=AssertionError("auto checkpoint is default-off")),
+        )
+        history = [
+            {"role": "user", "content": "old"},
+            {"role": "assistant", "content": "reply"},
+        ]
+        event = make_event(platform, text="continue")
+
+        message = runner._maybe_render_auto_context_checkpoint(
+            event=event,
+            response="normal response",
+            agent_result={
+                "final_response": "normal response",
+                "last_prompt_tokens": 900,
+                "context_length": 1000,
+            },
+            history=history,
+            session_id="sess-1",
+            session_key="e2e-session",
+        )
+
+        assert message == ""
+        bridge_mod.request_context_checkpoint.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_auto_context_checkpoint_threshold_returns_handoff_packet(
+        self, runner, platform, monkeypatch, caplog
+    ):
+        """V0-E threshold hit: calls build_context_checkpoint and returns handoff."""
+        import gateway.cogitator_checkpoint_bridge as bridge_mod
+        from gateway import run as gateway_run
+
+        monkeypatch.setattr(
+            gateway_run,
+            "_load_gateway_config",
+            lambda: {
+                "context_checkpoint": {
+                    "enabled": True,
+                    "base_url": "https://cog.example",
+                    "auto_trigger": {"enabled": True, "threshold": 0.75},
+                }
+            },
+        )
+        secret_token = "tok-DO-NOT-LEAK-AUTO-12345"
+        monkeypatch.setenv("COGITATOR_BRIDGE_TOKEN", secret_token)
+        captured = {}
+
+        def fake_request(context_fields, *, base_url, token, urlopen=None):
+            captured["context"] = context_fields
+            captured["base_url"] = base_url
+            captured["token"] = token
+            return {
+                "status": "ok",
+                "requested_action": "build_context_checkpoint",
+                "mutated": False,
+                "proposal_only": True,
+                "checkpoint": {
+                    "purpose": context_fields["purpose"],
+                    "current_state": context_fields["current_state"],
+                    "active_constraints": context_fields["active_constraints"],
+                    "decisions_made": context_fields["decisions_made"],
+                    "open_questions": context_fields["open_questions"],
+                    "artifact_paths": context_fields["artifact_paths"],
+                    "verification": context_fields["verification"],
+                    "next_recommended_action": context_fields["next_recommended_action"],
+                    "safety": {"mutation_allowed": False, "mutation_performed": False},
+                },
+            }
+
+        monkeypatch.setattr(bridge_mod, "request_context_checkpoint", fake_request)
+        history = [
+            {"role": "user", "content": "old"},
+            {"role": "assistant", "content": "reply"},
+        ]
+        event = make_event(platform, text="continue the task")
+
+        with caplog.at_level("DEBUG"):
+            message = runner._maybe_render_auto_context_checkpoint(
+                event=event,
+                response="normal response",
+                agent_result={
+                    "final_response": "normal response",
+                    "last_prompt_tokens": 800,
+                    "context_length": 1000,
+                },
+                history=history,
+                session_id="sess-1",
+                session_key="e2e-session",
+            )
+
+        assert "Automatic Context Protection" in message
+        assert "Clean continuation action:" in message
+        assert "/new" in message
+        assert captured["base_url"] == "https://cog.example"
+        assert captured["token"] == secret_token
+        assert "continue the task" in captured["context"]["current_state"]
+        assert captured["context"]["next_recommended_action"] == (
+            "Start a clean continuation with /new, then paste this checkpoint/handoff packet as the first message."
+        )
+        assert secret_token not in message
+        assert secret_token not in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_auto_context_checkpoint_output_is_not_persisted_to_transcript(
+        self, runner, adapter, platform, session_entry, monkeypatch
+    ):
+        """V0-E automatic checkpoint is a post-persistence notice, not transcript content."""
+        import gateway.cogitator_checkpoint_bridge as bridge_mod
+        from gateway import run as gateway_run
+        from gateway.run import GatewayRunner
+
+        monkeypatch.setattr(
+            gateway_run,
+            "_load_gateway_config",
+            lambda: {
+                "context_checkpoint": {
+                    "enabled": True,
+                    "base_url": "https://cog.example",
+                    "auto_trigger": {"enabled": True, "threshold": 0.75},
+                }
+            },
+        )
+        monkeypatch.setenv("COGITATOR_BRIDGE_TOKEN", "tok-not-persisted")
+
+        def fake_request(context_fields, *, base_url, token, urlopen=None):
+            return {
+                "status": "ok",
+                "requested_action": "build_context_checkpoint",
+                "mutated": False,
+                "proposal_only": True,
+                "checkpoint": {
+                    "purpose": context_fields["purpose"],
+                    "current_state": context_fields["current_state"],
+                    "active_constraints": context_fields["active_constraints"],
+                    "decisions_made": context_fields["decisions_made"],
+                    "open_questions": context_fields["open_questions"],
+                    "artifact_paths": context_fields["artifact_paths"],
+                    "verification": context_fields["verification"],
+                    "next_recommended_action": context_fields["next_recommended_action"],
+                    "safety": {"mutation_allowed": False, "mutation_performed": False},
+                },
+            }
+
+        monkeypatch.setattr(bridge_mod, "request_context_checkpoint", fake_request)
+        runner.session_store.load_transcript.return_value = []
+        runner.session_store.has_any_sessions.return_value = True
+        runner._run_agent = AsyncMock(
+            return_value={
+                "final_response": "normal response",
+                "messages": [],
+                "tools": [],
+                "last_prompt_tokens": 800,
+                "context_length": 1000,
+            }
+        )
+        runner._session_run_generation = {session_entry.session_key: 1}
+
+        event = make_event(platform, text="continue the task")
+        returned = await GatewayRunner._handle_message_with_agent(
+            runner,
+            event,
+            event.source,
+            session_entry.session_key,
+            1,
+        )
+
+        assert returned == "normal response"
+        persisted_entries = [call.args[1] for call in runner.session_store.append_to_transcript.call_args_list]
+        assistant_entries = [entry for entry in persisted_entries if entry.get("role") == "assistant"]
+        assert len(assistant_entries) == 1
+        assert assistant_entries[0]["content"] == "normal response"
+        assert all("Automatic Context Protection" not in str(entry) for entry in persisted_entries)
+        assert all("Clean continuation action" not in str(entry) for entry in persisted_entries)
+
+        callback = adapter.pop_post_delivery_callback(session_entry.session_key, generation=1)
+        assert callback is not None
+        await callback()
+        notice_text = adapter.send.call_args[1].get("content") or adapter.send.call_args[0][1]
+        assert "Automatic Context Protection" in notice_text
+        assert "Clean continuation action:" in notice_text
+
+    @pytest.mark.asyncio
+    async def test_auto_context_checkpoint_threshold_missing_token_fails_closed_without_post(
+        self, runner, platform, monkeypatch
+    ):
+        """V0-E threshold hit without token: visible fail-closed notice, no POST."""
+        import gateway.cogitator_checkpoint_bridge as bridge_mod
+        from gateway import run as gateway_run
+
+        monkeypatch.setattr(
+            gateway_run,
+            "_load_gateway_config",
+            lambda: {
+                "context_checkpoint": {
+                    "enabled": True,
+                    "base_url": "https://cog.example",
+                    "auto_trigger": {"enabled": True, "threshold": 0.75},
+                }
+            },
+        )
+        monkeypatch.delenv("COGITATOR_BRIDGE_TOKEN", raising=False)
+        post = MagicMock(side_effect=AssertionError("must not POST without token"))
+        monkeypatch.setattr(bridge_mod, "request_context_checkpoint", post)
+
+        message = runner._maybe_render_auto_context_checkpoint(
+            event=make_event(platform, text="continue the task"),
+            response="normal response",
+            agent_result={
+                "last_prompt_tokens": 800,
+                "context_length": 1000,
+            },
+            history=[{"role": "user", "content": "old"}],
+            session_id="sess-1",
+            session_key="e2e-session",
+        )
+
+        assert "Automatic Context Protection triggered" in message
+        assert "COGITATOR_BRIDGE_TOKEN is missing" in message
+        assert "No automatic injection or rotation has happened" in message
+        post.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_sequential_commands_share_session(self, adapter, platform):
         """Two commands from the same chat_id should both succeed."""
         send_help = await send_and_capture(adapter, "/help", platform)

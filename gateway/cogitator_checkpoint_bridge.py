@@ -38,6 +38,11 @@ _USER_INTENT = (
     "do not rotate or inject."
 )
 _REQUEST_TIMEOUT_SECONDS = 20
+_AUTO_DEFAULT_THRESHOLD = 0.80
+_AUTO_DEFAULT_HARD_MESSAGE_LIMIT = 400
+_AUTO_CONTINUATION_ACTION = (
+    "Start a clean continuation with /new, then paste this checkpoint/handoff packet as the first message."
+)
 
 # The only context fields ever forwarded to the bridge. Mirrors Cogitator's
 # COGITATOR_BRIDGE_CONTEXT_CHECKPOINT_CONTEXT_FIELDS.
@@ -124,6 +129,158 @@ def build_checkpoint_request(context_fields: Optional[Mapping[str, Any]]) -> dic
         "approval_status": "draft_only",
         "risk_level": "low",
         "context": _build_context(context_fields or {}),
+    }
+
+
+def _is_enabled(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed >= 0 else default
+
+
+def _safe_threshold(value: Any) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return _AUTO_DEFAULT_THRESHOLD
+    if parsed <= 0:
+        return _AUTO_DEFAULT_THRESHOLD
+    if parsed > 1:
+        parsed = parsed / 100.0
+    return parsed if 0 < parsed <= 1 else _AUTO_DEFAULT_THRESHOLD
+
+
+def evaluate_auto_checkpoint_trigger(
+    context_checkpoint_config: Mapping[str, Any] | None,
+    *,
+    prompt_tokens: Any,
+    context_length: Any,
+    message_count: Any,
+) -> dict[str, Any]:
+    """Return a deterministic V0-E automatic checkpoint decision.
+
+    Detection only: no bridge call, transcript write, injection, rotation,
+    reset, or persistence. Non-secret settings live under
+    ``context_checkpoint.auto_trigger`` in config.yaml and default off.
+    """
+    cfg = context_checkpoint_config if isinstance(context_checkpoint_config, Mapping) else {}
+    auto_cfg = cfg.get("auto_trigger", {})
+    if not isinstance(auto_cfg, Mapping):
+        auto_cfg = {}
+
+    enabled = _is_enabled(auto_cfg.get("enabled", False))
+    threshold = _safe_threshold(auto_cfg.get("threshold", _AUTO_DEFAULT_THRESHOLD))
+    hard_message_limit = _safe_int(
+        auto_cfg.get("hard_message_limit", _AUTO_DEFAULT_HARD_MESSAGE_LIMIT),
+        _AUTO_DEFAULT_HARD_MESSAGE_LIMIT,
+    )
+    prompt = _safe_int(prompt_tokens)
+    ctx_len = _safe_int(context_length)
+    msg_count = _safe_int(message_count)
+    threshold_tokens = int(ctx_len * threshold) if ctx_len > 0 else 0
+
+    decision = {
+        "enabled": enabled,
+        "should_trigger": False,
+        "reason": "disabled" if not enabled else "insufficient_usage_data",
+        "prompt_tokens": prompt,
+        "context_length": ctx_len,
+        "threshold": threshold,
+        "threshold_tokens": threshold_tokens,
+        "message_count": msg_count,
+        "hard_message_limit": hard_message_limit,
+    }
+    if not enabled:
+        return decision
+
+    if threshold_tokens > 0:
+        if prompt >= threshold_tokens:
+            decision["should_trigger"] = True
+            decision["reason"] = "token_threshold"
+        else:
+            decision["reason"] = "below_threshold"
+        return decision
+
+    if hard_message_limit > 0 and msg_count >= hard_message_limit:
+        decision["should_trigger"] = True
+        decision["reason"] = "message_count_threshold"
+    return decision
+
+
+def _clip(text: Any, limit: int = 2000) -> str:
+    value = str(text or "").strip()
+    if len(value) <= limit:
+        return value
+    return value[: limit - 1].rstrip() + "…"
+
+
+def build_auto_checkpoint_context(
+    *,
+    current_user_message: Any,
+    final_response: Any,
+    trigger_decision: Mapping[str, Any],
+    session_id: str,
+    session_key: str,
+) -> dict[str, Any]:
+    """Build the context fields sent to Cogitator for V0-E handoff."""
+    reason = str(trigger_decision.get("reason") or "threshold")
+    prompt = _safe_int(trigger_decision.get("prompt_tokens"))
+    ctx_len = _safe_int(trigger_decision.get("context_length"))
+    threshold_tokens = _safe_int(trigger_decision.get("threshold_tokens"))
+    msg_count = _safe_int(trigger_decision.get("message_count"))
+
+    usage = []
+    if prompt and ctx_len:
+        usage.append(f"Context usage reached ~{prompt:,}/{ctx_len:,} tokens.")
+    if threshold_tokens:
+        usage.append(f"Configured auto-checkpoint threshold is {threshold_tokens:,} tokens.")
+    if msg_count:
+        usage.append(f"Loaded conversation history contains {msg_count} messages.")
+
+    state_parts = [
+        "Hermes detected this conversation is approaching unsafe context size.",
+        f"Trigger reason: {reason}.",
+    ]
+    state_parts.extend(usage)
+    if current_user_message:
+        state_parts.append(f"Latest user message: {_clip(current_user_message)}")
+    if final_response:
+        state_parts.append(f"Latest assistant response: {_clip(final_response)}")
+
+    return {
+        "purpose": "Protect a Hermes conversation approaching unsafe context size by producing a read-only clean-continuation handoff.",
+        "current_state": "\n".join(state_parts),
+        "active_constraints": [
+            "No storage/db mutation",
+            "No storage/db mutation for this checkpoint trigger.",
+            "No automatic injection into a new context.",
+            "No automatic rotation, /new, /reset, /compress, or destructive session action.",
+            "Keep manual /context_checkpoint working.",
+        ],
+        "decisions_made": [
+            "V0-E only returns a checkpoint/handoff packet to the current chat.",
+            "The operator starts the clean continuation manually.",
+        ],
+        "open_questions": [
+            "V0-F must define and validate a safe automatic injection/continuation mechanism before full rotation is enabled.",
+        ],
+        "artifact_paths": [
+            f"Hermes session_id: {session_id or '(unknown)'}",
+            f"Hermes session_key: {session_key or '(unknown)'}",
+        ],
+        "verification": [
+            "Trigger decision was computed from local prompt-token/context-window or message-count metadata.",
+            "Cogitator bridge response must report mutated=false and checkpoint.safety.mutation_performed=false before rendering.",
+        ],
+        "next_recommended_action": _AUTO_CONTINUATION_ACTION,
     }
 
 
@@ -243,13 +400,50 @@ def render_checkpoint_message(response: Mapping[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def render_auto_checkpoint_message(
+    response: Mapping[str, Any],
+    *,
+    trigger_decision: Mapping[str, Any] | None = None,
+) -> str:
+    """Render V0-E's automatic checkpoint notice plus the validated packet."""
+    decision = trigger_decision or {}
+    prompt = _safe_int(decision.get("prompt_tokens"))
+    ctx_len = _safe_int(decision.get("context_length"))
+    threshold_tokens = _safe_int(decision.get("threshold_tokens"))
+    reason = str(decision.get("reason") or "threshold")
+    usage = ""
+    if prompt and ctx_len:
+        usage = f"Context usage: ~{prompt:,}/{ctx_len:,} tokens"
+        if threshold_tokens:
+            usage += f" (threshold: {threshold_tokens:,})"
+    elif threshold_tokens:
+        usage = f"Threshold: {threshold_tokens:,} tokens"
+
+    lines = [
+        "🛟 Automatic Context Protection (V0-E)",
+        f"Trigger: {reason}.",
+    ]
+    if usage:
+        lines.append(usage + ".")
+    lines.extend([
+        "No automatic injection or rotation has happened — this is a read-only handoff packet.",
+        "Clean continuation action: start a fresh chat with `/new`, then paste the checkpoint below as the first message.",
+        "",
+        render_checkpoint_message(response),
+    ])
+    return "\n".join(lines)
+
+
 __all__ = [
     "CheckpointBridgeError",
     "CHECKPOINT_CONTEXT_FIELDS",
     "TOKEN_ENV",
     "BRIDGE_PATH",
     "build_checkpoint_request",
+    "evaluate_auto_checkpoint_trigger",
+    "build_auto_checkpoint_context",
     "request_context_checkpoint",
     "validate_checkpoint_response",
     "render_checkpoint_message",
+    "render_auto_checkpoint_message",
 ]
