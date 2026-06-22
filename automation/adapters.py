@@ -40,9 +40,14 @@ _REDACTED = "***REDACTED***"
 # ordinary prose, commit SHAs and file hashes are left intact — we do NOT
 # blanket-redact every long token.  Order matters: more specific prefixes first.
 _SCRUB_PATTERNS: tuple[tuple[re.Pattern, str], ...] = (
-    # Provider key=value auth lines (env-style): preserve the key name.
+    # Generic credential key=value / key: value lines, env or config style.
+    # Preserve the key name, redact the value. Anchored on credential-ish key
+    # names so ordinary prose is left intact.
     (
-        re.compile(r"(?i)\b(OPENAI_API_KEY|ANTHROPIC_API_KEY)\s*=\s*\S+"),
+        re.compile(
+            r"(?i)\b([A-Z0-9_]*(?:PASSWORD|PASSWD|SECRET|TOKEN|API[_-]?KEY|"
+            r"ACCESS[_-]?KEY|PRIVATE[_-]?KEY|CLIENT[_-]?SECRET))\s*[=:]\s*\S+"
+        ),
         rf"\1={_REDACTED}",
     ),
     # HTTP auth header: preserve the header name.
@@ -51,6 +56,12 @@ _SCRUB_PATTERNS: tuple[tuple[re.Pattern, str], ...] = (
     # GitHub tokens (fine-grained, then personal-access / oauth / etc.).
     (re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}"), _REDACTED),
     (re.compile(r"\bgh[posru]_[A-Za-z0-9]{20,}"), _REDACTED),
+    # GitLab personal access tokens.
+    (re.compile(r"\bglpat-[A-Za-z0-9_\-]{20,}"), _REDACTED),
+    # Slack tokens (bot/user/app/refresh/legacy).
+    (re.compile(r"\bxox[baprs]-[A-Za-z0-9\-]{10,}"), _REDACTED),
+    # AWS access key IDs.
+    (re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"), _REDACTED),
     # Anthropic secret keys (sk-ant- before sk- so the longer prefix wins).
     (re.compile(r"\bsk-ant-[A-Za-z0-9._\-]{10,}"), _REDACTED),
     (re.compile(r"\bsk-[A-Za-z0-9._\-]{10,}"), _REDACTED),

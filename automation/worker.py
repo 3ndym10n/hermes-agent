@@ -40,6 +40,7 @@ VALID_STATUSES = (
     "pr_opened",
     "blocked_policy",
     "blocked_timeout",
+    "blocked_no_sandbox",
     "invalid_packet",
     "no_worker",
     "no_changes",
@@ -190,6 +191,10 @@ class GhPublisher:
 # is never auto-selected; it must be pinned explicitly via worker_kind="fake".
 _AUTO_PREFERENCE = ("claude", "codex")
 
+# Adapters that shell out to a real, unsandboxed coding CLI. Running one is gated
+# behind ``allow_live_workers`` until a sandbox/safe mode exists (fail-closed).
+LIVE_ADAPTER_NAMES = frozenset({"claude", "codex"})
+
 
 def _slugify(text: str, max_len: int = 40) -> str:
     """Turn an objective into a branch-safe slug."""
@@ -209,6 +214,7 @@ class BackendWorker:
         adapters: list[WorkerAdapter] | None = None,
         publisher=None,
         git: GitRunner | None = None,
+        allow_live_workers: bool = False,
     ) -> None:
         # Map of repo-key -> absolute local path.  Only these repos may be
         # touched; anything else is an invalid packet.
@@ -219,6 +225,11 @@ class BackendWorker:
         )
         self._git = git or GitRunner()
         self._publisher = publisher or GhPublisher(git=self._git)
+        # Fail-closed gate: a *live* coding CLI (Claude/Codex) is an unsandboxed
+        # subprocess sharing .git with the real repo. It must not execute until a
+        # sandbox/safe-mode is in place, so the controller refuses to run a live
+        # adapter unless this is explicitly enabled. Default OFF.
+        self._allow_live_workers = allow_live_workers
 
     @staticmethod
     def _default_adapters() -> list[WorkerAdapter]:
@@ -341,6 +352,22 @@ class BackendWorker:
                     ],
                 )
             worker_name = adapter.name
+
+            # 3b. Fail-closed: refuse to run a live coding CLI until a sandbox /
+            # safe mode is explicitly enabled. This blocks BEFORE any worktree is
+            # created or any command runs, so the default controller cannot
+            # launch an unsandboxed Claude/Codex worker by accident.
+            if worker_name in LIVE_ADAPTER_NAMES and not self._allow_live_workers:
+                return self._blank_evidence(
+                    packet,
+                    status="blocked_no_sandbox",
+                    worker_name=worker_name,
+                    notes=[
+                        f"live worker '{worker_name}' refused: sandbox/safe mode "
+                        "not enabled (allow_live_workers=False). Escalate to Cal "
+                        "to enable sandboxed execution.",
+                    ],
+                )
 
             # 4. Resolve base sha and create an isolated worktree + branch.
             base_sha = self._git.out(
