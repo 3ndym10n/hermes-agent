@@ -13,6 +13,7 @@ from .adapters import (
     FakeWorkerAdapter,
     WorkerAdapter,
 )
+from .automerge import AutoMerger, GhMergeClient, MergeDecision
 from .safety import (
     DEFAULT_PROTECTED_GLOBS,
     classify_changed_files,
@@ -37,6 +38,7 @@ from .worker import (
 
 __all__ = [
     "AdapterResult",
+    "AutoMerger",
     "BackendWorker",
     "ClaudeWorkerAdapter",
     "CodexWorkerAdapter",
@@ -45,8 +47,10 @@ __all__ = [
     "EvidenceValidator",
     "FakeWorkerAdapter",
     "FixLoopResult",
+    "GhMergeClient",
     "GhPublisher",
     "GitRunner",
+    "MergeDecision",
     "Verdict",
     "WorkerAdapter",
     "WorkerEvidence",
