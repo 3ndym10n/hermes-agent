@@ -1903,19 +1903,31 @@ def _load_gateway_config() -> dict:
     return {}
 
 
+# Usage Budget Guard (V0-E2) defaults applied when the guard is enabled but a
+# cap is left unspecified. Derived from observed runaway logs (a task hit the
+# 90/90 iteration ceiling at ~208k-token context). These bound a task well below
+# 90 iterations while staying generous enough not to interrupt ordinary short
+# chat (which uses a handful of calls). An operator can override either, or set
+# it to 0 to disable that single cap explicitly.
+_USAGE_BUDGET_DEFAULT_MAX_ITERATIONS = 30
+_USAGE_BUDGET_DEFAULT_MAX_PROMPT_TOKENS = 2_000_000
+
+
 def _build_usage_budget(config: dict):
     """Build a per-task :class:`UsageBudget` from config; default-off.
 
     Reads the optional ``usage_budget`` config block (V0-E2)::
 
         usage_budget:
-          enabled: false          # master switch — default off
-          max_iterations: 0       # 0 = no iteration cap
-          max_prompt_tokens: 0    # 0 = no cumulative-prompt-token cap
+          enabled: false          # master switch (kill switch) — default off
+          max_iterations: 30      # omit -> sane default; 0 = disable this cap
+          max_prompt_tokens: 2000000  # omit -> sane default; 0 = disable this cap
 
     When the block is absent or ``enabled`` is falsy, returns an inert
-    ``UsageBudget()`` (no caps) so the agent behaves exactly as before. Fails
-    open to a disabled budget on any malformed config.
+    ``UsageBudget()`` (no caps) so the agent behaves exactly as before — ordinary
+    chat is untouched. When ``enabled`` is true, an omitted cap takes the sane
+    default above (never 90 iterations); an explicit ``0`` disables just that
+    cap. Fails open to a disabled budget on any malformed config.
     """
     from agent.usage_budget import UsageBudget
 
@@ -1925,10 +1937,17 @@ def _build_usage_budget(config: dict):
             return UsageBudget()
         if not is_truthy_value(cfg.get("enabled", False), default=False):
             return UsageBudget()
-        return UsageBudget(
-            max_iterations=cfg.get("max_iterations", 0),
-            max_prompt_tokens=cfg.get("max_prompt_tokens", 0),
+        # Enabled: omitted caps take the sane default; explicit values (incl. 0
+        # to disable a single cap) are honored verbatim.
+        max_iter = (
+            cfg["max_iterations"] if "max_iterations" in cfg
+            else _USAGE_BUDGET_DEFAULT_MAX_ITERATIONS
         )
+        max_tok = (
+            cfg["max_prompt_tokens"] if "max_prompt_tokens" in cfg
+            else _USAGE_BUDGET_DEFAULT_MAX_PROMPT_TOKENS
+        )
+        return UsageBudget(max_iterations=max_iter, max_prompt_tokens=max_tok)
     except Exception:
         logger.debug("usage_budget config parse failed; defaulting to disabled")
         return UsageBudget()

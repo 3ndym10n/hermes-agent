@@ -97,3 +97,59 @@ class TestBothCaps:
     def test_enabled_with_either_cap(self):
         assert UsageBudget(max_iterations=5).enabled is True
         assert UsageBudget(max_prompt_tokens=5).enabled is True
+
+
+def _simulate_loop(budget, *, response_prompt_tokens, hard_stop=500):
+    """Model ``run_conversation``'s pre-call guard ordering exactly.
+
+    The real loop, before every provider call, checks
+    ``usage_budget.exceeded(api_call_count)`` and breaks (no call, no retry) on a
+    non-None reason; otherwise it makes the call, increments the count, and
+    records that call's prompt tokens. This mirror returns how many provider
+    calls were actually made before the guard stopped the task, so a test can
+    assert that **no extra call happens after the cap**.
+    """
+    budget.reset()
+    calls = 0
+    stop_reason = None
+    for _ in range(hard_stop):
+        stop_reason = budget.exceeded(calls)
+        if stop_reason is not None:
+            break  # guard stops the task BEFORE another provider call
+        calls += 1
+        budget.record_prompt_tokens(response_prompt_tokens)
+    return calls, stop_reason
+
+
+class TestLoopContract:
+    def test_iteration_cap_makes_no_extra_call(self):
+        """Exactly max_iterations calls are made; the guard stops the next one."""
+        budget = UsageBudget(max_iterations=5)
+        calls, reason = _simulate_loop(budget, response_prompt_tokens=10)
+        assert calls == 5
+        assert reason == "iteration_cap"
+
+    def test_token_cap_makes_no_extra_call(self):
+        """Calls stop once cumulative prompt tokens reach the cap — no call after."""
+        budget = UsageBudget(max_prompt_tokens=1000)
+        calls, reason = _simulate_loop(budget, response_prompt_tokens=300)
+        # 4 calls -> 1200 cumulative >= 1000; the 5th call is refused.
+        assert calls == 4
+        assert reason == "token_cap"
+        assert budget.prompt_tokens_used >= 1000
+
+    def test_disabled_budget_never_stops_the_loop(self):
+        """Default-off guard: the loop runs to its own natural end (hard_stop)."""
+        budget = UsageBudget()
+        calls, reason = _simulate_loop(budget, response_prompt_tokens=10_000, hard_stop=12)
+        assert calls == 12
+        assert reason is None
+
+    def test_ordinary_short_chat_is_not_blocked_under_sane_caps(self):
+        """A short interaction (a few calls, modest tokens) is never interrupted
+        by a guard configured with the sane enabled-defaults."""
+        budget = UsageBudget(max_iterations=30, max_prompt_tokens=2_000_000)
+        # A typical short chat: 3 model calls, ~8k prompt tokens each.
+        calls, reason = _simulate_loop(budget, response_prompt_tokens=8_000, hard_stop=3)
+        assert calls == 3       # chat ran to its natural end
+        assert reason is None   # the guard never tripped
