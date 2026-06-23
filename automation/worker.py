@@ -537,7 +537,13 @@ class BackendWorker:
     def _changed_files(self, worktree: str) -> list[str]:
         """Parse ``git status --porcelain`` into a list of changed paths."""
 
-        out = self._git.out(["-C", worktree, "status", "--porcelain"])
+        # ``--untracked-files=all`` lists each new file individually; without it
+        # git collapses a brand-new directory to its name (e.g. ``docs/new/``),
+        # which then fails the per-file allow-list check. Ignored files are still
+        # excluded, so this only widens granularity, not scope.
+        out = self._git.out(
+            ["-C", worktree, "status", "--porcelain", "--untracked-files=all"]
+        )
         paths: list[str] = []
         for line in out.splitlines():
             if not line.strip():
