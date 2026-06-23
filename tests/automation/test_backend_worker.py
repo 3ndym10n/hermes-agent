@@ -154,6 +154,14 @@ def no_edit(workdir: str) -> None:
     """Adapter apply fn: change nothing."""
 
 
+def write_new_dir_file(workdir: str) -> None:
+    """Adapter apply fn: create a file inside a brand-new directory."""
+
+    p = Path(workdir) / "docs" / "newdir" / "note.md"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text("hello\n", encoding="utf-8")
+
+
 def worker_for(repo: str, adapter, publisher=None) -> BackendWorker:
     return BackendWorker(
         allowed_repos={"sample": repo},
@@ -187,6 +195,26 @@ def test_happy_path_opens_pr(repo):
     assert not hasattr(publisher, "merge")
     # A test was recorded.
     assert ev.tests and ev.tests[0]["passed"] is True
+
+
+def test_file_in_new_directory_is_classified_per_file(repo):
+    # Regression: a file created inside a brand-new directory must be reported
+    # per-file (not collapsed to "docs/newdir/"), so an exact-path allow-list
+    # matches and the run reaches pr_opened instead of blocked_policy.
+    publisher = FakePublisher()
+    worker = worker_for(repo, FakeWorkerAdapter(apply=write_new_dir_file), publisher)
+
+    ev = worker.execute(
+        make_packet(
+            objective="add a note in a new dir",
+            success_condition="note.md exists",
+            allowed_files=("docs/newdir/note.md",),
+        )
+    )
+
+    assert ev.changed_files == ["docs/newdir/note.md"]
+    assert ev.status == "pr_opened"
+    assert ev.allow_list_result["all_allowed"] is True
 
 
 def test_protected_surface_blocks(repo):
