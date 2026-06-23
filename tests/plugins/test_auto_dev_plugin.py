@@ -199,6 +199,107 @@ def test_plugin_registers_only_auto_dev_command():
 
     assert len(ctx.calls) == 1
     args, kwargs = ctx.calls[0]
-    assert args[0] == "auto_dev"
+    # Registered hyphenated so the gateway's "_"->"-" dispatch resolves the
+    # Telegram "/auto_dev" form. See _telegram_dispatch_lookup below.
+    assert args[0] == "auto-dev"
     assert args[1] is command.handle_auto_dev
     assert kwargs["args_hint"] == "status | dry_run <json>"
+
+
+# ---------------------------------------------------------------------------
+# Bundled-plugin discovery + gateway slash-command dispatch
+#
+# Proves the live doorway: the command is registered ONLY when enabled, and the
+# Telegram "/auto_dev" form actually resolves through the gateway dispatcher.
+# ---------------------------------------------------------------------------
+
+import pytest  # noqa: E402
+import yaml  # noqa: E402
+
+
+@pytest.fixture
+def _isolate_env(tmp_path, monkeypatch):
+    """Isolate HERMES_HOME so plugins.enabled / config come from a temp file."""
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    return hermes_home
+
+
+def _write_config(hermes_home, config):
+    (hermes_home / "config.yaml").write_text(yaml.safe_dump(config))
+
+
+def _discover():
+    from hermes_cli import plugins as pmod
+
+    mgr = pmod.PluginManager()
+    mgr.discover_and_load()
+    return mgr
+
+
+def _telegram_dispatch_lookup(mgr, slash_command):
+    """Mirror the gateway slash-command dispatch (gateway/run.py).
+
+    Telegram delivers "/auto_dev"; the dispatcher normalizes "_"->"-" before
+    looking the handler up in the plugin command registry.
+    """
+    command_word = slash_command.lstrip("/").split()[0]
+    entry = mgr._plugin_commands.get(command_word.replace("_", "-"))
+    return entry["handler"] if entry else None
+
+
+def test_auto_dev_unknown_when_plugin_not_enabled(_isolate_env):
+    mgr = _discover()
+
+    # Discovered as a bundled plugin, but not active and not dispatchable.
+    assert "auto_dev" in mgr._plugins
+    assert not mgr._plugins["auto_dev"].enabled
+    assert _telegram_dispatch_lookup(mgr, "/auto_dev status") is None
+
+
+def test_auto_dev_status_recognized_when_plugin_enabled(_isolate_env):
+    _write_config(_isolate_env, {"plugins": {"enabled": ["auto_dev"]}})
+    mgr = _discover()
+
+    assert mgr._plugins["auto_dev"].enabled
+    assert "auto-dev" in mgr._plugins["auto_dev"].commands_registered
+
+    handler = _telegram_dispatch_lookup(mgr, "/auto_dev status")
+    assert handler is not None
+    reply = handler("status")
+    assert "Backend Development Automation" in reply
+    assert "Live execution: disabled" in reply
+
+
+def test_auto_dev_dry_run_remains_dry_run_only_when_enabled(_isolate_env):
+    _write_config(
+        _isolate_env,
+        {
+            "plugins": {"enabled": ["auto_dev"]},
+            "backend_automation": {
+                "command_enabled": True,
+                "allowed_repos": ["hermes", "cogitator"],
+            },
+        },
+    )
+    mgr = _discover()
+    handler = _telegram_dispatch_lookup(mgr, "/auto_dev dry_run")
+    assert handler is not None
+
+    reply = handler("dry_run " + json.dumps(_packet()))
+    assert "Status: valid" in reply
+    assert "Execution performed: no" in reply
+
+
+@pytest.mark.parametrize("subcommand", ["run", "execute", "start"])
+def test_auto_dev_live_execution_subcommands_refused(_isolate_env, subcommand):
+    _write_config(_isolate_env, {"plugins": {"enabled": ["auto_dev"]}})
+    mgr = _discover()
+    handler = _telegram_dispatch_lookup(mgr, f"/auto_dev {subcommand}")
+    assert handler is not None
+
+    reply = handler(f"{subcommand} whatever")
+    assert reply == (
+        "Live execution is disabled. Only status and dry_run are available."
+    )
