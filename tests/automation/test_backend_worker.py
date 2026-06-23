@@ -162,6 +162,14 @@ def write_new_dir_file(workdir: str) -> None:
     p.write_text("hello\n", encoding="utf-8")
 
 
+def write_protected_in_new_dir(workdir: str) -> None:
+    """Adapter apply fn: drop a protected (*.pem) file inside a brand-new dir."""
+
+    p = Path(workdir) / "newpkg" / "key.pem"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text("-----BEGIN PRIVATE KEY-----\n", encoding="utf-8")
+
+
 def worker_for(repo: str, adapter, publisher=None) -> BackendWorker:
     return BackendWorker(
         allowed_repos={"sample": repo},
@@ -215,6 +223,39 @@ def test_file_in_new_directory_is_classified_per_file(repo):
     assert ev.changed_files == ["docs/newdir/note.md"]
     assert ev.status == "pr_opened"
     assert ev.allow_list_result["all_allowed"] is True
+
+
+def test_modified_tracked_file_still_reported(repo):
+    # Normal case must keep working: a modified tracked file is reported per-file.
+    publisher = FakePublisher()
+    worker = worker_for(repo, FakeWorkerAdapter(apply=edit_app), publisher)
+
+    ev = worker.execute(make_packet())
+
+    assert ev.changed_files == ["src/app.py"]
+    assert ev.status == "pr_opened"
+
+
+def test_protected_file_inside_new_directory_is_detected(repo):
+    # Per-file expansion must keep the global protected-glob guard effective:
+    # a *.pem inside a brand-new directory is caught even when the packet
+    # allow-lists that directory (defense in depth, not just the allow-list).
+    publisher = FakePublisher()
+    worker = worker_for(
+        repo, FakeWorkerAdapter(apply=write_protected_in_new_dir), publisher
+    )
+
+    ev = worker.execute(
+        make_packet(
+            objective="add a key in a new dir",
+            success_condition="key exists",
+            allowed_files=("newpkg/**",),
+        )
+    )
+
+    assert ev.status == "blocked_policy"
+    assert "newpkg/key.pem" in ev.forbidden_surface_scan["protected_hits"]
+    assert len(publisher.pr_calls) == 0  # never pushed/opened a PR
 
 
 def test_protected_surface_blocks(repo):
