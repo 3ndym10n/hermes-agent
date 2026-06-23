@@ -254,6 +254,30 @@ def _render_validation(result: Mapping[str, Any]) -> str:
     return _scrub_auth("\n".join(lines))
 
 
+def _render_proof_run(result) -> str:
+    if result.refused:
+        return _scrub_auth(
+            "Backend Automation Run — refused\n"
+            f"Reason: {result.reason}\n"
+            "Run stays disabled unless command_enabled, live_execution_enabled "
+            "and proof_mode are all set, the packet is GREEN-safe, and "
+            "worker_kind is the deterministic proof worker."
+        )
+    ev = result.evidence
+    verdict = result.verdict
+    merge = result.merge
+    lines = [
+        "Backend Automation Run (deterministic proof)",
+        f"Worker: {ev.get('worker_name') or '(none)'} — status {ev.get('status')}",
+        f"PR: {ev.get('pr_url') or '(none)'}",
+        f"Validator: {verdict.get('decision')}/{verdict.get('classification')} "
+        f"(merge_eligible={verdict.get('merge_eligible')})",
+        f"Merged: {merge.get('merged')} — {merge.get('reason')}",
+        "Evidence posted to issue #846. No live model, no deploy.",
+    ]
+    return _scrub_auth("\n".join(lines))
+
+
 def handle_auto_dev(raw_args: str) -> str:
     text = str(raw_args or "").strip()
     if not text or text.lower() == "status":
@@ -261,10 +285,24 @@ def handle_auto_dev(raw_args: str) -> str:
 
     command, _, remainder = text.partition(" ")
     command = command.lower()
-    if command in {"run", "execute", "start"}:
-        return "Live execution is disabled. Only status and dry_run are available."
+    if command == "run":
+        if not remainder.strip():
+            return "Usage: /auto_dev run <task-packet-json>"
+        # Deterministic, non-LLM proof path. Default-OFF behind three config
+        # gates; refuses non-GREEN packets and any live coding worker kind.
+        from automation.proof_run import run_proof_task
+
+        return _render_proof_run(run_proof_task(remainder, _load_config()))
+    if command in {"execute", "start"}:
+        return (
+            "Live execution aliases are disabled. Use "
+            "/auto_dev run <task-packet-json> (deterministic proof mode only)."
+        )
     if command not in {"dry_run", "dry-run", "dryrun"}:
-        return "Usage: /auto_dev status | /auto_dev dry_run <task-packet-json>"
+        return (
+            "Usage: /auto_dev status | /auto_dev dry_run <json> | "
+            "/auto_dev run <json>"
+        )
 
     config = _load_config()
     if not status_packet(config)["command_enabled"]:
