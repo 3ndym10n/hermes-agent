@@ -180,10 +180,19 @@ def test_handler_redacts_secret_shaped_values_in_rendered_errors(monkeypatch):
     assert "Status: invalid" in reply
 
 
-def test_handler_has_no_live_execution_subcommand():
+def test_handler_run_is_refused_by_default():
+    # /auto_dev run is now a gated deterministic-proof path; with no config the
+    # triple gate (command_enabled/live_execution_enabled/proof_mode) is off.
     reply = command.handle_auto_dev("run anything")
 
-    assert reply == "Live execution is disabled. Only status and dry_run are available."
+    assert "Backend Automation Run — refused" in reply
+
+
+def test_handler_execute_and_start_aliases_refused():
+    for alias in ("execute", "start"):
+        reply = command.handle_auto_dev(f"{alias} anything")
+        assert "aliases are disabled" in reply
+        assert "/auto_dev run" in reply
 
 
 def test_plugin_registers_only_auto_dev_command():
@@ -294,12 +303,14 @@ def test_auto_dev_dry_run_remains_dry_run_only_when_enabled(_isolate_env):
 
 @pytest.mark.parametrize("subcommand", ["run", "execute", "start"])
 def test_auto_dev_live_execution_subcommands_refused(_isolate_env, subcommand):
+    # Plugin enabled but backend automation is NOT configured, so no live or
+    # proof execution can occur. `run` is a gated deterministic-proof path
+    # (refused here: command/proof config off); `execute`/`start` are hard
+    # aliases pointing at `run`. None of them run a live worker.
     _write_config(_isolate_env, {"plugins": {"enabled": ["auto_dev"]}})
     mgr = _discover()
     handler = _telegram_dispatch_lookup(mgr, f"/auto_dev {subcommand}")
     assert handler is not None
 
     reply = handler(f"{subcommand} whatever")
-    assert reply == (
-        "Live execution is disabled. Only status and dry_run are available."
-    )
+    assert "refused" in reply or "aliases are disabled" in reply
