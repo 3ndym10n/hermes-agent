@@ -197,36 +197,24 @@ def request_decision_batch(
 def render_decision_batch_message(response: Mapping[str, Any]) -> str:
     """Render a validated decision-batch response back to chat.
 
-    The grouped summary and allowed replies already live inside
-    ``rendered_batch`` (Cogitator builds them); this adds a read-only banner, the
-    optional item detail, the sample-mode notice + missing-feed doc, and a clear
-    reminder that ``approve #id`` is not executable yet.
+    Cogitator's ``rendered_batch`` is already the Cal-facing "Decision Inbox" —
+    plain-English sections, simple numbers, and its own read-only Status line. We
+    pass it through verbatim rather than wrapping it in internal bridge/action
+    text; we add only the optional item detail and a short sample-data note. No
+    ``approve #id`` footer — approval execution is not implemented and the inbox's
+    own Status line already says so.
     """
     rendered = str(response.get("rendered_batch") or "").strip()
     detail = str(response.get("rendered_item") or "").strip()
     is_sample = bool(response.get("sample"))
 
-    lines = [
-        "🗂️ Decision Batch (read-only, draft only)",
-        "Source: Cogitator render_decision_batch bridge action.",
-        "No mutation, no promotion, no approval execution — display only.",
-    ]
+    parts: list[str] = []
     if is_sample:
-        lines += [
-            "",
-            "⚠️ Sample mode: no live candidate/evidence feed is wired into Hermes yet, "
-            "so Cogitator returned a representative sample batch. Real batches appear "
-            "once Hermes passes gathered candidate/triage/research evidence as "
-            "context.items — that feed is the one remaining piece.",
-        ]
-    lines += ["", rendered]
+        parts.append("⚠️ Sample data — no live feed wired yet.")
+    parts.append(rendered or "Decision Inbox\n\nNothing needs your attention right now.")
     if detail:
-        lines += ["", "--- Item detail ---", detail]
-    lines += [
-        "",
-        "Replies like `approve #id` are shown for planning only and are NOT executable yet.",
-    ]
-    return "\n".join(lines)
+        parts.append(detail)
+    return "\n\n".join(parts)
 
 
 __all__ = [

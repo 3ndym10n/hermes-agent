@@ -1588,9 +1588,11 @@ class GatewaySlashCommandsMixin:
         call a provider/model. ``approve #id`` is display-only — there is no
         approval-execution path here.
 
-        Usage: ``/decision_batch`` (grouped batch) or ``/decision_batch detail <id>``.
-        Hermes sends no ``items`` yet, so Cogitator returns a sample batch; the
-        real candidate/evidence feed is the one remaining wiring step.
+        Usage: ``/decision_batch`` (the inbox), ``/decision_batch show <n>``
+        (item detail by display number; ``detail <id>`` also accepted), or
+        ``/decision_batch refresh`` (re-fetch the inbox). Hermes sends no
+        ``items`` yet, so Cogitator returns a sample batch; the real
+        candidate/evidence feed is the one remaining wiring step.
         """
         import os
 
@@ -1620,9 +1622,13 @@ class GatewaySlashCommandsMixin:
             )
 
         args = event.get_command_args().strip()
+        low = args.lower()
         detail_id = ""
-        if args.lower().startswith("detail"):
-            detail_id = args[len("detail"):].strip()
+        if low.startswith("show"):
+            detail_id = args[len("show"):].strip().lstrip("#")
+        elif low.startswith("detail"):
+            detail_id = args[len("detail"):].strip().lstrip("#")
+        # bare command or "refresh" → no detail, full inbox
 
         try:
             # items stays None: no live candidate/evidence feed is wired yet, so
