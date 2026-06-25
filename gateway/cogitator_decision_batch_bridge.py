@@ -166,8 +166,14 @@ def validate_decision_batch_response(response: Any) -> dict[str, Any]:
     if stateful:
         raise DecisionBatchBridgeError("BRIDGE_STATEFUL_RESPONSE", f"fields={stateful}")
     rendered = response.get("rendered_batch")
-    if not isinstance(rendered, str) or not rendered.strip():
-        raise DecisionBatchBridgeError("BRIDGE_BATCH_MISSING", "rendered_batch missing or empty")
+    if not isinstance(rendered, str):
+        raise DecisionBatchBridgeError("BRIDGE_BATCH_MISSING", "rendered_batch missing or not a string")
+    # A detail view (`show <n>`) intentionally returns an empty rendered_batch and
+    # a populated rendered_item — accept that. Fail closed only if BOTH are empty.
+    detail = response.get("rendered_item")
+    has_detail = isinstance(detail, str) and detail.strip()
+    if not rendered.strip() and not has_detail:
+        raise DecisionBatchBridgeError("BRIDGE_BATCH_MISSING", "rendered_batch and rendered_item both empty")
     return dict(response)
 
 
@@ -200,9 +206,12 @@ def render_decision_batch_message(response: Mapping[str, Any]) -> str:
     Cogitator's ``rendered_batch`` is already the Cal-facing "Decision Inbox" —
     plain-English sections, simple numbers, and its own read-only Status line. We
     pass it through verbatim rather than wrapping it in internal bridge/action
-    text; we add only the optional item detail and a short sample-data note. No
-    ``approve #id`` footer — approval execution is not implemented and the inbox's
-    own Status line already says so.
+    text; we add only a short sample-data note. No ``approve #id`` footer —
+    approval execution is not implemented and the inbox's own Status line already
+    says so.
+
+    A detail view (``show <n>``) carries a ``rendered_item`` and an empty
+    ``rendered_batch``: render only the item, never prepend the whole inbox.
     """
     rendered = str(response.get("rendered_batch") or "").strip()
     detail = str(response.get("rendered_item") or "").strip()
@@ -211,9 +220,10 @@ def render_decision_batch_message(response: Mapping[str, Any]) -> str:
     parts: list[str] = []
     if is_sample:
         parts.append("⚠️ Sample data — no live feed wired yet.")
-    parts.append(rendered or "Decision Inbox\n\nNothing needs your attention right now.")
     if detail:
-        parts.append(detail)
+        parts.append(detail)  # show <n>: detail only, no inbox prepended
+    else:
+        parts.append(rendered or "Decision Inbox\n\nNothing needs your attention right now.")
     return "\n\n".join(parts)
 
 
