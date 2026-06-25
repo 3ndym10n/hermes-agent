@@ -227,6 +227,20 @@ class TestGatewayKnownCommands:
         assert alias.name == "context-checkpoint"
         assert alias.gateway_only is True
 
+    def test_decision_batch_command_is_gateway_known_with_alias(self):
+        assert "decision-batch" in GATEWAY_KNOWN_COMMANDS
+        assert "decision_batch" in GATEWAY_KNOWN_COMMANDS
+
+        canonical = resolve_command("decision-batch")
+        assert canonical is not None
+        assert canonical.name == "decision-batch"
+        assert canonical.gateway_only is True
+
+        alias = resolve_command("decision_batch")
+        assert alias is not None
+        assert alias.name == "decision-batch"
+        assert alias.gateway_only is True
+
     def test_is_frozenset(self):
         assert isinstance(GATEWAY_KNOWN_COMMANDS, frozenset)
 

@@ -222,6 +222,10 @@ COMMAND_REGISTRY: list[CommandDef] = [
                "Request a read-only Cogitator context checkpoint (default off)", "Info",
                gateway_only=True, aliases=("context_checkpoint",),
                args_hint="<current state to checkpoint>"),
+    CommandDef("decision-batch",
+               "Show the read-only Cogitator decision batch (approval cockpit, default off)", "Info",
+               gateway_only=True, aliases=("decision_batch",),
+               args_hint="[detail <id>]"),
     CommandDef("help", "Show available commands", "Info"),
     CommandDef("restart", "Gracefully restart the gateway after draining active runs", "Session",
                gateway_only=True),
@@ -365,6 +369,7 @@ ACTIVE_SESSION_BYPASS_COMMANDS: frozenset[str] = frozenset(
         "background",
         "commands",
         "context-checkpoint",
+        "decision-batch",
         "deny",
         "help",
         "loop-health",
@@ -1076,8 +1081,10 @@ _SLACK_PRIORITY_ALIASES = ("btw", "bg")
 #     Hermes controls from the 50-command native Slack manifest.
 #   - context-checkpoint: default-off manual Cogitator checkpoint request; same
 #     rationale — keep it off the native Slack manifest, reachable via /hermes.
+#   - decision-batch: default-off read-only Cogitator decision-batch display; same
+#     rationale — keep it off the native Slack manifest, reachable via /hermes.
 _SLACK_VIA_HERMES_ONLY = frozenset(
-    {"credits", "debug", "promote", "review", "review-page", "context-checkpoint"}
+    {"credits", "debug", "promote", "review", "review-page", "context-checkpoint", "decision-batch"}
 )
 
 
