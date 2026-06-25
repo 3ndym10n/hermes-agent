@@ -1647,6 +1647,99 @@ class GatewaySlashCommandsMixin:
 
         return render_decision_batch_message(response)
 
+    def _x_batch_config(self) -> tuple[bool, str]:
+        """Resolve the default-off ``x_batch`` gate and bridge base URL.
+
+        Returns ``(enabled, base_url)``. Fails closed (disabled) on any config
+        error. Never reads secrets/``.env`` — only plain gateway config keys; the
+        bearer token is sourced separately, from the environment only.
+        """
+        try:
+            from gateway.run import _load_gateway_config
+
+            config = _load_gateway_config()
+        except Exception:
+            return False, ""
+        enabled = is_truthy_value(
+            cfg_get(config, "x_batch", "enabled", default=False), default=False
+        )
+        base_url = str(cfg_get(config, "x_batch", "base_url", default="") or "").strip()
+        return enabled, base_url
+
+    async def _handle_x_batch_command(self, event: MessageEvent) -> str:
+        """Handle /x_batch — capture a batch of X/Twitter links through Cogitator.
+
+        The command plus up to 25 newline-separated post URLs arrive in one
+        message. When disabled (the default) this returns a short notice and
+        never contacts Cogitator. When enabled it POSTs a draft-only
+        ``x_link_batch_intake`` bridge request (bearer token from the
+        COGITATOR_BRIDGE_TOKEN environment variable only), validates the
+        response fail-closed (``promotion_performed`` must be False), and renders
+        a compact count summary. Capture/persistence happens on Cogitator's side,
+        gated there by its own default-off ENABLE_X_BATCH_INTAKE flag. This path
+        never promotes, approves, or dumps raw JSON into chat.
+
+        Usage: ``/x_batch`` + newline-separated URLs, or ``/x_batch dry_run`` +
+        URLs to preview without capturing. No links → compact help.
+        """
+        import os
+
+        from gateway.cogitator_x_batch_bridge import (
+            TOKEN_ENV,
+            XBatchBridgeError,
+            parse_x_batch_command,
+            render_x_batch_message,
+            request_x_batch_intake,
+            x_batch_help_text,
+        )
+
+        args = event.get_command_args()
+        urls, dry_run = parse_x_batch_command(args)
+        if not urls.strip():
+            return x_batch_help_text()
+
+        enabled, base_url = self._x_batch_config()
+        if not enabled:
+            return (
+                "X batch intake is disabled.\n"
+                "Enable it with x_batch.enabled: true in the gateway config to "
+                "capture X links through Cogitator.\n"
+                "Promotion/approval is not implemented and remains off."
+            )
+
+        token = str(os.environ.get(TOKEN_ENV, "") or "").strip()
+        if not base_url or not token:
+            return (
+                "X batch intake is not configured.\n"
+                "Set x_batch.base_url in the gateway config and the "
+                f"{TOKEN_ENV} environment variable to enable batch capture."
+            )
+
+        try:
+            response = request_x_batch_intake(
+                base_url=base_url, token=token, urls=urls, dry_run=dry_run
+            )
+        except XBatchBridgeError as exc:
+            logger.warning("[x_batch] bridge error code=%s", exc.code)
+            if exc.code == "TOO_MANY_LINKS":
+                return "X batch refused: too many links (max 25 per batch)."
+            if exc.code == "NO_LINKS":
+                return x_batch_help_text()
+            return (
+                "X batch unavailable.\n"
+                f"Reason: {exc.code}.\n"
+                "Next action: verify x_batch.base_url and the deployed Cogitator bridge."
+            )
+        except Exception:
+            logger.exception("[x_batch] unexpected error")
+            return (
+                "X batch failed.\n"
+                "Reason: unexpected error.\n"
+                "Next action: inspect gateway logs."
+            )
+
+        return render_x_batch_message(response)
+
     async def _handle_model_command(self, event: MessageEvent) -> Optional[str]:
         """Handle /model command — switch model for this session.
 

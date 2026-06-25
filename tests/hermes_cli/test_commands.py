@@ -241,6 +241,25 @@ class TestGatewayKnownCommands:
         assert alias.name == "decision-batch"
         assert alias.gateway_only is True
 
+    def test_x_batch_command_is_gateway_known_with_alias(self):
+        assert "x-batch" in GATEWAY_KNOWN_COMMANDS
+        assert "x_batch" in GATEWAY_KNOWN_COMMANDS
+
+        canonical = resolve_command("x-batch")
+        assert canonical is not None
+        assert canonical.name == "x-batch"
+        assert canonical.gateway_only is True
+
+        alias = resolve_command("x_batch")
+        assert alias is not None
+        assert alias.name == "x-batch"
+        assert alias.gateway_only is True
+
+    def test_x_batch_does_not_clobber_other_commands(self):
+        # Adding x-batch must leave the sibling Cogitator commands resolvable.
+        for name in ("decision-batch", "review", "promote", "help"):
+            assert resolve_command(name) is not None
+
     def test_is_frozenset(self):
         assert isinstance(GATEWAY_KNOWN_COMMANDS, frozenset)
 

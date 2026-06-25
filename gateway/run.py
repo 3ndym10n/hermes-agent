@@ -7343,6 +7343,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     return await self._handle_context_checkpoint_command(event)
                 if _cmd_def_inner.name == "decision-batch":
                     return await self._handle_decision_batch_command(event)
+                if _cmd_def_inner.name == "x-batch":
+                    return await self._handle_x_batch_command(event)
                 if _cmd_def_inner.name == "profile":
                     return await self._handle_profile_command(event)
                 if _cmd_def_inner.name == "update":
@@ -7621,6 +7623,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if canonical == "decision-batch":
             return await self._handle_decision_batch_command(event)
+
+        if canonical == "x-batch":
+            return await self._handle_x_batch_command(event)
 
         if canonical == "profile":
             return await self._handle_profile_command(event)

@@ -226,6 +226,10 @@ COMMAND_REGISTRY: list[CommandDef] = [
                "Show the read-only Cogitator decision batch (approval cockpit, default off)", "Info",
                gateway_only=True, aliases=("decision_batch",),
                args_hint="[detail <id>]"),
+    CommandDef("x-batch",
+               "Capture a batch of X/Twitter links through Cogitator (default off)", "Info",
+               gateway_only=True, aliases=("x_batch",),
+               args_hint="[dry_run] <url per line>"),
     CommandDef("help", "Show available commands", "Info"),
     CommandDef("restart", "Gracefully restart the gateway after draining active runs", "Session",
                gateway_only=True),
@@ -370,6 +374,7 @@ ACTIVE_SESSION_BYPASS_COMMANDS: frozenset[str] = frozenset(
         "commands",
         "context-checkpoint",
         "decision-batch",
+        "x-batch",
         "deny",
         "help",
         "loop-health",
@@ -1084,7 +1089,7 @@ _SLACK_PRIORITY_ALIASES = ("btw", "bg")
 #   - decision-batch: default-off read-only Cogitator decision-batch display; same
 #     rationale — keep it off the native Slack manifest, reachable via /hermes.
 _SLACK_VIA_HERMES_ONLY = frozenset(
-    {"credits", "debug", "promote", "review", "review-page", "context-checkpoint", "decision-batch"}
+    {"credits", "debug", "promote", "review", "review-page", "context-checkpoint", "decision-batch", "x-batch"}
 )
 
 
