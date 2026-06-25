@@ -23,9 +23,12 @@ from gateway.cogitator_decision_batch_bridge import (
 _EXPECTED_USER_INTENT = "Show the current Cogitator decision batch for review (read-only)."
 
 _SAMPLE_RENDER = (
-    "Decision batch:\n\nAuto-skipped:\n- #sample-skip caching — already covered\n\n"
-    "Needs approval:\n- #sample-approve skills — strong evidence\n\n"
-    "Allowed replies:\n- skip #sample-skip\n- approve #sample-approve\n- skip all"
+    "Decision Inbox\n\n"
+    "Needs your decision:\n1. skills\n   Why: strong evidence\n"
+    "   Action needed: approve later when approval execution is enabled.\n\n"
+    "Needs research:\nNone\n\nDeferred:\nNone\n\nSkipped:\n2. caching\n   Why: already covered\n\n"
+    "Status:\nRead-only display. Approval not enabled yet — I can show details, "
+    "but I cannot approve or promote from Telegram yet.\n\nTry:\n- show <n>\n- refresh"
 )
 
 
@@ -216,27 +219,29 @@ class TestValidateResponse:
 
 
 class TestRender:
-    def test_renders_readonly_banner_and_batch(self):
-        msg = render_decision_batch_message(_ok_response())
-        assert "Decision Batch (read-only, draft only)" in msg
-        assert "render_decision_batch bridge action" in msg
-        assert "Decision batch:" in msg
-        assert "Auto-skipped:" in msg
-        assert "approve #sample-approve" in msg
-        assert "NOT executable yet" in msg
-
-    def test_sample_mode_banner_and_missing_feed_note(self):
-        msg = render_decision_batch_message(_ok_response(sample=True))
-        assert "Sample mode" in msg
-        assert "context.items" in msg
-
-    def test_no_sample_banner_for_real_batch(self):
+    def test_passes_through_inbox_without_internal_bridge_text(self):
         msg = render_decision_batch_message(_ok_response(sample=False))
-        assert "Sample mode" not in msg
+        # the Cal-facing inbox is passed through verbatim
+        assert "Decision Inbox" in msg
+        assert "Needs your decision:" in msg
+        # no internal bridge/action wrapper text, no approve footer
+        assert "bridge action" not in msg
+        assert "draft only" not in msg
+        assert "approve #" not in msg
+        # the read-only assurance comes from the inbox's own Status line
+        assert "Read-only display." in msg
+
+    def test_sample_data_note_when_sample(self):
+        msg = render_decision_batch_message(_ok_response(sample=True))
+        assert "Sample data" in msg
+
+    def test_no_sample_note_for_real_batch(self):
+        msg = render_decision_batch_message(_ok_response(sample=False))
+        assert "Sample data" not in msg
 
     def test_item_detail_rendered_when_present(self):
         msg = render_decision_batch_message(
-            _ok_response(rendered_item="# Decision #sample-approve — skills\n**Group:** needs_cal_approval")
+            _ok_response(rendered_item="Detail #1 — skills\n\nSection: Needs your decision\nRecord id: sample-approve")
         )
-        assert "--- Item detail ---" in msg
-        assert "Decision #sample-approve" in msg
+        assert "Detail #1 — skills" in msg
+        assert "Record id: sample-approve" in msg
