@@ -205,6 +205,24 @@ class TestValidateResponse:
             validate_decision_batch_response(resp)
         assert exc.value.code == "BRIDGE_BATCH_MISSING"
 
+    def test_accepts_detail_view_with_empty_batch(self):
+        # Regression: `show <n>` returns an empty rendered_batch + a populated
+        # rendered_item. That must validate, not raise BRIDGE_BATCH_MISSING.
+        resp = _ok_response(
+            sample=False,
+            rendered_batch="",
+            rendered_item="Detail #2 — graph memory\nSection: Skipped\nRecord id: cand-2",
+        )
+        out = validate_decision_batch_response(resp)
+        assert out["rendered_item"].startswith("Detail #2")
+
+    def test_rejects_when_batch_and_item_both_empty(self):
+        with pytest.raises(DecisionBatchBridgeError) as exc:
+            validate_decision_batch_response(
+                _ok_response(rendered_batch="", rendered_item="")
+            )
+        assert exc.value.code == "BRIDGE_BATCH_MISSING"
+
     @pytest.mark.parametrize("field", ["storage_path", "promoted", "approved", "executed"])
     def test_rejects_stateful_response_fields(self, field):
         with pytest.raises(DecisionBatchBridgeError) as exc:
@@ -245,3 +263,39 @@ class TestRender:
         )
         assert "Detail #1 — skills" in msg
         assert "Record id: sample-approve" in msg
+
+    def test_detail_view_shows_only_item_not_inbox(self):
+        # Regression: `show <n>` must render ONLY the item detail — never prepend
+        # the whole Decision Inbox above it.
+        msg = render_decision_batch_message(
+            _ok_response(
+                sample=False,
+                rendered_batch="",
+                rendered_item="Detail #2 — graph memory\nSection: Skipped\nRecord id: cand-2",
+            )
+        )
+        assert "Detail #2 — graph memory" in msg
+        assert "Decision Inbox" not in msg       # inbox not prepended
+        assert "Needs your decision:" not in msg
+
+
+class TestShowEndToEnd:
+    def test_show_detail_request_validates_and_renders_detail_only(self):
+        # End-to-end `show 2`: Cogitator returns empty batch + detail; the helper
+        # must validate it (no BRIDGE_BATCH_MISSING) and render the item alone.
+        captured = {}
+        payload = _ok_response(
+            sample=False,
+            rendered_batch="",
+            rendered_item="Detail #2 — graph memory\nSection: Skipped\nRecord id: cand-2",
+        )
+        result = request_decision_batch(
+            base_url="https://cogitator.example",
+            token="s3cr3t-token",
+            detail_id="2",
+            urlopen=_fake_urlopen(payload, captured),
+        )
+        assert captured["body"]["context"]["detail_id"] == "2"
+        msg = render_decision_batch_message(result)
+        assert "Detail #2 — graph memory" in msg
+        assert "Decision Inbox" not in msg
