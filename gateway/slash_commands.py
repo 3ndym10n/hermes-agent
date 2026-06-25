@@ -1557,6 +1557,96 @@ class GatewaySlashCommandsMixin:
 
         return render_checkpoint_message(response)
 
+    def _decision_batch_config(self) -> tuple[bool, str]:
+        """Resolve the default-off ``decision_batch`` gate and bridge base URL.
+
+        Returns ``(enabled, base_url)``. Fails closed (disabled) on any config
+        error. Never reads secrets/``.env`` — only plain gateway config keys; the
+        bearer token is sourced separately, from the environment only.
+        """
+        try:
+            from gateway.run import _load_gateway_config
+
+            config = _load_gateway_config()
+        except Exception:
+            return False, ""
+        enabled = is_truthy_value(
+            cfg_get(config, "decision_batch", "enabled", default=False), default=False
+        )
+        base_url = str(cfg_get(config, "decision_batch", "base_url", default="") or "").strip()
+        return enabled, base_url
+
+    async def _handle_decision_batch_command(self, event: MessageEvent) -> str:
+        """Handle /decision_batch — show the read-only Cogitator decision batch.
+
+        Manual, read-only. When disabled (the default) this returns a short notice
+        and never contacts Cogitator. When enabled it POSTs a draft-only
+        ``render_decision_batch`` bridge request (bearer token from the
+        COGITATOR_BRIDGE_TOKEN environment variable only), validates the
+        read-only response fail-closed, and renders the batch back to this chat.
+        It does NOT enter the model loop, promote, approve, mutate storage, or
+        call a provider/model. ``approve #id`` is display-only — there is no
+        approval-execution path here.
+
+        Usage: ``/decision_batch`` (grouped batch) or ``/decision_batch detail <id>``.
+        Hermes sends no ``items`` yet, so Cogitator returns a sample batch; the
+        real candidate/evidence feed is the one remaining wiring step.
+        """
+        import os
+
+        enabled, base_url = self._decision_batch_config()
+        if not enabled:
+            return (
+                "Decision batch is disabled.\n"
+                "Enable it with decision_batch.enabled: true in the gateway config to "
+                "show the read-only Cogitator decision batch.\n"
+                "Approval execution is not implemented and remains off."
+            )
+
+        from gateway.cogitator_decision_batch_bridge import (
+            DecisionBatchBridgeError,
+            TOKEN_ENV,
+            render_decision_batch_message,
+            request_decision_batch,
+        )
+
+        token = str(os.environ.get(TOKEN_ENV, "") or "").strip()
+        if not base_url or not token:
+            return (
+                "Decision batch is not configured.\n"
+                "Set decision_batch.base_url in the gateway config and the "
+                f"{TOKEN_ENV} environment variable to enable read-only batch requests.\n"
+                "Approval execution is not implemented and remains off."
+            )
+
+        args = event.get_command_args().strip()
+        detail_id = ""
+        if args.lower().startswith("detail"):
+            detail_id = args[len("detail"):].strip()
+
+        try:
+            # items stays None: no live candidate/evidence feed is wired yet, so
+            # Cogitator renders a sample batch (documented in the rendered notice).
+            response = request_decision_batch(
+                base_url=base_url, token=token, detail_id=detail_id
+            )
+        except DecisionBatchBridgeError as exc:
+            logger.warning("[decision_batch] bridge error code=%s", exc.code)
+            return (
+                "Decision batch unavailable.\n"
+                f"Reason: {exc.code}.\n"
+                "Next action: verify decision_batch.base_url and the deployed Cogitator bridge."
+            )
+        except Exception:
+            logger.exception("[decision_batch] unexpected error")
+            return (
+                "Decision batch failed.\n"
+                "Reason: unexpected error.\n"
+                "Next action: inspect gateway logs."
+            )
+
+        return render_decision_batch_message(response)
+
     async def _handle_model_command(self, event: MessageEvent) -> Optional[str]:
         """Handle /model command — switch model for this session.
 
