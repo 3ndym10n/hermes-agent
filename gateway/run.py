@@ -7007,6 +7007,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # itself will produce the next user-facing message.
                     return ""
 
+        # Decision Inbox cockpit: after /decision_batch opens the cockpit, plain
+        # replies (research <n>, show <n>, refresh, skip <n>) are routed to the
+        # read-only Cogitator cockpit instead of the model. Deterministic parser,
+        # no LLM; only active while a batch context is open for this session. A
+        # research/skip reply with no open cockpit nudges the user to open one;
+        # everything else (and all ordinary prose) falls through unchanged.
+        try:
+            from gateway.decision_inbox_cockpit import parse_inbox_reply
+            _inbox_reply = parse_inbox_reply(event.text or "")
+        except Exception:
+            _inbox_reply = None
+        if _inbox_reply is not None:
+            if self.has_active_decision_inbox(event):
+                logger.info("Gateway routed Decision Inbox reply (session=%s, verb=%s)",
+                            _quick_key, _inbox_reply.verb)
+                return await self.handle_decision_inbox_reply(event, _inbox_reply)
+            if _inbox_reply.verb in ("research", "skip") and _inbox_reply.number is not None:
+                return (
+                    "Open the Decision Inbox first with /decision_batch, then reply "
+                    "research <n> to research an item."
+                )
+
         # Intercept messages that are responses to a pending /reload-mcp
         # (or future) slash-confirm prompt.  Recognized confirm replies are
         # /approve, /always, /cancel (plus short aliases).  Anything else

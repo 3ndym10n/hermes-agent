@@ -1156,6 +1156,121 @@ class GatewaySlashCommandsMixin:
         if isinstance(states, dict):
             states.pop(build_session_key(event.source), None)
 
+    # --- Decision Inbox cockpit (reply-context, no new slash command) ----------
+    # After /decision_batch opens the cockpit we remember, per session, the
+    # snapshot it was shown under. Plain replies (research/show/refresh/skip) are
+    # then routed here by the gateway instead of the model — see
+    # gateway.decision_inbox_cockpit.parse_inbox_reply and the interception in
+    # gateway.run._handle_message. The context expires so a stale cockpit never
+    # silently captures later chat.
+    _DECISION_INBOX_CONTEXT_TTL_SECONDS = 1800
+
+    def _decision_inbox_states(self) -> dict[str, Any]:
+        states = getattr(self, "_decision_inbox_ctx", None)
+        if not isinstance(states, dict):
+            states = {}
+            setattr(self, "_decision_inbox_ctx", states)
+        return states
+
+    def _set_decision_inbox_context(self, event: MessageEvent, snapshot_id: str) -> None:
+        self._decision_inbox_states()[build_session_key(event.source)] = {
+            "snapshot_id": str(snapshot_id or ""),
+            "ts": time.time(),
+        }
+
+    def _active_decision_inbox_context(self, event: MessageEvent) -> Optional[dict[str, Any]]:
+        ctx = self._decision_inbox_states().get(build_session_key(event.source))
+        if not isinstance(ctx, dict):
+            return None
+        if time.time() - float(ctx.get("ts") or 0) > self._DECISION_INBOX_CONTEXT_TTL_SECONDS:
+            return None
+        return ctx
+
+    def has_active_decision_inbox(self, event: MessageEvent) -> bool:
+        """True when this session has a live Decision Inbox cockpit open."""
+        return self._active_decision_inbox_context(event) is not None
+
+    async def handle_decision_inbox_reply(self, event: MessageEvent, reply) -> str:
+        """Route a parsed cockpit reply (research/show/refresh/skip). Read-only
+        except for the bounded, non-promoting research action. Deterministic — no
+        model/LLM. ``reply`` is a gateway.decision_inbox_cockpit.InboxReply."""
+        import os
+
+        enabled, base_url = self._decision_batch_config()
+        if not enabled:
+            return (
+                "The Decision Inbox is disabled.\n"
+                "Enable it with decision_batch.enabled: true in the gateway config."
+            )
+        from gateway.cogitator_decision_batch_bridge import (
+            DecisionBatchBridgeError,
+            TOKEN_ENV,
+            render_decision_batch_message,
+            request_decision_batch,
+        )
+
+        token = str(os.environ.get(TOKEN_ENV, "") or "").strip()
+        if not base_url or not token:
+            return (
+                "The Decision Inbox is not configured.\n"
+                f"Set decision_batch.base_url and the {TOKEN_ENV} environment variable."
+            )
+
+        ctx = self._active_decision_inbox_context(event)
+        snapshot = str((ctx or {}).get("snapshot_id") or "")
+
+        if reply.verb == "skip":
+            return (
+                "Skip isn't enabled yet — the Decision Inbox is read-only and I "
+                "can't dismiss or approve items from here. Reply research <n> to "
+                "research an item."
+            )
+
+        if reply.verb in ("refresh", "show"):
+            detail_id = str(reply.number) if reply.verb == "show" else ""
+            try:
+                response = request_decision_batch(
+                    base_url=base_url, token=token, detail_id=detail_id
+                )
+            except DecisionBatchBridgeError as exc:
+                logger.warning("[decision_inbox] bridge error code=%s", exc.code)
+                return (
+                    "Decision Inbox unavailable.\n"
+                    f"Reason: {exc.code}.\n"
+                    "Next action: verify decision_batch.base_url and the deployed Cogitator bridge."
+                )
+            except Exception:
+                logger.exception("[decision_inbox] unexpected error")
+                return "Decision Inbox failed.\nReason: unexpected error."
+            # refresh re-pins the snapshot; show leaves the open cockpit untouched.
+            if reply.verb == "refresh":
+                self._set_decision_inbox_context(event, str(response.get("snapshot_id") or ""))
+            return render_decision_batch_message(response)
+
+        # research <n>
+        from gateway.cogitator_research_bridge import (
+            ResearchBridgeError,
+            render_research_message,
+            request_research_decision_item,
+        )
+
+        try:
+            response = request_research_decision_item(
+                base_url=base_url, token=token,
+                item_id=str(reply.number), expected_snapshot_id=snapshot,
+            )
+        except ResearchBridgeError as exc:
+            logger.warning("[decision_inbox] research bridge error code=%s", exc.code)
+            return (
+                "Research unavailable.\n"
+                f"Reason: {exc.code}.\n"
+                "Next action: verify decision_batch.base_url and the deployed Cogitator bridge."
+            )
+        except Exception:
+            logger.exception("[decision_inbox] research unexpected error")
+            return "Research failed.\nReason: unexpected error."
+        return render_research_message(response)
+
     async def _handle_cogitator_review_command(self, event: MessageEvent) -> str:
         """Proxy /review to Cogitator without entering the model loop."""
         try:
@@ -1651,6 +1766,9 @@ class GatewaySlashCommandsMixin:
                 "Next action: inspect gateway logs."
             )
 
+        # Open the cockpit: remember the snapshot so plain replies (research <n>,
+        # show <n>, refresh) route here instead of the model until it expires.
+        self._set_decision_inbox_context(event, str(response.get("snapshot_id") or ""))
         return render_decision_batch_message(response)
 
     def _x_batch_config(self) -> tuple[bool, str]:
