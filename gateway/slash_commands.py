@@ -1172,11 +1172,28 @@ class GatewaySlashCommandsMixin:
             setattr(self, "_decision_inbox_ctx", states)
         return states
 
-    def _set_decision_inbox_context(self, event: MessageEvent, snapshot_id: str) -> None:
+    def _set_decision_inbox_context(
+        self, event: MessageEvent, snapshot_id: str, inbox_index: Any = None
+    ) -> None:
+        # inbox_index is the render's display-number → STABLE candidate_id map; we
+        # remember it so a later `research <n>` resolves by durable identity rather
+        # than by replaying the churning whole-batch snapshot_id (kept for back-compat).
         self._decision_inbox_states()[build_session_key(event.source)] = {
             "snapshot_id": str(snapshot_id or ""),
+            "inbox_index": list(inbox_index or []),
             "ts": time.time(),
         }
+
+    @staticmethod
+    def _resolve_inbox_candidate_id(inbox_index: Any, number: int) -> Optional[str]:
+        """Map a 1-based display number to its STABLE candidate id from the stored
+        inbox_index, or None if that number isn't in the current inbox."""
+        for entry in inbox_index or []:
+            if isinstance(entry, dict) and entry.get("n") == number:
+                cid = str(entry.get("candidate_id") or "").strip()
+                if cid:
+                    return cid
+        return None
 
     def _active_decision_inbox_context(self, event: MessageEvent) -> Optional[dict[str, Any]]:
         ctx = self._decision_inbox_states().get(build_session_key(event.source))
@@ -1244,20 +1261,37 @@ class GatewaySlashCommandsMixin:
                 return "Decision Inbox failed.\nReason: unexpected error."
             # refresh re-pins the snapshot; show leaves the open cockpit untouched.
             if reply.verb == "refresh":
-                self._set_decision_inbox_context(event, str(response.get("snapshot_id") or ""))
+                self._set_decision_inbox_context(event, str(response.get("snapshot_id") or ""), response.get("inbox_index"))
             return render_decision_batch_message(response)
 
-        # research <n>
+        # research <n> — resolve the display number to a STABLE candidate id via
+        # the stored inbox_index and research by identity (no fragile whole-batch
+        # snapshot). Fall back to the legacy number+snapshot only when an older
+        # Cogitator returned no inbox_index.
         from gateway.cogitator_research_bridge import (
             ResearchBridgeError,
             render_research_message,
             request_research_decision_item,
         )
 
+        inbox_index = (ctx or {}).get("inbox_index") or []
+        candidate_id = self._resolve_inbox_candidate_id(inbox_index, reply.number)
+        if candidate_id:
+            research_item_id, research_snapshot = candidate_id, ""
+        elif inbox_index:
+            # the inbox is known but this number isn't in it → the item is gone
+            return (
+                f"There's no item {reply.number} in the current Decision Inbox.\n"
+                "Reply refresh (or run /decision_batch) and try again."
+            )
+        else:
+            # legacy path: older Cogitator with no inbox_index in the render
+            research_item_id, research_snapshot = str(reply.number), snapshot
+
         try:
             response = request_research_decision_item(
                 base_url=base_url, token=token,
-                item_id=str(reply.number), expected_snapshot_id=snapshot,
+                item_id=research_item_id, expected_snapshot_id=research_snapshot,
             )
         except ResearchBridgeError as exc:
             logger.warning("[decision_inbox] research bridge error code=%s", exc.code)
@@ -1768,7 +1802,7 @@ class GatewaySlashCommandsMixin:
 
         # Open the cockpit: remember the snapshot so plain replies (research <n>,
         # show <n>, refresh) route here instead of the model until it expires.
-        self._set_decision_inbox_context(event, str(response.get("snapshot_id") or ""))
+        self._set_decision_inbox_context(event, str(response.get("snapshot_id") or ""), response.get("inbox_index"))
         return render_decision_batch_message(response)
 
     def _x_batch_config(self) -> tuple[bool, str]:

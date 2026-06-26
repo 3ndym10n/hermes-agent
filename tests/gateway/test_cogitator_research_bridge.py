@@ -89,6 +89,10 @@ class TestParseInboxReply:
 
     def test_case_insensitive(self):
         assert parse_inbox_reply("RESEARCH 4").number == 4
+        r = parse_inbox_reply("Research 5")
+        assert r.verb == "research" and r.number == 5
+        s = parse_inbox_reply("SHOW 2")
+        assert s.verb == "show" and s.number == 2
 
     def test_prose_is_not_a_reply(self):
         assert parse_inbox_reply("research three papers on retrieval") is None
