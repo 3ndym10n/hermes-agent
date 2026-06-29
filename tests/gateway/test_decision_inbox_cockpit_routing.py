@@ -12,6 +12,7 @@ import time
 import pytest
 
 import gateway.cogitator_decision_batch_bridge as db_bridge
+import gateway.cogitator_promotion_approval_bridge as approval_bridge
 import gateway.cogitator_research_bridge as research_bridge
 from gateway.config import Platform
 from gateway.decision_inbox_cockpit import InboxReply
@@ -166,3 +167,95 @@ async def test_disabled_config_short_circuits():
 
     out = await _Disabled().handle_decision_inbox_reply(_Ev(), InboxReply(verb="research", number=1))
     assert "disabled" in out.lower()
+
+
+# --- approve-candidate routing (Scope D) -----------------------------------
+def _ctx_with_index(c, ev):
+    c._set_decision_inbox_context(
+        ev, "snap-1",
+        inbox_index=[{"n": 3, "candidate_id": "cand-x", "section": "watchlist", "title": "T"}])
+
+
+@pytest.mark.asyncio
+async def test_approve_candidate_preview_builds_preview_packet(monkeypatch):
+    c, ev = _Cockpit(), _Ev()
+    _ctx_with_index(c, ev)
+    captured = {}
+
+    def fake_request(*, base_url, token, item_id, mode, confirm, expected_snapshot_id, **kw):
+        captured.update(item_id=item_id, mode=mode, confirm=confirm, snapshot=expected_snapshot_id)
+        return {"status": "preview", "requested_action": "approve_promotion_candidate",
+                "approval_enabled": False, "target_path": "storage/promoted/x.md",
+                "would_be_record": {"title": "T", "trigger_phrases": ["a"]}}
+
+    monkeypatch.setattr(approval_bridge, "request_promotion_approval", fake_request)
+    out = await c.handle_decision_inbox_reply(ev, InboxReply("approve_candidate", 3, "preview"))
+    assert captured["item_id"] == "cand-x"  # resolved stable id, not "3"
+    assert captured["mode"] == "preview" and captured["confirm"] is False
+    assert captured["snapshot"] == ""  # by identity, snapshot dropped
+    assert "Approval preview for #3" in out
+
+
+@pytest.mark.asyncio
+async def test_approve_candidate_confirm_sets_confirm_true(monkeypatch):
+    c, ev = _Cockpit(), _Ev()
+    _ctx_with_index(c, ev)
+    captured = {}
+
+    def fake_request(*, base_url, token, item_id, mode, confirm, expected_snapshot_id, **kw):
+        captured.update(mode=mode, confirm=confirm)
+        return {"status": "approved", "requested_action": "approve_promotion_candidate",
+                "mutation_performed": True, "approved_retrieval_record_path": "storage/promoted/x.md"}
+
+    monkeypatch.setattr(approval_bridge, "request_promotion_approval", fake_request)
+    out = await c.handle_decision_inbox_reply(ev, InboxReply("approve_candidate", 3, "confirm"))
+    assert captured["mode"] == "confirm" and captured["confirm"] is True
+    assert "Approved. Wrote:" in out
+
+
+@pytest.mark.asyncio
+async def test_approve_candidate_bulk_rejected_no_bridge_call(monkeypatch):
+    c, ev = _Cockpit(), _Ev()
+    _ctx_with_index(c, ev)
+    called = {"n": 0}
+    monkeypatch.setattr(approval_bridge, "request_promotion_approval",
+                        lambda **kw: called.__setitem__("n", called["n"] + 1))
+    out = await c.handle_decision_inbox_reply(ev, InboxReply("approve_candidate", None, "all"))
+    assert called["n"] == 0
+    assert "bulk approval is not supported" in out.lower()
+
+
+@pytest.mark.asyncio
+async def test_approve_candidate_malformed_shows_usage(monkeypatch):
+    c, ev = _Cockpit(), _Ev()
+    _ctx_with_index(c, ev)
+    called = {"n": 0}
+    monkeypatch.setattr(approval_bridge, "request_promotion_approval",
+                        lambda **kw: called.__setitem__("n", called["n"] + 1))
+    out = await c.handle_decision_inbox_reply(ev, InboxReply("approve_candidate", None, None))
+    assert called["n"] == 0 and "usage:" in out.lower()
+
+
+@pytest.mark.asyncio
+async def test_approve_candidate_vanished_number_points_to_refresh(monkeypatch):
+    c, ev = _Cockpit(), _Ev()
+    c._set_decision_inbox_context(ev, "snap-1", inbox_index=[{"n": 1, "candidate_id": "cand-a"}])
+    called = {"n": 0}
+    monkeypatch.setattr(approval_bridge, "request_promotion_approval",
+                        lambda **kw: called.__setitem__("n", called["n"] + 1))
+    out = await c.handle_decision_inbox_reply(ev, InboxReply("approve_candidate", 9, "preview"))
+    assert called["n"] == 0 and "no item 9" in out.lower() and "refresh" in out.lower()
+
+
+@pytest.mark.asyncio
+async def test_approve_candidate_blocked_renders_no_write(monkeypatch):
+    c, ev = _Cockpit(), _Ev()
+    _ctx_with_index(c, ev)
+
+    def fake_request(**kw):
+        return {"status": "blocked", "requested_action": "approve_promotion_candidate",
+                "message": "Promotion approval is disabled.", "mutation_performed": False}
+
+    monkeypatch.setattr(approval_bridge, "request_promotion_approval", fake_request)
+    out = await c.handle_decision_inbox_reply(ev, InboxReply("approve_candidate", 3, "confirm"))
+    assert "Blocked:" in out and "No record written." in out

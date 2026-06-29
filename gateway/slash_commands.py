@@ -1207,10 +1207,61 @@ class GatewaySlashCommandsMixin:
         """True when this session has a live Decision Inbox cockpit open."""
         return self._active_decision_inbox_context(event) is not None
 
+    def _handle_approve_candidate_reply(self, reply, ctx, base_url: str, token: str) -> str:
+        """Map an ``approve-candidate <n> preview|confirm`` cockpit reply onto the
+        Cogitator ``approve_promotion_candidate`` bridge action (Scope D). The
+        command layer only resolves the number → stable candidate id and renders
+        the bridge result — it never writes storage and never approves itself. Bulk
+        and malformed forms are refused here with a clear message (no bridge call)."""
+        if reply.mode == "all":
+            return "Bulk approval is not supported. Approve one candidate by number."
+        if reply.number is None or reply.mode not in ("preview", "confirm"):
+            return ("Usage:\napprove-candidate <n> preview\napprove-candidate <n> confirm")
+
+        from gateway.cogitator_promotion_approval_bridge import (
+            ApprovalBridgeError,
+            render_approval_message,
+            request_promotion_approval,
+        )
+
+        inbox_index = (ctx or {}).get("inbox_index") or []
+        snapshot = str((ctx or {}).get("snapshot_id") or "")
+        candidate_id = self._resolve_inbox_candidate_id(inbox_index, reply.number)
+        if candidate_id:
+            item_id, expected_snapshot = candidate_id, ""
+        elif inbox_index:
+            return (
+                f"There's no item {reply.number} in the current Decision Inbox.\n"
+                "Reply refresh (or run /decision_batch) and try again."
+            )
+        else:
+            # legacy path: older Cogitator render with no inbox_index
+            item_id, expected_snapshot = str(reply.number), snapshot
+
+        try:
+            response = request_promotion_approval(
+                base_url=base_url, token=token, item_id=item_id,
+                mode=reply.mode, confirm=(reply.mode == "confirm"),
+                expected_snapshot_id=expected_snapshot,
+            )
+        except ApprovalBridgeError as exc:
+            logger.warning("[decision_inbox] approval bridge error code=%s", exc.code)
+            return (
+                "Approval unavailable.\n"
+                f"Reason: {exc.code}.\n"
+                "Next action: verify decision_batch.base_url and the deployed Cogitator bridge."
+            )
+        except Exception:
+            logger.exception("[decision_inbox] approval unexpected error")
+            return "Approval failed.\nReason: unexpected error."
+        return render_approval_message(response, number=reply.number)
+
     async def handle_decision_inbox_reply(self, event: MessageEvent, reply) -> str:
-        """Route a parsed cockpit reply (research/show/refresh/skip). Read-only
-        except for the bounded, non-promoting research action. Deterministic — no
-        model/LLM. ``reply`` is a gateway.decision_inbox_cockpit.InboxReply."""
+        """Route a parsed cockpit reply (research/show/refresh/skip/approve-candidate).
+        Read-only except for the bounded non-promoting research action and the
+        Cal-confirmed promotion approval (gated entirely on Cogitator's side).
+        Deterministic — no model/LLM. ``reply`` is a
+        gateway.decision_inbox_cockpit.InboxReply."""
         import os
 
         enabled, base_url = self._decision_batch_config()
@@ -1242,6 +1293,9 @@ class GatewaySlashCommandsMixin:
                 "can't dismiss or approve items from here. Reply research <n> to "
                 "research an item."
             )
+
+        if reply.verb == "approve_candidate":
+            return self._handle_approve_candidate_reply(reply, ctx, base_url, token)
 
         if reply.verb in ("refresh", "show"):
             detail_id = str(reply.number) if reply.verb == "show" else ""

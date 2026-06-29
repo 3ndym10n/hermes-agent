@@ -7023,10 +7023,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.info("Gateway routed Decision Inbox reply (session=%s, verb=%s)",
                             _quick_key, _inbox_reply.verb)
                 return await self.handle_decision_inbox_reply(event, _inbox_reply)
-            if _inbox_reply.verb in ("research", "skip") and _inbox_reply.number is not None:
+            if (_inbox_reply.verb in ("research", "skip") and _inbox_reply.number is not None) \
+                    or _inbox_reply.verb == "approve_candidate":
                 return (
                     "Open the Decision Inbox first with /decision_batch, then reply "
-                    "research <n> to research an item."
+                    "research <n> or approve-candidate <n> preview."
                 )
 
         # Intercept messages that are responses to a pending /reload-mcp
