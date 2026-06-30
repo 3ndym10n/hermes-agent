@@ -350,6 +350,37 @@ def _get_hermes_config_resolved() -> str | None:
     return _hermes_config_resolved
 
 
+def _skill_write_block_reason(resolved: str, normalized: str, filepath: str) -> str | None:
+    """Skill Write Protection V0.1 — block raw writes into ~/.hermes/skills/.
+
+    Closes the bypass left open by the skill_manage gate: write_file/patch (and
+    the terminal tool) could still write skill files directly. Only explicit
+    curator/self-improvement contexts (``skill_writes_allowed()``) may; everyone
+    else fails closed. This runs only on the WRITE path, so reads/list/search of
+    skills are unaffected. When allowed, snapshots the skills tree first so the
+    raw write is recoverable, mirroring skill_manage. See
+    docs/skill-write-protection-v0.md.
+    """
+    from tools.skill_provenance import path_targets_skills, skill_writes_allowed
+
+    if not (path_targets_skills(resolved) or path_targets_skills(normalized)):
+        return None
+    if not skill_writes_allowed():
+        return (
+            f"Refusing raw write to a skill file: {filepath}\n"
+            "Files under ~/.hermes/skills/ can only be changed through the "
+            "curator/self-improvement flow (skill_manage), not raw file writes. "
+            "Run `hermes curator run` or stage the change for review. "
+            "See docs/skill-write-protection-v0.md."
+        )
+    try:
+        from agent import curator_backup
+        curator_backup.snapshot_skills(reason="pre-skill-write:raw")
+    except Exception:
+        logger.warning("Pre-raw-skill-write snapshot failed for %s", filepath, exc_info=True)
+    return None
+
+
 def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None:
     """Return an error message if the path targets a sensitive system location."""
     try:
@@ -357,6 +388,13 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
     except (OSError, ValueError):
         resolved = filepath
     normalized = os.path.normpath(os.path.expanduser(filepath))
+
+    # Skill Write Protection V0.1: raw writes into ~/.hermes/skills/ are gated
+    # the same as skill_manage (both write_file and patch route through here).
+    skill_block = _skill_write_block_reason(resolved, normalized, filepath)
+    if skill_block:
+        return skill_block
+
     _err = (
         f"Refusing to write to sensitive system path: {filepath}\n"
         "Use the terminal tool with sudo if you need to modify system files."

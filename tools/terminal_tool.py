@@ -1840,6 +1840,65 @@ def _resolve_command_cwd(
     return default_cwd
 
 
+def _command_targets_skills_write(command: str) -> bool:
+    """Best-effort: True iff a shell command obviously WRITES into
+    ~/.hermes/skills/ (redirect/tee into a skills path, or a mutating verb
+    touching one). Reads (cat/ls/grep/head…) are not matched.
+
+    ponytail: heuristic with a known ceiling — variable expansion, symlinks, or
+    obfuscation can evade it. The hard boundary is the write_file/patch guard in
+    file_tools; this just closes the obvious shell hole. Upgrade path: a real
+    shell-arg parser if evasion ever matters.
+    """
+    if not isinstance(command, str) or not command:
+        return False
+    tokens = [r'\.hermes/skills']
+    try:
+        from tools.skill_provenance import skills_root
+        tokens.append(re.escape(str(skills_root())))
+    except Exception:
+        pass
+    token = r'(?:' + '|'.join(tokens) + r')'
+    # redirect or tee whose target is a skills path
+    if re.search(r'>>?\s*[\'"]?[^\s\'";|&]*' + token, command):
+        return True
+    if re.search(r'\btee\b[^\n|;&]*' + token, command):
+        return True
+    # mutating/destructive verb with a skills path among its args
+    if re.search(
+        r'\b(?:cp|mv|rm|rmdir|mkdir|touch|dd|install|truncate|ln|sed|chmod|chown)\b'
+        r'[^\n|;&]*' + token,
+        command,
+    ):
+        return True
+    return False
+
+
+def _skill_write_terminal_block(command: str) -> Optional[str]:
+    """Skill Write Protection V0.1 for the terminal tool. Returns a block
+    message when a command would write skills outside an allowed context, else
+    None. Snapshots first when allowed (mirrors skill_manage)."""
+    if not _command_targets_skills_write(command):
+        return None
+    try:
+        from tools.skill_provenance import skill_writes_allowed
+    except Exception:
+        return None  # provenance unavailable — fall through to normal guards
+    if not skill_writes_allowed():
+        return (
+            "Refusing terminal command that writes to ~/.hermes/skills/. "
+            "Skill files can only be changed through the curator/self-improvement "
+            "flow (skill_manage), not raw shell writes. Run `hermes curator run` "
+            "or stage the change for review. See docs/skill-write-protection-v0.md."
+        )
+    try:
+        from agent import curator_backup
+        curator_backup.snapshot_skills(reason="pre-skill-write:terminal")
+    except Exception:
+        logger.warning("Pre-terminal-skill-write snapshot failed", exc_info=True)
+    return None
+
+
 def terminal_tool(
     command: str,
     background: bool = False,
@@ -2057,6 +2116,19 @@ def terminal_tool(
                         _last_activity[effective_task_id] = time.time()
                         env = new_env
                     logger.info("%s environment ready for task %s", env_type, effective_task_id[:8])
+
+        # Skill Write Protection V0.1: fail closed on shell commands that
+        # obviously write into ~/.hermes/skills/ outside an allowed
+        # curator/self-improvement context. This is a security boundary, not a
+        # dangerous-command UX prompt, so `force` does NOT bypass it.
+        skill_block = _skill_write_terminal_block(command)
+        if skill_block:
+            return json.dumps({
+                "output": "",
+                "exit_code": -1,
+                "error": skill_block,
+                "status": "blocked",
+            }, ensure_ascii=False)
 
         # Pre-exec security checks (tirith + dangerous command detection)
         # Skip check if force=True (user has confirmed they want to run it)

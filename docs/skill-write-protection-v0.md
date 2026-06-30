@@ -77,14 +77,34 @@ hermes curator rollback <id>        # restore a specific snapshot
 Rollback takes its own safety snapshot first, so the rollback itself is
 undoable.
 
-## Scope (V0)
+## Raw-write guard (V0.1)
 
-In scope: the `skill_manage` tool — the designed skill-write path and the one
-the incident used.
+V0 gated `skill_manage` only, leaving a hole: an agent could still write skill
+files directly via the generic `write_file` / `patch` tools or a `terminal`
+shell command. V0.1 closes it with the **same** `skill_writes_allowed()` gate:
 
-Out of scope (separate, broader surfaces, tracked as follow-ups):
+- **`write_file` / `patch`** — `tools/file_tools.py::_check_sensitive_path`
+  (the shared pre-write check both tools route through) blocks any write whose
+  resolved path lands under `~/.hermes/skills/` unless allowed.
+- **`terminal`** — `tools/terminal_tool.py` fails closed, *before* the
+  dangerous-command check and regardless of `force`, on commands that obviously
+  write into the skills dir (redirect/`tee` into a skills path, or a mutating
+  verb — `cp`/`mv`/`rm`/`sed -i`/`touch`/`dd`/… — touching one). This is a
+  best-effort heuristic: variable expansion, symlinks, or obfuscation can evade
+  it; the `write_file`/`patch` guard is the hard boundary.
 
-- Raw `file_write` / `terminal` writes that target `~/.hermes/skills/`
-  directly (these bypass `skill_manage`).
-- The skills hub install/sync path, which is a human-initiated CLI action
-  already vetted by the `skills_guard` security scanner.
+Reads, lists, and searches of `~/.hermes/skills/` are never gated (the guards
+run only on the write path). Allowed raw writes snapshot the skills tree first,
+exactly like `skill_manage`.
+
+## Scope
+
+In scope: `skill_manage` (V0) plus raw `write_file` / `patch` / `terminal`
+writes (V0.1) — the designed skill-write path and its bypasses.
+
+Out of scope:
+
+- The skills hub install/sync path, a human-initiated CLI action already vetted
+  by the `skills_guard` security scanner.
+- Adversarial shell obfuscation against the terminal heuristic (see the
+  best-effort caveat above).
