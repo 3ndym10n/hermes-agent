@@ -31,12 +31,22 @@ Usage:
         mark_agent_created(skill_name)
 """
 
+import contextlib
 import contextvars
 
 
 _write_origin: contextvars.ContextVar[str] = contextvars.ContextVar(
     "skill_write_origin",
     default="foreground",
+)
+
+# Skill-write protection — explicit opt-in for the curator/self-improvement
+# flows that are allowed to mutate ~/.hermes/skills/. Normal conversational,
+# operator, cron, and reflective/planning agent runs never set this, so the
+# skill-write gate fails them closed. See docs/skill-write-protection-v0.md.
+_writes_allowed: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "skill_writes_allowed",
+    default=False,
 )
 
 # The sentinel value the background review fork uses; mirrors
@@ -76,3 +86,34 @@ def is_background_review() -> bool:
     """Convenience: True iff the current write origin is the background
     review fork."""
     return get_current_write_origin() == BACKGROUND_REVIEW
+
+
+@contextlib.contextmanager
+def allow_skill_writes():
+    """Mark the current context as an explicit curator/self-improvement flow
+    that may write skill files.
+
+    Wrap the curator's review pass (and any other deliberate skill-write
+    entry point) in this so the skill-write gate lets it through. Runs in the
+    same thread as the wrapped tool loop, so the ContextVar is visible to the
+    skill_manage tool calls made inside it. Normal agent runs never enter this
+    context, so their skill writes fail closed.
+    """
+    token = _writes_allowed.set(True)
+    try:
+        yield
+    finally:
+        _writes_allowed.reset(token)
+
+
+def skill_writes_allowed() -> bool:
+    """True iff the current context is an explicit curator/self-improvement
+    flow allowed to write skill files.
+
+    Allowed: the background self-improvement review fork
+    (``is_background_review()``), and any context wrapped in
+    ``allow_skill_writes()`` (the curator pass). Everything else — foreground
+    conversational/operator runs, cron jobs, reflective/planning answers,
+    subagents — is denied.
+    """
+    return _writes_allowed.get() or is_background_review()

@@ -13,6 +13,20 @@ from unittest.mock import patch
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _allow_skill_writes_in_tools_tests():
+    """Existing tools tests exercise the *allowed* skill-write mechanics
+    (create/edit/patch/delete file ops, the approval-staging gate). The
+    skill-write protection guard fails closed outside curator/self-improvement
+    flows, so grant the allow context for this directory's tests. The dedicated
+    block-path coverage lives in tests/test_skill_write_protection.py, outside
+    this directory, where the guard runs un-suppressed.
+    """
+    from tools.skill_provenance import allow_skill_writes
+    with allow_skill_writes():
+        yield
+
+
 def register_all_web_providers():
     """Register all bundled web-search providers into the global registry.
 
