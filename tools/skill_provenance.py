@@ -33,6 +33,7 @@ Usage:
 
 import contextlib
 import contextvars
+from pathlib import Path
 
 
 _write_origin: contextvars.ContextVar[str] = contextvars.ContextVar(
@@ -117,3 +118,28 @@ def skill_writes_allowed() -> bool:
     subagents — is denied.
     """
     return _writes_allowed.get() or is_background_review()
+
+
+def skills_root() -> Path:
+    """Absolute, resolved path of the skills directory (``~/.hermes/skills``)."""
+    from hermes_constants import get_hermes_home
+    return (get_hermes_home() / "skills").resolve()
+
+
+def path_targets_skills(path) -> bool:
+    """True iff *path* resolves to the skills directory or a file/dir under it.
+
+    Used by the raw-write guard (file_write/patch/terminal) to recognize a
+    write aimed at ~/.hermes/skills/ so it can be held to the same gate as
+    skill_manage. Resolution failures return False (caller falls through to its
+    normal handling).
+    """
+    try:
+        rp = Path(str(path)).expanduser().resolve()
+    except Exception:
+        return False
+    try:
+        root = skills_root()
+    except Exception:
+        return False
+    return rp == root or root in rp.parents
