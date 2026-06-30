@@ -1768,9 +1768,15 @@ def _run_llm_review(prompt: str) -> Dict[str, Any]:
         # terminal. The background-thread runner also hides it; this
         # belt-and-suspenders path matters when a caller invokes
         # run_curator_review(synchronous=True) from the CLI.
+        # The curator IS the explicit self-improvement flow allowed to write
+        # skills. Mark this context so the skill-write gate lets the review
+        # agent's skill_manage calls through (runs in this thread, so the
+        # ContextVar is visible to the synchronous tool loop below).
+        from tools.skill_provenance import allow_skill_writes
         with open(os.devnull, "w", encoding="utf-8") as _devnull, \
              contextlib.redirect_stdout(_devnull), \
-             contextlib.redirect_stderr(_devnull):
+             contextlib.redirect_stderr(_devnull), \
+             allow_skill_writes():
             conv_result = review_agent.run_conversation(user_message=prompt)
 
         final = ""

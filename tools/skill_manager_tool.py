@@ -937,6 +937,35 @@ _skill_gate_bypass: "_ctxvars.ContextVar[bool]" = _ctxvars.ContextVar(
     "skill_gate_bypass", default=False
 )
 
+_SKILL_WRITE_BLOCKED_MSG = (
+    "Skill writes are blocked outside explicit curator/self-improvement flows "
+    "(attempted action='{action}' on skill '{name}'). A normal conversation, "
+    "operator session, cron job, or reflective/planning answer must not patch "
+    "skill files — they live outside version control and a cron may read them "
+    "later. To change a skill, run the curator (`hermes curator run`) or stage "
+    "the write for review via the skills approval flow. See "
+    "docs/skill-write-protection-v0.md."
+)
+
+
+def _snapshot_before_skill_write(action: str, name: str) -> None:
+    """Snapshot ~/.hermes/skills/ before an allowed mutation so a bad write is
+    recoverable via `hermes curator rollback`. Best-effort and idempotent —
+    reuses the curator's existing tar.gz+manifest backup convention. A backup
+    failure is logged but never blocks the write (matches the curator's own
+    pre-pass snapshot behaviour).
+
+    ponytail: snapshots the whole skills tree per allowed write; if write
+    volume ever spikes, switch to a per-file copy keyed on the target path.
+    """
+    try:
+        from agent import curator_backup
+        curator_backup.snapshot_skills(reason=f"pre-skill-write:{action}:{name}")
+    except Exception:
+        logger.warning(
+            "Pre-skill-write snapshot failed for %s on '%s'", action, name, exc_info=True
+        )
+
 
 def _apply_skill_write_gate(action, name, **payload_kwargs):
     """Evaluate the skill write gate. Returns a JSON tool-result string when the
@@ -947,6 +976,15 @@ def _apply_skill_write_gate(action, name, **payload_kwargs):
         return None
     if _skill_gate_bypass.get():
         return None
+
+    # Skill-write protection: only explicit curator/self-improvement flows may
+    # mutate ~/.hermes/skills/. A normal conversational/operator/cron run (or a
+    # reflective/planning answer) that reaches here is the exact bug this guards
+    # against — it must fail closed, not silently patch a skill a cron will
+    # later read. See docs/skill-write-protection-v0.md.
+    from tools.skill_provenance import skill_writes_allowed
+    if not skill_writes_allowed():
+        return tool_error(_SKILL_WRITE_BLOCKED_MSG.format(action=action, name=name), success=False)
 
     try:
         from tools import write_approval as wa
@@ -1028,6 +1066,10 @@ def skill_manage(
     )
     if gate_result is not None:
         return gate_result
+
+    # Gate passed (an explicit curator/self-improvement flow). Snapshot the
+    # skills tree before mutating it so the write is recoverable.
+    _snapshot_before_skill_write(action, name)
 
     if action == "create":
         if not content:
