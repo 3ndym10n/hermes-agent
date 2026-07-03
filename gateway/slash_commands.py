@@ -1952,6 +1952,125 @@ class GatewaySlashCommandsMixin:
 
         return render_x_batch_message(response)
 
+    # --- Universal text intake (plain-text ``intake`` command) -----------------
+    # Cal pastes one messy dump whose first line is ``intake`` (or ``intake lens
+    # <label>``). gateway.run intercepts it via cogitator_intake_bridge.
+    # parse_intake_message — deterministically, before the model — and routes it
+    # here. After a successful intake we remember the packet path per session so
+    # a later research verb can address items in the latest packet.
+    _INTAKE_CONTEXT_TTL_SECONDS = 3600
+
+    def _intake_config(self) -> tuple[bool, str]:
+        """Resolve the default-off ``intake`` gate and bridge base URL.
+
+        Fails closed (disabled) on any config error. Never reads secrets — the
+        bearer token is sourced separately, from the environment only.
+        """
+        try:
+            from gateway.run import _load_gateway_config
+
+            config = _load_gateway_config()
+        except Exception:
+            return False, ""
+        enabled = is_truthy_value(
+            cfg_get(config, "intake", "enabled", default=False), default=False
+        )
+        base_url = str(cfg_get(config, "intake", "base_url", default="") or "").strip()
+        return enabled, base_url
+
+    def _intake_states(self) -> dict[str, Any]:
+        states = getattr(self, "_intake_ctx", None)
+        if not isinstance(states, dict):
+            states = {}
+            setattr(self, "_intake_ctx", states)
+        return states
+
+    def _set_intake_context(self, event: MessageEvent, response: dict[str, Any]) -> None:
+        self._intake_states()[build_session_key(event.source)] = {
+            "packet_path": str(response.get("packet_path") or ""),
+            "raw_path": str(response.get("raw_path") or ""),
+            "ts": time.time(),
+        }
+
+    def _active_intake_context(self, event: MessageEvent) -> Optional[dict[str, Any]]:
+        ctx = self._intake_states().get(build_session_key(event.source))
+        if not isinstance(ctx, dict):
+            return None
+        if time.time() - float(ctx.get("ts") or 0) > self._INTAKE_CONTEXT_TTL_SECONDS:
+            return None
+        return ctx
+
+    async def handle_intake_message(self, event: MessageEvent, cmd) -> str:
+        """Handle a parsed plain-text intake command (never reaches the model).
+
+        When disabled (the default) this returns a short notice and never
+        contacts Cogitator. When enabled it POSTs a draft-only
+        ``intake_review_packet`` bridge request (bearer token from the
+        COGITATOR_BRIDGE_TOKEN environment variable only), validates the
+        response fail-closed (research/promotion must not have executed), and
+        renders a compact packet summary. File writes happen on Cogitator's
+        side, bounded to storage/intake/. This path never fetches links,
+        researches, promotes, or approves.
+        """
+        import os
+
+        from gateway.cogitator_intake_bridge import (
+            TOKEN_ENV,
+            IntakeBridgeError,
+            intake_help_text,
+            render_intake_message,
+            request_intake_review,
+        )
+
+        if cmd.error == "missing_body":
+            return intake_help_text()
+        if cmd.error == "oversized_body":
+            return (
+                "Intake rejected: the pasted material is too large for one message.\n"
+                "Split the dump into smaller intake messages."
+            )
+        if cmd.error == "invalid_lens":
+            return (
+                "Intake rejected: invalid lens label (letters/digits/space/dash, "
+                "max 60 chars).\n" + intake_help_text()
+            )
+
+        enabled, base_url = self._intake_config()
+        if not enabled:
+            return (
+                "Intake is disabled.\n"
+                "Enable it with intake.enabled: true in the gateway config to "
+                "capture raw material through Cogitator."
+            )
+
+        token = str(os.environ.get(TOKEN_ENV, "") or "").strip()
+        if not base_url or not token:
+            return (
+                "Intake is not configured.\n"
+                "Set intake.base_url in the gateway config and the "
+                f"{TOKEN_ENV} environment variable."
+            )
+
+        try:
+            response = request_intake_review(
+                base_url=base_url, token=token,
+                raw_text=cmd.raw_text, context_label=cmd.lens,
+            )
+        except IntakeBridgeError as exc:
+            logger.warning("[intake] bridge error code=%s", exc.code)
+            return (
+                "Intake unavailable.\n"
+                f"Reason: {exc.code}.\n"
+                "Next action: verify intake.base_url and the deployed Cogitator bridge."
+            )
+        except Exception:
+            logger.exception("[intake] unexpected error")
+            return "Intake failed.\nReason: unexpected error.\nNext action: inspect gateway logs."
+
+        if response.get("status") == "ok" and response.get("packet_path"):
+            self._set_intake_context(event, response)
+        return render_intake_message(response)
+
     async def _handle_model_command(self, event: MessageEvent) -> Optional[str]:
         """Handle /model command — switch model for this session.
 

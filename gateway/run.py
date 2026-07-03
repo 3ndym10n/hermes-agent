@@ -7030,6 +7030,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "research <n> or approve-candidate <n> preview."
                 )
 
+        # Universal text intake: a message whose first line is ``intake`` (or
+        # ``intake lens <label>``) is routed deterministically to the Cogitator
+        # intake bridge instead of the model. The parser is strict — ordinary
+        # prose that merely contains the word "intake" falls through unchanged.
+        try:
+            from gateway.cogitator_intake_bridge import parse_intake_message
+            _intake_cmd = parse_intake_message(event.text or "")
+        except Exception:
+            _intake_cmd = None
+        if _intake_cmd is not None:
+            logger.info("Gateway routed intake message (session=%s, lens=%s, error=%s)",
+                        _quick_key, _intake_cmd.lens or "-", _intake_cmd.error or "-")
+            return await self.handle_intake_message(event, _intake_cmd)
+
         # Intercept messages that are responses to a pending /reload-mcp
         # (or future) slash-confirm prompt.  Recognized confirm replies are
         # /approve, /always, /cancel (plus short aliases).  Anything else
