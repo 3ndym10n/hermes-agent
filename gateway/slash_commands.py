@@ -2025,6 +2025,11 @@ class GatewaySlashCommandsMixin:
             request_source_access_intake,
         )
 
+        if cmd.error == "invalid_research":
+            return (
+                "Usage:\nintake research <n> — research claim n of the latest intake packet\n"
+                "intake research <packet_path> <n> — research from a specific packet"
+            )
         if cmd.error == "missing_body":
             return intake_help_text()
         if cmd.error == "oversized_body":
@@ -2053,6 +2058,41 @@ class GatewaySlashCommandsMixin:
                 "Set intake.base_url in the gateway config and the "
                 f"{TOKEN_ENV} environment variable."
             )
+
+        # Research verb: bounded research on one claim of the latest (or an
+        # explicitly addressed) intake packet. Never promotes; Cogitator writes
+        # one research note and this side verifies promotion did not happen.
+        if cmd.research_number is not None:
+            from gateway.cogitator_intake_bridge import (
+                render_intake_research_message,
+                request_intake_research,
+            )
+
+            packet_path = cmd.packet_path
+            if not packet_path:
+                ctx = self._active_intake_context(event)
+                packet_path = str((ctx or {}).get("packet_path") or "")
+            if not packet_path:
+                return (
+                    "No recent intake packet in this session.\n"
+                    "Run intake first, or use: intake research <packet_path> <n>"
+                )
+            try:
+                response = request_intake_research(
+                    base_url=base_url, token=token,
+                    packet_path=packet_path, item_number=cmd.research_number,
+                )
+            except IntakeBridgeError as exc:
+                logger.warning("[intake] research bridge error code=%s", exc.code)
+                return (
+                    "Intake research unavailable.\n"
+                    f"Reason: {exc.code}.\n"
+                    "Next action: verify intake.base_url and the deployed Cogitator bridge."
+                )
+            except Exception:
+                logger.exception("[intake] research unexpected error")
+                return "Intake research failed.\nReason: unexpected error."
+            return render_intake_research_message(response)
 
         # A body that is only URLs routes through the source-access seam
         # (full-source-or-abstain fetch), everything else through text intake.

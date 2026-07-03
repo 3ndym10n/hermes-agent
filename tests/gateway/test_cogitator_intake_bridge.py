@@ -53,8 +53,20 @@ def test_parse_ordinary_prose_falls_through():
     assert ib.parse_intake_message("the intake\nprocess is fine") is None
     assert ib.parse_intake_message("/intake something") is None
     assert ib.parse_intake_message("") is None
-    # research verb belongs to the (later) research flow, not this parser
-    assert ib.parse_intake_message("intake research 2") is None
+
+
+def test_parse_research_verb():
+    cmd = ib.parse_intake_message("intake research 2")
+    assert cmd is not None and cmd.error == "" and cmd.research_number == 2
+    assert cmd.packet_path == ""
+    cmd = ib.parse_intake_message(
+        "intake research storage/intake/packets/2026-07-03_12-00-00-intake-packet.md 3")
+    assert cmd is not None and cmd.research_number == 3
+    assert cmd.packet_path.endswith("-packet.md")
+    cmd = ib.parse_intake_message("intake research two")
+    assert cmd is not None and cmd.error == "invalid_research"
+    cmd = ib.parse_intake_message("intake research 2\nplus body")
+    assert cmd is not None and cmd.error == "invalid_research"
 
 
 # --- request/response validation ---------------------------------------------
@@ -340,3 +352,90 @@ def test_handler_bridge_error_is_sanitized(monkeypatch):
     out = _run(mixin.handle_intake_message(_Ev(), ib.IntakeCommand(raw_text="body")))
     assert "BRIDGE_UNREACHABLE" in out
     assert "tkn" not in out
+
+
+def _ok_research_response(**overrides):
+    resp = {
+        "status": "ok",
+        "requested_action": "research_intake_item",
+        "packet_path": "storage/intake/packets/2026-07-03_12-00-00-intake-packet.md",
+        "claim_number": 1,
+        "claim": "AI dynamic pricing lifts margins by 25%",
+        "verdict": "needs_more_evidence",
+        "evidence_quality": "none",
+        "sources_used": [
+            {"url": "https://x.com/v/status/1", "stance": "failed",
+             "evidence_type": "none", "note": "status=needs_full_source"},
+        ],
+        "missing_evidence": ["https://x.com/v/status/1 — full source unavailable"],
+        "recommended_action": "Verify manually before relying on the claim.",
+        "note_path": "storage/research_notes/ai-dynamic-pricing_x-claim-1.md",
+        "mutation_performed": True,
+        "research_performed": True,
+        "promotion_performed": False,
+    }
+    resp.update(overrides)
+    return resp
+
+
+def test_research_response_promotion_fails_closed():
+    with pytest.raises(ib.IntakeBridgeError):
+        ib.validate_intake_research_response(_ok_research_response(promotion_performed=True))
+    # research_performed=True is expected and allowed here
+    assert ib.validate_intake_research_response(_ok_research_response())["verdict"]
+
+
+def test_render_research_message():
+    out = ib.render_intake_research_message(_ok_research_response())
+    assert "needs_more_evidence" in out
+    assert "AI dynamic pricing" in out
+    assert "Sources consulted:" in out
+    assert "Research note: storage/research_notes/" in out
+
+
+def test_render_intake_message_lists_research_targets():
+    out = ib.render_intake_message(_ok_response(research_targets=[
+        {"n": 1, "claim": "AI dynamic pricing lifts margins by 25%"},
+        {"n": 2, "claim": "Chatbots handle 70-90% of queries"},
+    ]))
+    assert "intake research <n>" in out
+    assert "1. AI dynamic pricing" in out
+
+
+def test_handler_research_uses_session_context(monkeypatch):
+    calls = {}
+
+    def fake_research(*, base_url, token, packet_path, item_number, **kw):
+        calls.update(packet_path=packet_path, item_number=item_number)
+        return _ok_research_response()
+
+    monkeypatch.setattr(ib, "request_intake_research", fake_research)
+    monkeypatch.setattr(ib, "request_intake_review", lambda **k: _ok_response())
+    monkeypatch.setenv(ib.TOKEN_ENV, "tkn")
+    mixin = _handler_with_config(True, "https://cog.example")
+    ev = _Ev()
+    # no context yet → nudge
+    out = _run(mixin.handle_intake_message(ev, ib.IntakeCommand(research_number=1)))
+    assert "Run intake first" in out
+    # after an intake, the latest packet is addressed automatically
+    _run(mixin.handle_intake_message(ev, ib.IntakeCommand(raw_text="some dump")))
+    out = _run(mixin.handle_intake_message(ev, ib.IntakeCommand(research_number=2)))
+    assert calls["item_number"] == 2
+    assert calls["packet_path"].endswith("-intake-packet.md")
+    assert "Research verdict" in out
+
+
+def test_handler_research_explicit_path(monkeypatch):
+    calls = {}
+
+    def fake_research(*, packet_path, item_number, **kw):
+        calls.update(packet_path=packet_path, item_number=item_number)
+        return _ok_research_response()
+
+    monkeypatch.setattr(ib, "request_intake_research", fake_research)
+    monkeypatch.setenv(ib.TOKEN_ENV, "tkn")
+    mixin = _handler_with_config(True, "https://cog.example")
+    out = _run(mixin.handle_intake_message(_Ev(), ib.IntakeCommand(
+        research_number=3, packet_path="storage/intake/packets/x-packet.md")))
+    assert calls == {"packet_path": "storage/intake/packets/x-packet.md", "item_number": 3}
+    assert "Research verdict" in out

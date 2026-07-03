@@ -57,26 +57,43 @@ class IntakeBridgeError(Exception):
         self.detail = detail
 
 
+_RESEARCH_RE = re.compile(
+    r"^intake\s+research\s+(?:(storage/intake/packets/\S+-packet\.md)\s+)?#?(\d{1,3})$",
+    re.IGNORECASE,
+)
+_RESEARCH_ATTEMPT_RE = re.compile(r"^intake\s+research\b", re.IGNORECASE)
+
+
 @dataclass(frozen=True)
 class IntakeCommand:
     """Parsed plain-text intake command. ``error`` set → show usage/reason and
-    stop; the message never reaches the model either way."""
+    stop; the message never reaches the model either way. ``research_number``
+    set → this is a research verb, not a new dump."""
 
     raw_text: str = ""
     lens: str = ""
-    error: str = ""  # "", "missing_body", "oversized_body", "invalid_lens"
+    research_number: int | None = None
+    packet_path: str = ""  # optional explicit target for the research verb
+    error: str = ""  # "", "missing_body", "oversized_body", "invalid_lens", "invalid_research"
 
 
 def parse_intake_message(text: str) -> Optional[IntakeCommand]:
     """Strict string→intent parser for one chat message.
 
     Returns None for anything that is not an intake command attempt (slash
-    commands, prose that merely contains the word, ``intake research …`` which
-    belongs to the research verb) so normal handling is untouched.
+    commands, prose that merely contains the word) so normal handling is
+    untouched. ``intake research <n>`` (optionally with an explicit packet
+    path) is the research verb over the latest/addressed intake packet.
     """
     s = str(text or "")
     first, _, body = s.partition("\n")
     head = first.strip()
+    if _RESEARCH_ATTEMPT_RE.match(head):
+        match = _RESEARCH_RE.match(head)
+        if not match or body.strip():
+            return IntakeCommand(error="invalid_research")
+        return IntakeCommand(research_number=int(match.group(2)),
+                             packet_path=match.group(1) or "")
     if head.lower() == "intake":
         lens = ""
     else:
@@ -285,6 +302,104 @@ def request_intake_review(
     return validate_intake_response(response)
 
 
+def build_intake_research_request(
+    *, packet_path: str, item_number: int, dry_run: bool = False
+) -> dict[str, Any]:
+    """Build the draft-only ``research_intake_item`` bridge packet."""
+    context: dict[str, Any] = {"packet_path": str(packet_path), "item_number": int(item_number)}
+    if dry_run:
+        context["dry_run"] = True
+    return {
+        "source_agent": "hermes",
+        "requested_action": "research_intake_item",
+        "user_intent": "Bounded research on one selected intake-packet claim.",
+        "content": "",
+        "approval_status": "draft_only",
+        "risk_level": "low",
+        "context": context,
+    }
+
+
+def validate_intake_research_response(response: Any) -> dict[str, Any]:
+    """Fail-closed validation for the research verb: research is EXPECTED here,
+    but promotion/approval must not have happened."""
+    if not isinstance(response, Mapping):
+        raise IntakeBridgeError("BRIDGE_RESPONSE_INVALID", "response is not an object")
+    status = response.get("status")
+    if status not in {"ok", "rejected"}:
+        raise IntakeBridgeError("BRIDGE_STATUS_NOT_OK", f"status={status!r}")
+    if response.get("requested_action") != "research_intake_item":
+        raise IntakeBridgeError("BRIDGE_ACTION_MISMATCH", f"action={response.get('requested_action')!r}")
+    if response.get("promotion_performed") not in (False, None):
+        raise IntakeBridgeError("BRIDGE_STATEFUL_RESPONSE",
+                                f"promotion_performed={response.get('promotion_performed')!r}")
+    stateful = [f for f in _FORBIDDEN_RESPONSE_FIELDS if f in response]
+    if stateful:
+        raise IntakeBridgeError("BRIDGE_STATEFUL_RESPONSE", f"fields={stateful}")
+    return dict(response)
+
+
+def request_intake_research(
+    *,
+    base_url: str,
+    token: str,
+    packet_path: str,
+    item_number: int,
+    dry_run: bool = False,
+    urlopen: Optional[Callable[..., Any]] = None,
+) -> dict[str, Any]:
+    """POST one bounded research request and validate the reply fail-closed."""
+    if not str(base_url or "").strip():
+        raise IntakeBridgeError("BRIDGE_NOT_CONFIGURED", "base_url missing")
+    if not str(token or "").strip():
+        raise IntakeBridgeError("BRIDGE_TOKEN_MISSING", "token missing")
+    if not str(packet_path or "").strip():
+        raise IntakeBridgeError("NO_PACKET", "packet_path missing")
+    packet = build_intake_research_request(
+        packet_path=packet_path, item_number=item_number, dry_run=dry_run)
+    response = _post_bridge(packet, base_url=base_url.strip(), token=token.strip(),
+                            urlopen=urlopen)
+    return validate_intake_research_response(response)
+
+
+_VERDICT_EMOJI = {
+    "verified_enough": "✅",
+    "plausible_unverified": "🟡",
+    "contradicted": "❌",
+    "needs_full_source": "🔒",
+    "needs_more_evidence": "❓",
+    "ignore_low_value": "🗑️",
+}
+
+
+def render_intake_research_message(response: Mapping[str, Any]) -> str:
+    """Render a validated research response: verdict first, provenance visible."""
+    if response.get("status") == "rejected":
+        return f"Research rejected: {response.get('message') or 'invalid selection'}"
+    verdict = str(response.get("verdict") or "unknown")
+    lines = [
+        f"{_VERDICT_EMOJI.get(verdict, '🔎')} Research verdict: {verdict}",
+        f"Claim: {response.get('claim', '')}",
+        f"Evidence quality: {response.get('evidence_quality', 'none')}",
+    ]
+    sources = response.get("sources_used") or []
+    if sources:
+        lines.append("")
+        lines.append("Sources consulted:")
+        for s in sources[:5]:
+            lines.append(f"- [{s.get('stance', '?')}/{s.get('evidence_type', 'none')}] {s.get('url', '')}")
+    missing = [str(m) for m in (response.get("missing_evidence") or [])]
+    if missing:
+        lines.append("")
+        lines.append("Missing evidence:")
+        lines += [f"- {m}" for m in missing[:4]]
+    if response.get("recommended_action"):
+        lines += ["", f"Recommended action: {response['recommended_action']}"]
+    if response.get("note_path"):
+        lines.append(f"Research note: {response['note_path']}")
+    return "\n".join(lines)
+
+
 def intake_help_text() -> str:
     """Compact usage shown for an attempted-but-malformed intake message."""
     return (
@@ -328,6 +443,12 @@ def render_intake_message(response: Mapping[str, Any]) -> str:
         lines.append("")
         lines.append("Top outputs:")
         lines += [f"{i}. {t}" for i, t in enumerate(top, 1)]
+    targets = response.get("research_targets") or []
+    if targets:
+        lines.append("")
+        lines.append("Research targets (reply `intake research <n>`):")
+        for t in targets:
+            lines.append(f"{t.get('n')}. {t.get('claim', '')}")
     if response.get("next_action"):
         lines.append("")
         lines.append(f"Next action: {response['next_action']}")
