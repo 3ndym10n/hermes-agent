@@ -2018,8 +2018,11 @@ class GatewaySlashCommandsMixin:
             TOKEN_ENV,
             IntakeBridgeError,
             intake_help_text,
+            is_url_only_body,
             render_intake_message,
+            render_link_intake_message,
             request_intake_review,
+            request_source_access_intake,
         )
 
         if cmd.error == "missing_body":
@@ -2051,13 +2054,25 @@ class GatewaySlashCommandsMixin:
                 f"{TOKEN_ENV} environment variable."
             )
 
+        # A body that is only URLs routes through the source-access seam
+        # (full-source-or-abstain fetch), everything else through text intake.
+        link_mode = is_url_only_body(cmd.raw_text)
         try:
-            response = request_intake_review(
-                base_url=base_url, token=token,
-                raw_text=cmd.raw_text, context_label=cmd.lens,
-            )
+            if link_mode:
+                urls = [line.strip() for line in cmd.raw_text.splitlines() if line.strip()]
+                response = request_source_access_intake(
+                    base_url=base_url, token=token,
+                    urls=urls, context_label=cmd.lens,
+                )
+            else:
+                response = request_intake_review(
+                    base_url=base_url, token=token,
+                    raw_text=cmd.raw_text, context_label=cmd.lens,
+                )
         except IntakeBridgeError as exc:
             logger.warning("[intake] bridge error code=%s", exc.code)
+            if exc.code == "TOO_MANY_LINKS":
+                return "Intake refused: too many links (max 25 per message)."
             return (
                 "Intake unavailable.\n"
                 f"Reason: {exc.code}.\n"
@@ -2069,7 +2084,7 @@ class GatewaySlashCommandsMixin:
 
         if response.get("status") == "ok" and response.get("packet_path"):
             self._set_intake_context(event, response)
-        return render_intake_message(response)
+        return render_link_intake_message(response) if link_mode else render_intake_message(response)
 
     async def _handle_model_command(self, event: MessageEvent) -> Optional[str]:
         """Handle /model command — switch model for this session.

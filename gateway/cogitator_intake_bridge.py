@@ -94,6 +94,94 @@ def parse_intake_message(text: str) -> Optional[IntakeCommand]:
     return IntakeCommand(raw_text=raw_text, lens=lens)
 
 
+_URL_LINE_RE = re.compile(r"^https?://\S+$", re.IGNORECASE)
+MAX_LINK_LINES = 25
+
+
+def is_url_only_body(raw_text: str) -> bool:
+    """True when every non-empty line of the body is a bare URL — then the
+    dump is a link list and routes through Cogitator's source-access seam."""
+    lines = [line.strip() for line in str(raw_text or "").splitlines() if line.strip()]
+    return bool(lines) and all(_URL_LINE_RE.match(line) for line in lines)
+
+
+def build_source_access_request(
+    *, urls: list[str], context_label: str = "", dry_run: bool = False
+) -> dict[str, Any]:
+    """Build the draft-only ``source_access_intake_packet`` bridge packet."""
+    context: dict[str, Any] = {"urls": list(urls)}
+    if str(context_label or "").strip():
+        context["context_label"] = str(context_label).strip()
+    if dry_run:
+        context["dry_run"] = True
+    return {
+        "source_agent": "hermes",
+        "requested_action": "source_access_intake_packet",
+        "user_intent": "Fetch full public sources for pasted links and build an intake packet.",
+        "content": "",
+        "approval_status": "draft_only",
+        "risk_level": "low",
+        "context": context,
+    }
+
+
+def request_source_access_intake(
+    *,
+    base_url: str,
+    token: str,
+    urls: list[str],
+    context_label: str = "",
+    dry_run: bool = False,
+    urlopen: Optional[Callable[..., Any]] = None,
+) -> dict[str, Any]:
+    """POST a link-list intake and validate the reply fail-closed."""
+    if not str(base_url or "").strip():
+        raise IntakeBridgeError("BRIDGE_NOT_CONFIGURED", "base_url missing")
+    if not str(token or "").strip():
+        raise IntakeBridgeError("BRIDGE_TOKEN_MISSING", "token missing")
+    urls = [u for u in (str(x or "").strip() for x in urls or []) if u]
+    if not urls:
+        raise IntakeBridgeError("NO_BODY", "no urls supplied")
+    if len(urls) > MAX_LINK_LINES:
+        raise IntakeBridgeError("TOO_MANY_LINKS", f"max={MAX_LINK_LINES}")
+    packet = build_source_access_request(urls=urls, context_label=context_label, dry_run=dry_run)
+    response = _post_bridge(packet, base_url=base_url.strip(), token=token.strip(), urlopen=urlopen)
+    return _validate_response(response, expected_action="source_access_intake_packet")
+
+
+def render_link_intake_message(response: Mapping[str, Any]) -> str:
+    """Render a validated link-intake response: honest per-status counts first."""
+    if response.get("status") == "rejected":
+        return f"Link intake rejected: {response.get('message') or 'invalid input'}"
+    status_counts = response.get("source_status_counts") or {}
+    counts = response.get("counts") or {}
+    lines = ["🔗 Link intake complete:"]
+    for status in ("fetched_full", "needs_full_source", "cookie_required",
+                   "fetch_failed", "unsupported", "skipped"):
+        if status_counts.get(status):
+            lines.append(f"- {status}: {status_counts[status]}")
+    lines.append(f"- mined into packet: {response.get('mined_sources', 0)} source(s)")
+    if response.get("packet_path"):
+        lines += [
+            "",
+            f"Packet: {response['packet_path']}",
+            f"- ideas {counts.get('high_value_ideas', 0)} · claims {counts.get('claims_to_verify', 0)}"
+            f" · opportunities {counts.get('opportunities', 0)} · playbooks {counts.get('playbook_candidates', 0)}"
+            f" · retrieval {counts.get('retrieval_candidates', 0)} · ignored {counts.get('ignored', 0)}",
+        ]
+        top = [str(t) for t in (response.get("top_outputs") or [])]
+        if top:
+            lines.append("Top outputs:")
+            lines += [f"{i}. {t}" for i, t in enumerate(top, 1)]
+    if response.get("next_action"):
+        lines += ["", f"Next action: {response['next_action']}"]
+    if response.get("bundle_path"):
+        lines.append(f"Sources bundle: {response['bundle_path']}")
+    if response.get("raw_path"):
+        lines.append(f"Link list saved: {response['raw_path']}")
+    return "\n".join(lines)
+
+
 def build_intake_request(
     *, raw_text: str, context_label: str = "", dry_run: bool = False
 ) -> dict[str, Any]:
@@ -146,8 +234,8 @@ def _post_bridge(
         raise IntakeBridgeError("BRIDGE_RESPONSE_INVALID", type(exc).__name__)
 
 
-def validate_intake_response(response: Any) -> dict[str, Any]:
-    """Validate an ``intake_review_packet`` response. Fails closed.
+def _validate_response(response: Any, *, expected_action: str) -> dict[str, Any]:
+    """Shared fail-closed response validation for both intake actions.
 
     Enforces: ``status`` ok|rejected, matching action, ``research_performed``
     and ``promotion_performed`` exactly false/absent, and no approval/promotion
@@ -158,7 +246,7 @@ def validate_intake_response(response: Any) -> dict[str, Any]:
     status = response.get("status")
     if status not in {"ok", "rejected"}:
         raise IntakeBridgeError("BRIDGE_STATUS_NOT_OK", f"status={status!r}")
-    if response.get("requested_action") != _REQUESTED_ACTION:
+    if response.get("requested_action") != expected_action:
         raise IntakeBridgeError("BRIDGE_ACTION_MISMATCH", f"action={response.get('requested_action')!r}")
     for field in ("research_performed", "promotion_performed"):
         if response.get(field) not in (False, None):
@@ -167,6 +255,11 @@ def validate_intake_response(response: Any) -> dict[str, Any]:
     if stateful:
         raise IntakeBridgeError("BRIDGE_STATEFUL_RESPONSE", f"fields={stateful}")
     return dict(response)
+
+
+def validate_intake_response(response: Any) -> dict[str, Any]:
+    """Validate an ``intake_review_packet`` response. Fails closed."""
+    return _validate_response(response, expected_action=_REQUESTED_ACTION)
 
 
 def request_intake_review(
