@@ -38,6 +38,9 @@ MAX_LENS_CHARS = 60
 # but has a bad label is an attempted command and gets usage, never the model.
 _LENS_RE = re.compile(r"^intake\s+lens\s+(.+)$", re.IGNORECASE)
 _LENS_LABEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _-]*$")
+# One-line ``intake <url>`` — a bare URL right after the verb cannot be prose,
+# so folding it into the body is hijack-safe. Cal's natural phone form.
+_INLINE_URL_RE = re.compile(r"^intake\s+(https?://\S+)$", re.IGNORECASE)
 
 # Response fields that would indicate research/promotion/approval execution.
 _FORBIDDEN_RESPONSE_FIELDS: tuple[str, ...] = (
@@ -97,12 +100,17 @@ def parse_intake_message(text: str) -> Optional[IntakeCommand]:
     if head.lower() == "intake":
         lens = ""
     else:
-        match = _LENS_RE.match(head)
-        if not match:
-            return None
-        lens = match.group(1).strip()
-        if not _LENS_LABEL_RE.match(lens) or len(lens) > MAX_LENS_CHARS:
-            return IntakeCommand(error="invalid_lens")
+        inline_url = _INLINE_URL_RE.match(head)
+        if inline_url:
+            lens = ""
+            body = inline_url.group(1) + ("\n" + body if body.strip() else "")
+        else:
+            match = _LENS_RE.match(head)
+            if not match:
+                return None
+            lens = match.group(1).strip()
+            if not _LENS_LABEL_RE.match(lens) or len(lens) > MAX_LENS_CHARS:
+                return IntakeCommand(error="invalid_lens")
     raw_text = body.strip("\n")
     if not raw_text.strip():
         return IntakeCommand(lens=lens, error="missing_body")
