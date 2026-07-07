@@ -1960,8 +1960,9 @@ class GatewaySlashCommandsMixin:
     # a later research verb can address items in the latest packet.
     _INTAKE_CONTEXT_TTL_SECONDS = 3600
 
-    def _intake_config(self) -> tuple[bool, str]:
-        """Resolve the default-off ``intake`` gate and bridge base URL.
+    def _intake_config(self) -> tuple[bool, str, str]:
+        """Resolve the default-off ``intake`` gate, bridge base URL, and the
+        local directory where returned packet/note markdown is persisted.
 
         Fails closed (disabled) on any config error. Never reads secrets — the
         bearer token is sourced separately, from the environment only.
@@ -1971,12 +1972,27 @@ class GatewaySlashCommandsMixin:
 
             config = _load_gateway_config()
         except Exception:
-            return False, ""
+            return False, "", ""
         enabled = is_truthy_value(
             cfg_get(config, "intake", "enabled", default=False), default=False
         )
         base_url = str(cfg_get(config, "intake", "base_url", default="") or "").strip()
-        return enabled, base_url
+        local_dir = str(
+            cfg_get(config, "intake", "local_dir", default="~/cogitator-brain") or ""
+        ).strip()
+        return enabled, base_url, local_dir
+
+    def _save_intake_copies(self, response: dict[str, Any], local_dir: str) -> list[str]:
+        """Persist returned markdown locally; never let a disk error break the reply."""
+        if not local_dir:
+            return []
+        from gateway.cogitator_intake_bridge import save_local_copies
+
+        try:
+            return save_local_copies(response, local_dir)
+        except Exception:
+            logger.exception("[intake] local save failed")
+            return []
 
     def _intake_states(self) -> dict[str, Any]:
         states = getattr(self, "_intake_ctx", None)
@@ -2043,7 +2059,7 @@ class GatewaySlashCommandsMixin:
                 "max 60 chars).\n" + intake_help_text()
             )
 
-        enabled, base_url = self._intake_config()
+        enabled, base_url, local_dir = self._intake_config()
         if not enabled:
             return (
                 "Intake is disabled.\n"
@@ -2092,7 +2108,11 @@ class GatewaySlashCommandsMixin:
             except Exception:
                 logger.exception("[intake] research unexpected error")
                 return "Intake research failed.\nReason: unexpected error."
-            return render_intake_research_message(response)
+            message = render_intake_research_message(response)
+            saved = self._save_intake_copies(response, local_dir)
+            if saved:
+                message += "\n" + "\n".join(f"Saved locally: {p}" for p in saved)
+            return message
 
         # A body that is only URLs routes through the source-access seam
         # (full-source-or-abstain fetch), everything else through text intake.
@@ -2124,7 +2144,11 @@ class GatewaySlashCommandsMixin:
 
         if response.get("status") == "ok" and response.get("packet_path"):
             self._set_intake_context(event, response)
-        return render_link_intake_message(response) if link_mode else render_intake_message(response)
+        message = render_link_intake_message(response) if link_mode else render_intake_message(response)
+        saved = self._save_intake_copies(response, local_dir)
+        if saved:
+            message += "\n" + "\n".join(f"Saved locally: {p}" for p in saved)
+        return message
 
     async def _handle_model_command(self, event: MessageEvent) -> Optional[str]:
         """Handle /model command — switch model for this session.

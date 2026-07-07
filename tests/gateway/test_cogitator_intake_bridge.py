@@ -177,10 +177,29 @@ def test_render_rejected():
 
 # --- mixin handler dispatch ----------------------------------------------------
 
-def _handler_with_config(enabled, base_url):
+def _handler_with_config(enabled, base_url, local_dir=""):
     mixin = GatewaySlashCommandsMixin()
-    mixin._intake_config = lambda: (enabled, base_url)  # type: ignore[attr-defined]
+    mixin._intake_config = lambda: (enabled, base_url, local_dir)  # type: ignore[attr-defined]
     return mixin
+
+
+def test_save_local_copies_writes_only_present_markdown(tmp_path):
+    saved = ib.save_local_copies({
+        "packet_path": "storage/intake/packets/2026-07-07_10-00-00-intake-packet.md",
+        "packet_markdown": "# Intake Review Packet\ncontent",
+        "note_path": "storage/research_notes/x.md",
+        "note_markdown": "",  # empty → skipped
+        "bundle_path": "../../evil.md",  # traversal → basename only
+        "bundle_markdown": "sources",
+    }, str(tmp_path))
+    assert sorted(p.replace(str(tmp_path), "") for p in saved) == [
+        "/intake/extracted/evil.md",
+        "/intake/packets/2026-07-07_10-00-00-intake-packet.md",
+    ]
+    packet = tmp_path / "intake/packets/2026-07-07_10-00-00-intake-packet.md"
+    assert packet.read_text() == "# Intake Review Packet\ncontent"
+    assert not (tmp_path / "research_notes").exists()
+    assert (tmp_path / "intake/extracted/evil.md").read_text() == "sources"
 
 
 class _Ev:
