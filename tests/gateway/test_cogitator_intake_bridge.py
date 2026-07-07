@@ -47,6 +47,20 @@ def test_parse_invalid_lens_rejected():
     assert cmd is not None and cmd.error == "invalid_lens"
 
 
+def test_parse_inline_url():
+    # One-line ``intake <url>`` is the natural phone form — must parse.
+    url = "https://x.com/femke_plantinga/status/2071909327808483360?s=20"
+    cmd = ib.parse_intake_message(f"intake {url}")
+    assert cmd is not None and cmd.error == "" and cmd.lens == ""
+    assert cmd.raw_text == url
+    # Extra body lines after the inline URL stay part of the dump.
+    cmd = ib.parse_intake_message(f"intake {url}\nsecond line")
+    assert cmd is not None and cmd.error == ""
+    assert cmd.raw_text == f"{url}\nsecond line"
+    # Non-URL words after the verb are still prose, never hijacked.
+    assert ib.parse_intake_message("intake https broke again") is None
+
+
 def test_parse_ordinary_prose_falls_through():
     # Prose containing/starting with the word must NOT be hijacked.
     assert ib.parse_intake_message("intake of protein matters a lot") is None
