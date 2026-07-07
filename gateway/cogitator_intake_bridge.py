@@ -419,6 +419,33 @@ def intake_help_text() -> str:
     )
 
 
+def save_local_copies(response: Mapping[str, Any], base_dir: str) -> list[str]:
+    """Persist markdown content returned by the bridge to durable local disk.
+
+    Cogitator's container storage is ephemeral; the bridge responses carry the
+    full packet/bundle/note markdown so this host keeps the durable copy.
+    Filenames are basename-only (no traversal); missing fields are skipped.
+    Returns the paths written.
+    """
+    from pathlib import Path
+
+    saved: list[str] = []
+    for path_key, content_key, subdir in (
+        ("packet_path", "packet_markdown", "intake/packets"),
+        ("bundle_path", "bundle_markdown", "intake/extracted"),
+        ("note_path", "note_markdown", "research_notes"),
+    ):
+        name = Path(str(response.get(path_key) or "")).name
+        content = str(response.get(content_key) or "")
+        if not name or not name.endswith(".md") or not content:
+            continue
+        target = Path(base_dir).expanduser() / subdir / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+        saved.append(str(target))
+    return saved
+
+
 def render_intake_message(response: Mapping[str, Any]) -> str:
     """Render a validated intake response into a compact chat summary."""
     if response.get("status") == "rejected":
@@ -471,5 +498,6 @@ __all__ = [
     "request_intake_review",
     "validate_intake_response",
     "render_intake_message",
+    "save_local_copies",
     "intake_help_text",
 ]
