@@ -189,6 +189,50 @@ def test_render_rejected():
     assert "Intake rejected" in out and "raw_text is required" in out
 
 
+_AUTO_RESEARCH_OK = {
+    "status": "ok",
+    "claim_number": 1,
+    "claim": "AI dynamic pricing lifts margins by 25%",
+    "verdict": "verified_enough",
+    "evidence_quality": "moderate",
+    "engine": "adaptive",
+    "recommended_action": "Direct sources support the claim.",
+    "note_path": "storage/research_notes/intake-research-x.md",
+}
+
+
+def test_auto_research_response_accepted_only_with_result():
+    # research_performed=True is legitimate ONLY alongside an auto_research block
+    ok = ib.validate_intake_response(
+        _ok_response(research_performed=True, auto_research=dict(_AUTO_RESEARCH_OK)))
+    assert ok["auto_research"]["verdict"] == "verified_enough"
+    with pytest.raises(ib.IntakeBridgeError) as exc:
+        ib.validate_intake_response(_ok_response(research_performed=True))
+    assert exc.value.code == "BRIDGE_STATEFUL_RESPONSE"
+    with pytest.raises(ib.IntakeBridgeError):
+        ib.validate_intake_response(
+            _ok_response(research_performed=True, auto_research="yes"))
+    with pytest.raises(ib.IntakeBridgeError):  # promotion stays forbidden regardless
+        ib.validate_intake_response(
+            _ok_response(promotion_performed=True, auto_research=dict(_AUTO_RESEARCH_OK)))
+
+
+def test_render_summary_shows_auto_research_verdict():
+    out = ib.render_intake_message(
+        _ok_response(research_performed=True, auto_research=dict(_AUTO_RESEARCH_OK)))
+    assert "✅ Auto-research (claim 1): verified_enough" in out
+    assert "AI dynamic pricing lifts margins by 25%" in out
+    assert "engine: adaptive" in out
+    assert "storage/research_notes/intake-research-x.md" in out
+
+
+def test_render_summary_shows_auto_research_failure_softly():
+    out = ib.render_intake_message(_ok_response(
+        auto_research={"status": "failed", "reason": "auto-research error: RuntimeError"}))
+    assert "Auto-research failed" in out
+    assert "intake itself succeeded" in out
+
+
 # --- mixin handler dispatch ----------------------------------------------------
 
 def _handler_with_config(enabled, base_url, local_dir=""):
