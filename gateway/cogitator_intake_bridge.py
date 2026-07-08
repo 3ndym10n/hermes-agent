@@ -262,9 +262,11 @@ def _post_bridge(
 def _validate_response(response: Any, *, expected_action: str) -> dict[str, Any]:
     """Shared fail-closed response validation for both intake actions.
 
-    Enforces: ``status`` ok|rejected, matching action, ``research_performed``
-    and ``promotion_performed`` exactly false/absent, and no approval/promotion
-    execution fields.
+    Enforces: ``status`` ok|rejected, matching action, ``promotion_performed``
+    exactly false/absent, and no approval/promotion execution fields.
+    ``research_performed`` may be true ONLY when the response carries an
+    ``auto_research`` result (Cogitator's flag-gated auto-research of the top
+    intake claim); any other researched intake response fails closed.
     """
     if not isinstance(response, Mapping):
         raise IntakeBridgeError("BRIDGE_RESPONSE_INVALID", "response is not an object")
@@ -273,9 +275,14 @@ def _validate_response(response: Any, *, expected_action: str) -> dict[str, Any]
         raise IntakeBridgeError("BRIDGE_STATUS_NOT_OK", f"status={status!r}")
     if response.get("requested_action") != expected_action:
         raise IntakeBridgeError("BRIDGE_ACTION_MISMATCH", f"action={response.get('requested_action')!r}")
-    for field in ("research_performed", "promotion_performed"):
-        if response.get(field) not in (False, None):
-            raise IntakeBridgeError("BRIDGE_STATEFUL_RESPONSE", f"{field}={response.get(field)!r}")
+    if response.get("promotion_performed") not in (False, None):
+        raise IntakeBridgeError(
+            "BRIDGE_STATEFUL_RESPONSE",
+            f"promotion_performed={response.get('promotion_performed')!r}")
+    researched = response.get("research_performed")
+    if researched not in (False, None) and not (
+            researched is True and isinstance(response.get("auto_research"), Mapping)):
+        raise IntakeBridgeError("BRIDGE_STATEFUL_RESPONSE", f"research_performed={researched!r}")
     stateful = [f for f in _FORBIDDEN_RESPONSE_FIELDS if f in response]
     if stateful:
         raise IntakeBridgeError("BRIDGE_STATEFUL_RESPONSE", f"fields={stateful}")
@@ -487,6 +494,26 @@ def render_intake_message(response: Mapping[str, Any]) -> str:
     if response.get("next_action"):
         lines.append("")
         lines.append(f"Next action: {response['next_action']}")
+    auto = response.get("auto_research")
+    if isinstance(auto, Mapping):
+        lines.append("")
+        if auto.get("status") == "ok":
+            verdict = str(auto.get("verdict") or "unknown")
+            lines.append(
+                f"{_VERDICT_EMOJI.get(verdict, '🔎')} Auto-research (claim "
+                f"{auto.get('claim_number')}): {verdict}")
+            lines.append(f"Claim: {auto.get('claim', '')}")
+            lines.append(
+                f"Evidence: {auto.get('evidence_quality', 'none')} "
+                f"(engine: {auto.get('engine', '?')})")
+            if auto.get("recommended_action"):
+                lines.append(f"Recommended action: {auto['recommended_action']}")
+            if auto.get("note_path"):
+                lines.append(f"Research note: {auto['note_path']}")
+        else:
+            lines.append(
+                f"⚠️ Auto-research failed: {auto.get('reason') or 'unknown error'} "
+                "(intake itself succeeded)")
     if not dry:
         lines.append("")
         lines.append(f"Raw saved: {response.get('raw_path', '')}")
