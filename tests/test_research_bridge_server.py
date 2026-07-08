@@ -1,0 +1,123 @@
+"""Research bridge server: auth fail-closed, healthz, URL extraction, caps,
+provider-failure sanitization. Handler logic is tested pure; one live
+ephemeral-port round-trip covers the HTTP wiring."""
+
+import json
+import threading
+import urllib.error
+import urllib.request
+
+import pytest
+
+from gateway.research_bridge_server import (
+    MAX_QUERY_CHARS,
+    MAX_RESULTS_CAP,
+    handle_research_search,
+    make_server,
+)
+
+TOKEN = "test-bridge-token"
+
+
+def _call(body: dict | bytes, auth: str = f"Bearer {TOKEN}", token: str = TOKEN,
+          search=lambda q, n: {"success": True, "data": {"web": []}}):
+    raw = body if isinstance(body, bytes) else json.dumps(body).encode()
+    return handle_research_search(raw, auth, token=token, search=search)
+
+
+def test_no_token_fails_closed_503():
+    status, resp = _call({"query": "q"}, token="")
+    assert status == 503 and resp["status"] == "error"
+
+
+def test_bad_or_missing_bearer_401():
+    for auth in ("", "Bearer wrong", "Basic abc", "Bearer "):
+        status, _ = _call({"query": "q"}, auth=auth)
+        assert status == 401
+
+
+def test_bad_json_and_empty_query_400():
+    assert _call(b"not json")[0] == 400
+    assert _call({"query": "  "})[0] == 400
+    assert _call({"query": "x" * (MAX_QUERY_CHARS + 1)})[0] == 400
+    assert _call(b'["a list"]')[0] == 400
+
+
+def test_url_extraction_dedup_scheme_filter_and_cap():
+    rows = [{"url": u} for u in (
+        "https://a.example/1",
+        "https://a.example/1",      # dup
+        "javascript:alert(1)",      # non-http dropped
+        "https://b.example/2",
+        "https://c.example/3",
+    )] + [{"title": "no url"}, "not a dict"]
+    search = lambda q, n: {"success": True, "data": {"web": rows}}
+    status, resp = _call({"query": "q", "max_results": 2}, search=search)
+    assert status == 200
+    assert resp == {"status": "ok", "provider": "xai",
+                    "urls": ["https://a.example/1", "https://b.example/2"]}
+
+
+def test_max_results_clamped_to_cap():
+    seen = {}
+    search = lambda q, n: seen.update(limit=n) or {"success": True, "data": {"web": []}}
+    _call({"query": "q", "max_results": 999}, search=search)
+    assert seen["limit"] == MAX_RESULTS_CAP
+    _call({"query": "q", "max_results": -3}, search=search)
+    assert seen["limit"] == 1
+    _call({"query": "q", "max_results": "junk"}, search=search)
+    assert seen["limit"] == 5
+
+
+@pytest.mark.parametrize("search", [
+    lambda q, n: {"success": False, "error": "HTTP 500: secret-internal-body"},
+    lambda q, n: (_ for _ in ()).throw(RuntimeError("token=leaky")),
+    lambda q, n: "not a dict",
+])
+def test_provider_failure_sanitized_502(search):
+    status, resp = _call({"query": "q"}, search=search)
+    assert status == 502
+    text = json.dumps(resp)
+    assert resp == {"status": "error", "error": "search provider failed"}
+    assert "secret" not in text and "leaky" not in text
+
+
+def test_live_roundtrip_healthz_and_search():
+    search = lambda q, n: {"success": True, "data": {"web": [
+        {"url": "https://docs.example/found", "title": "t"}]}}
+    server = make_server(0, token=TOKEN, search=search)
+    port = server.server_address[1]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/healthz", timeout=5) as r:
+            assert r.status == 200
+            assert json.load(r) == {"status": "ok"}
+
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/research_search",
+            data=json.dumps({"query": "anything", "max_results": 3}).encode(),
+            headers={"Authorization": f"Bearer {TOKEN}",
+                     "Content-Type": "application/json"},
+            method="POST")
+        with urllib.request.urlopen(req, timeout=5) as r:
+            assert r.status == 200
+            assert json.load(r)["urls"] == ["https://docs.example/found"]
+
+        # Wrong token over the wire → 401, sanitized body.
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/research_search",
+            data=json.dumps({"query": "q"}).encode(),
+            headers={"Authorization": "Bearer nope"}, method="POST")
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            urllib.request.urlopen(req, timeout=5)
+        assert exc.value.code == 401
+
+        # Unknown paths 404 both methods.
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            urllib.request.urlopen(f"http://127.0.0.1:{port}/other", timeout=5)
+        assert exc.value.code == 404
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)

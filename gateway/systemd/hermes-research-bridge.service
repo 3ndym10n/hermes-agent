@@ -1,0 +1,21 @@
+# Hermes research bridge — local OAuth-backed search execution for Cogitator.
+# Install:
+#   sudo cp gateway/systemd/hermes-research-bridge.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now hermes-research-bridge
+# The bridge bearer token (HERMES_RESEARCH_BRIDGE_TOKEN) lives in ~/.hermes/.env.
+[Unit]
+Description=Hermes research bridge (Cogitator search execution)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=%i
+WorkingDirectory=/home/v0id/Projects/hermes-agent
+ExecStart=/usr/bin/env python3 -m gateway.research_bridge_server
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
