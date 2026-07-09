@@ -29,7 +29,11 @@ TOKEN_ENV = "COGITATOR_BRIDGE_TOKEN"
 
 _REQUESTED_ACTION = "intake_review_packet"
 _USER_INTENT = "Turn one raw Telegram dump into a reviewable intake packet (Virgil intake)."
-_REQUEST_TIMEOUT_SECONDS = 45
+# Link intake runs auto-research synchronously on the Cogitator side; a live
+# fetched_full+auto-research round trip measured 90.7s, so 45s surfaced
+# BRIDGE_UNREACHABLE on healthy requests. 180s covers it with headroom.
+# ponytail: full-engine research can take ~4min — that needs a budget/async slice, not more timeout.
+_REQUEST_TIMEOUT_SECONDS = 180
 MAX_BODY_CHARS = 16000  # matches Cogitator's front-door cap; bridge envelope is 20k
 MAX_LENS_CHARS = 60
 
