@@ -174,6 +174,33 @@ def request_source_access_intake(
     return _validate_response(response, expected_action="source_access_intake_packet")
 
 
+def _auto_research_lines(response: Mapping[str, Any]) -> list[str]:
+    """Render the flag-gated auto-research verdict block (shared by both
+    intake renderers) — research must never run invisibly."""
+    auto = response.get("auto_research")
+    if not isinstance(auto, Mapping):
+        return []
+    lines = [""]
+    if auto.get("status") == "ok":
+        verdict = str(auto.get("verdict") or "unknown")
+        lines.append(
+            f"{_VERDICT_EMOJI.get(verdict, '🔎')} Auto-research (claim "
+            f"{auto.get('claim_number')}): {verdict}")
+        lines.append(f"Claim: {auto.get('claim', '')}")
+        lines.append(
+            f"Evidence: {auto.get('evidence_quality', 'none')} "
+            f"(engine: {auto.get('engine', '?')})")
+        if auto.get("recommended_action"):
+            lines.append(f"Recommended action: {auto['recommended_action']}")
+        if auto.get("note_path"):
+            lines.append(f"Research note: {auto['note_path']}")
+    else:
+        lines.append(
+            f"⚠️ Auto-research failed: {auto.get('reason') or 'unknown error'} "
+            "(intake itself succeeded)")
+    return lines
+
+
 def render_link_intake_message(response: Mapping[str, Any]) -> str:
     """Render a validated link-intake response: honest per-status counts first."""
     if response.get("status") == "rejected":
@@ -198,6 +225,7 @@ def render_link_intake_message(response: Mapping[str, Any]) -> str:
         if top:
             lines.append("Top outputs:")
             lines += [f"{i}. {t}" for i, t in enumerate(top, 1)]
+    lines += _auto_research_lines(response)
     if response.get("next_action"):
         lines += ["", f"Next action: {response['next_action']}"]
     if response.get("bundle_path"):
@@ -494,26 +522,7 @@ def render_intake_message(response: Mapping[str, Any]) -> str:
     if response.get("next_action"):
         lines.append("")
         lines.append(f"Next action: {response['next_action']}")
-    auto = response.get("auto_research")
-    if isinstance(auto, Mapping):
-        lines.append("")
-        if auto.get("status") == "ok":
-            verdict = str(auto.get("verdict") or "unknown")
-            lines.append(
-                f"{_VERDICT_EMOJI.get(verdict, '🔎')} Auto-research (claim "
-                f"{auto.get('claim_number')}): {verdict}")
-            lines.append(f"Claim: {auto.get('claim', '')}")
-            lines.append(
-                f"Evidence: {auto.get('evidence_quality', 'none')} "
-                f"(engine: {auto.get('engine', '?')})")
-            if auto.get("recommended_action"):
-                lines.append(f"Recommended action: {auto['recommended_action']}")
-            if auto.get("note_path"):
-                lines.append(f"Research note: {auto['note_path']}")
-        else:
-            lines.append(
-                f"⚠️ Auto-research failed: {auto.get('reason') or 'unknown error'} "
-                "(intake itself succeeded)")
+    lines += _auto_research_lines(response)
     if not dry:
         lines.append("")
         lines.append(f"Raw saved: {response.get('raw_path', '')}")
