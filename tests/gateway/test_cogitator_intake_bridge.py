@@ -388,6 +388,22 @@ def test_render_link_intake_message_shows_honest_statuses():
     assert "mined into packet: 1" in out
     assert "playbook candidate: Example Tool" in out
     assert "intake-sources.md" in out
+    assert "Auto-research" not in out  # no block when Cogitator sent none
+
+
+def test_render_link_intake_message_shows_auto_research_verdict():
+    out = ib.render_link_intake_message(_ok_link_response(
+        research_performed=True, auto_research=dict(_AUTO_RESEARCH_OK)))
+    assert "Auto-research (claim 1): verified_enough" in out
+    assert "engine: adaptive" in out
+    assert "storage/research_notes/intake-research-x.md" in out
+
+
+def test_render_link_intake_message_shows_auto_research_failure_softly():
+    out = ib.render_link_intake_message(_ok_link_response(
+        auto_research={"status": "failed", "reason": "auto-research error: RuntimeError"}))
+    assert "Auto-research failed" in out
+    assert "intake itself succeeded" in out
 
 
 def test_handler_url_only_body_routes_to_source_access(monkeypatch):
