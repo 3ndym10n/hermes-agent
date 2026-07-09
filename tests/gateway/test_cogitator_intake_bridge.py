@@ -114,6 +114,7 @@ class _FakeHTTP:
 
     def __call__(self, request, timeout=None):
         self.request = request
+        self.timeout = timeout
         payload = self._payload
 
         class _Resp:
@@ -127,6 +128,17 @@ class _FakeHTTP:
                 return json.dumps(payload).encode("utf-8")
 
         return _Resp()
+
+
+def test_request_timeout_covers_synchronous_auto_research():
+    # Live link intake with auto-research measured 90.7s end to end; 45s
+    # surfaced BRIDGE_UNREACHABLE on healthy requests. Guard the floor.
+    fake = _FakeHTTP(_ok_response())
+    ib.request_intake_review(
+        base_url="https://cog.example", token="tkn", raw_text="body", urlopen=fake,
+    )
+    assert fake.timeout == ib._REQUEST_TIMEOUT_SECONDS
+    assert fake.timeout >= 120
 
 
 def test_request_maps_lens_to_context_label():
