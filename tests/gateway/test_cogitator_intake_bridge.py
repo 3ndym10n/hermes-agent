@@ -600,3 +600,42 @@ def test_handler_research_explicit_path(monkeypatch):
         research_number=3, packet_path="storage/intake/packets/x-packet.md")))
     assert calls == {"packet_path": "storage/intake/packets/x-packet.md", "item_number": 3}
     assert "Research verdict" in out
+
+
+def test_text_link_and_manual_research_persist_origin_but_never_render_it():
+    origin = {
+        "platform": "telegram", "chat_id": "-100987654321",
+        "chat_type": "group", "thread_id": "456", "message_id": "789",
+    }
+    text_http = _FakeHTTP(_ok_response())
+    text_result = ib.request_intake_review(
+        base_url="https://cog.example", token="tkn", raw_text="body",
+        origin=origin, urlopen=text_http)
+    link_http = _FakeHTTP(_ok_link_response())
+    link_result = ib.request_source_access_intake(
+        base_url="https://cog.example", token="tkn",
+        urls=["https://docs.example/gpu"], origin=origin, urlopen=link_http)
+    research_http = _FakeHTTP(_ok_research_response())
+    research_result = ib.request_intake_research(
+        base_url="https://cog.example", token="tkn",
+        packet_path="storage/intake/packets/x-packet.md", item_number=1,
+        origin=origin, urlopen=research_http)
+
+    payloads = [
+        json.loads(fake.request.data.decode("utf-8"))
+        for fake in (text_http, link_http, research_http)
+    ]
+    assert [payload["context"]["origin"] for payload in payloads] == [
+        origin, origin, origin]
+    rendered = "\n".join((
+        ib.render_intake_message(text_result),
+        ib.render_link_intake_message(link_result),
+        ib.render_intake_research_message(research_result),
+    ))
+    for hidden in (origin["chat_id"], origin["thread_id"], origin["message_id"], "tkn"):
+        assert hidden not in rendered
+
+    with pytest.raises(ib.IntakeBridgeError):
+        ib.request_intake_review(
+            base_url="https://cog.example", token="tkn", raw_text="body",
+            origin={**origin, "token": "must-not-pass"}, urlopen=text_http)
