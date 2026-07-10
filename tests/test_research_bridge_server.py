@@ -13,6 +13,7 @@ from gateway.research_bridge_server import (
     MAX_QUERY_CHARS,
     MAX_RESULTS_CAP,
     handle_research_search,
+    handle_research_note,
     make_server,
 )
 
@@ -23,6 +24,12 @@ def _call(body: dict | bytes, auth: str = f"Bearer {TOKEN}", token: str = TOKEN,
           search=lambda q, n: {"success": True, "data": {"web": []}}):
     raw = body if isinstance(body, bytes) else json.dumps(body).encode()
     return handle_research_search(raw, auth, token=token, search=search)
+
+
+def _note_call(body: dict | bytes, base_dir: str, auth: str = f"Bearer {TOKEN}",
+               token: str = TOKEN):
+    raw = body if isinstance(body, bytes) else json.dumps(body).encode()
+    return handle_research_note(raw, auth, token=token, base_dir=base_dir)
 
 
 def test_no_token_fails_closed_503():
@@ -82,10 +89,26 @@ def test_provider_failure_sanitized_502(search):
     assert "secret" not in text and "leaky" not in text
 
 
-def test_live_roundtrip_healthz_and_search():
+def test_research_note_persists_basename_only_and_fails_closed(tmp_path):
+    status, resp = _note_call(
+        {"note_path": "../../note.md", "note_markdown": "# durable note"},
+        str(tmp_path),
+    )
+    assert status == 200 and resp == {"status": "ok", "saved": True}
+    target = tmp_path / "research_notes" / "note.md"
+    assert target.read_text() == "# durable note"
+
+    assert _note_call({"note_path": "note.md", "note_markdown": "# n"},
+                      str(tmp_path), auth="Bearer wrong")[0] == 401
+    assert _note_call({"note_path": "note.md", "note_markdown": "# n"}, "")[0] == 503
+    assert _note_call({"note_path": "note.txt", "note_markdown": "# n"},
+                      str(tmp_path))[0] == 400
+
+
+def test_live_roundtrip_healthz_search_and_note(tmp_path):
     search = lambda q, n: {"success": True, "data": {"web": [
         {"url": "https://docs.example/found", "title": "t"}]}}
-    server = make_server(0, token=TOKEN, search=search)
+    server = make_server(0, token=TOKEN, search=search, local_dir=str(tmp_path))
     port = server.server_address[1]
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -103,6 +126,18 @@ def test_live_roundtrip_healthz_and_search():
         with urllib.request.urlopen(req, timeout=5) as r:
             assert r.status == 200
             assert json.load(r)["urls"] == ["https://docs.example/found"]
+
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/research_note",
+            data=json.dumps({
+                "note_path": "../../live-note.md",
+                "note_markdown": "# live durable note",
+            }).encode(),
+            headers={"Authorization": f"Bearer {TOKEN}",
+                     "Content-Type": "application/json"},
+            method="POST")
+        with urllib.request.urlopen(req, timeout=5) as r:
+            assert json.load(r) == {"status": "ok", "saved": True}
 
         # Wrong token over the wire → 401, sanitized body.
         req = urllib.request.Request(

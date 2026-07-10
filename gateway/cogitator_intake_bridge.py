@@ -323,6 +323,9 @@ def _validate_response(response: Any, *, expected_action: str) -> dict[str, Any]
     if researched not in (False, None) and not (
             researched is True and isinstance(response.get("auto_research"), Mapping)):
         raise IntakeBridgeError("BRIDGE_STATEFUL_RESPONSE", f"research_performed={researched!r}")
+    auto = response.get("auto_research")
+    if isinstance(auto, Mapping) and auto.get("status") in {"queued", "duplicate"}:
+        _validate_research_job(auto)
     stateful = [f for f in _FORBIDDEN_RESPONSE_FIELDS if f in response]
     if stateful:
         raise IntakeBridgeError("BRIDGE_STATEFUL_RESPONSE", f"fields={stateful}")
@@ -388,10 +391,38 @@ def validate_intake_research_response(response: Any) -> dict[str, Any]:
     if response.get("promotion_performed") not in (False, None):
         raise IntakeBridgeError("BRIDGE_STATEFUL_RESPONSE",
                                 f"promotion_performed={response.get('promotion_performed')!r}")
+    job = response.get("research_job")
+    if job is not None:
+        _validate_research_job(job)
+        if response.get("research_performed") not in (False, None):
+            raise IntakeBridgeError(
+                "BRIDGE_STATEFUL_RESPONSE",
+                f"research_performed={response.get('research_performed')!r}")
     stateful = [f for f in _FORBIDDEN_RESPONSE_FIELDS if f in response]
     if stateful:
         raise IntakeBridgeError("BRIDGE_STATEFUL_RESPONSE", f"fields={stateful}")
     return dict(response)
+
+
+def _validate_research_job(job: Any) -> None:
+    """Validate the bounded async receipt before Hermes tells Cal it started."""
+    if not isinstance(job, Mapping):
+        raise IntakeBridgeError("BRIDGE_RESPONSE_INVALID", "research job is not an object")
+    if job.get("status") not in {"queued", "duplicate"}:
+        raise IntakeBridgeError("BRIDGE_RESPONSE_INVALID", "invalid research job status")
+    job_id = job.get("job_id")
+    claim = job.get("claim")
+    claim_number = job.get("claim_number")
+    if not isinstance(job_id, str) or not job_id.strip() or len(job_id) > 200:
+        raise IntakeBridgeError("BRIDGE_RESPONSE_INVALID", "invalid research job id")
+    if not isinstance(claim, str) or not claim.strip():
+        raise IntakeBridgeError("BRIDGE_RESPONSE_INVALID", "invalid research claim")
+    if (
+        not isinstance(claim_number, int)
+        or isinstance(claim_number, bool)
+        or claim_number < 1
+    ):
+        raise IntakeBridgeError("BRIDGE_RESPONSE_INVALID", "invalid research claim number")
 
 
 def request_intake_research(

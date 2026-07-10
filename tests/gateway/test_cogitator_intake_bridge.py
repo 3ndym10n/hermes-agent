@@ -267,6 +267,14 @@ def test_render_summary_shows_duplicate_auto_research_job():
     assert "Auto-research failed" not in out
 
 
+def test_queued_auto_research_response_requires_a_valid_job_shape():
+    with pytest.raises(ib.IntakeBridgeError) as exc:
+        ib.validate_intake_response(_ok_response(auto_research={
+            "status": "queued", "claim_number": 0, "claim": "c", "job_id": "",
+        }))
+    assert exc.value.code == "BRIDGE_RESPONSE_INVALID"
+
+
 # --- mixin handler dispatch ----------------------------------------------------
 
 def _handler_with_config(enabled, base_url, local_dir=""):
@@ -533,6 +541,17 @@ def test_render_research_message_job_receipt():
     assert "the claim text" in out
     assert "result will arrive here" in out
     assert "verdict" not in out.lower()
+
+
+def test_research_job_response_requires_a_valid_job_shape():
+    with pytest.raises(ib.IntakeBridgeError) as exc:
+        ib.validate_intake_research_response({
+            "status": "ok", "requested_action": "research_intake_item",
+            "research_job": {"status": "queued", "job_id": "job-1",
+                             "claim": "", "claim_number": 1},
+            "research_performed": False, "promotion_performed": False,
+        })
+    assert exc.value.code == "BRIDGE_RESPONSE_INVALID"
 
 
 def test_render_intake_message_lists_research_targets():
