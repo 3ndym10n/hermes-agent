@@ -2016,6 +2016,20 @@ class GatewaySlashCommandsMixin:
             return None
         return ctx
 
+    @staticmethod
+    def _intake_origin(event: MessageEvent) -> dict[str, str]:
+        source = event.source
+        origin = {
+            "platform": source.platform.value, "chat_id": str(source.chat_id),
+            "chat_type": str(source.chat_type),
+        }
+        for field in ("thread_id", "message_id"):
+            value = getattr(source, field, None)
+            if value is not None:
+                origin[field] = str(value)
+        return origin
+
+
     async def handle_intake_message(self, event: MessageEvent, cmd) -> str:
         """Handle a parsed plain-text intake command (never reaches the model).
 
@@ -2096,6 +2110,7 @@ class GatewaySlashCommandsMixin:
             try:
                 response = request_intake_research(
                     base_url=base_url, token=token,
+                    origin=self._intake_origin(event),
                     packet_path=packet_path, item_number=cmd.research_number,
                 )
             except IntakeBridgeError as exc:
@@ -2122,11 +2137,13 @@ class GatewaySlashCommandsMixin:
                 urls = [line.strip() for line in cmd.raw_text.splitlines() if line.strip()]
                 response = request_source_access_intake(
                     base_url=base_url, token=token,
+                    origin=self._intake_origin(event),
                     urls=urls, context_label=cmd.lens,
                 )
             else:
                 response = request_intake_review(
                     base_url=base_url, token=token,
+                    origin=self._intake_origin(event),
                     raw_text=cmd.raw_text, context_label=cmd.lens,
                 )
         except IntakeBridgeError as exc:

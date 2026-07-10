@@ -134,11 +134,33 @@ def is_url_only_body(raw_text: str) -> bool:
     return bool(lines) and all(_URL_LINE_RE.match(line) for line in lines)
 
 
+def _delivery_origin(origin: Mapping[str, Any] | None) -> dict[str, str]:
+    if not isinstance(origin, Mapping):
+        raise IntakeBridgeError("BRIDGE_ROUTE_INVALID", "origin missing")
+    allowed = {"platform", "chat_id", "chat_type", "thread_id", "message_id"}
+    if set(origin) - allowed or origin.get("platform") != "telegram":
+        raise IntakeBridgeError("BRIDGE_ROUTE_INVALID", "origin invalid")
+    chat_id = str(origin.get("chat_id") or "")
+    chat_type = str(origin.get("chat_type") or "")
+    if not re.fullmatch(r"-?\d{1,20}", chat_id) or chat_type not in {"dm", "group", "channel"}:
+        raise IntakeBridgeError("BRIDGE_ROUTE_INVALID", "origin invalid")
+    clean = {"platform": "telegram", "chat_id": chat_id, "chat_type": chat_type}
+    for field in ("thread_id", "message_id"):
+        value = str(origin.get(field) or "")
+        if value:
+            if not re.fullmatch(r"\d{1,20}", value):
+                raise IntakeBridgeError("BRIDGE_ROUTE_INVALID", "origin invalid")
+            clean[field] = value
+    return clean
+
+
 def build_source_access_request(
-    *, urls: list[str], context_label: str = "", dry_run: bool = False
+    *, urls: list[str], context_label: str = "", dry_run: bool = False, origin=None
 ) -> dict[str, Any]:
     """Build the draft-only ``source_access_intake_packet`` bridge packet."""
     context: dict[str, Any] = {"urls": list(urls)}
+    if origin is not None:
+        context["origin"] = _delivery_origin(origin)
     if str(context_label or "").strip():
         context["context_label"] = str(context_label).strip()
     if dry_run:
@@ -162,6 +184,7 @@ def request_source_access_intake(
     context_label: str = "",
     dry_run: bool = False,
     urlopen: Optional[Callable[..., Any]] = None,
+    origin: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """POST a link-list intake and validate the reply fail-closed."""
     if not str(base_url or "").strip():
@@ -173,7 +196,8 @@ def request_source_access_intake(
         raise IntakeBridgeError("NO_BODY", "no urls supplied")
     if len(urls) > MAX_LINK_LINES:
         raise IntakeBridgeError("TOO_MANY_LINKS", f"max={MAX_LINK_LINES}")
-    packet = build_source_access_request(urls=urls, context_label=context_label, dry_run=dry_run)
+    packet = build_source_access_request(
+        urls=urls, context_label=context_label, dry_run=dry_run, origin=origin)
     response = _post_bridge(packet, base_url=base_url.strip(), token=token.strip(), urlopen=urlopen)
     return _validate_response(response, expected_action="source_access_intake_packet")
 
@@ -248,10 +272,12 @@ def render_link_intake_message(response: Mapping[str, Any]) -> str:
 
 
 def build_intake_request(
-    *, raw_text: str, context_label: str = "", dry_run: bool = False
+    *, raw_text: str, context_label: str = "", dry_run: bool = False, origin=None
 ) -> dict[str, Any]:
     """Build the draft-only ``intake_review_packet`` bridge packet."""
     context: dict[str, Any] = {"raw_text": str(raw_text or "")}
+    if origin is not None:
+        context["origin"] = _delivery_origin(origin)
     if str(context_label or "").strip():
         context["context_label"] = str(context_label).strip()
     if dry_run:
@@ -345,6 +371,7 @@ def request_intake_review(
     context_label: str = "",
     dry_run: bool = False,
     urlopen: Optional[Callable[..., Any]] = None,
+    origin: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the request, POST it, and validate the reply. Fails closed."""
     if not str(base_url or "").strip():
@@ -355,16 +382,19 @@ def request_intake_review(
         raise IntakeBridgeError("NO_BODY", "no raw text supplied")
     if len(raw_text) > MAX_BODY_CHARS:
         raise IntakeBridgeError("BODY_TOO_LARGE", f"max={MAX_BODY_CHARS}")
-    packet = build_intake_request(raw_text=raw_text, context_label=context_label, dry_run=dry_run)
+    packet = build_intake_request(
+        raw_text=raw_text, context_label=context_label, dry_run=dry_run, origin=origin)
     response = _post_bridge(packet, base_url=base_url.strip(), token=token.strip(), urlopen=urlopen)
     return validate_intake_response(response)
 
 
 def build_intake_research_request(
-    *, packet_path: str, item_number: int, dry_run: bool = False
+    *, packet_path: str, item_number: int, dry_run: bool = False, origin=None
 ) -> dict[str, Any]:
     """Build the draft-only ``research_intake_item`` bridge packet."""
     context: dict[str, Any] = {"packet_path": str(packet_path), "item_number": int(item_number)}
+    if origin is not None:
+        context["origin"] = _delivery_origin(origin)
     if dry_run:
         context["dry_run"] = True
     return {
@@ -433,6 +463,7 @@ def request_intake_research(
     item_number: int,
     dry_run: bool = False,
     urlopen: Optional[Callable[..., Any]] = None,
+    origin: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """POST one bounded research request and validate the reply fail-closed."""
     if not str(base_url or "").strip():
@@ -442,10 +473,95 @@ def request_intake_research(
     if not str(packet_path or "").strip():
         raise IntakeBridgeError("NO_PACKET", "packet_path missing")
     packet = build_intake_research_request(
-        packet_path=packet_path, item_number=item_number, dry_run=dry_run)
+        packet_path=packet_path, item_number=item_number, dry_run=dry_run,
+        origin=origin)
     response = _post_bridge(packet, base_url=base_url.strip(), token=token.strip(),
                             urlopen=urlopen)
     return validate_intake_research_response(response)
+
+def _request_research_delivery_action(
+    *, base_url: str, token: str, action: str, context: dict,
+    approval_status: str = "draft_only", urlopen=None,
+) -> dict[str, Any]:
+    packet = {
+        "source_agent": "hermes", "requested_action": action,
+        "user_intent": "Deliver one completed async research result.",
+        "content": "", "approval_status": approval_status,
+        "risk_level": "low", "context": context,
+    }
+    response = _post_bridge(
+        packet, base_url=str(base_url or "").strip(),
+        token=str(token or "").strip(), urlopen=urlopen)
+    if not isinstance(response, Mapping) or response.get("status") not in {"ok", "rejected"}:
+        raise IntakeBridgeError("BRIDGE_RESPONSE_INVALID", "delivery response invalid")
+    if response.get("requested_action") != action:
+        raise IntakeBridgeError("BRIDGE_ACTION_MISMATCH", "delivery action mismatch")
+    return dict(response)
+
+
+def claim_research_delivery(*, base_url: str, token: str, worker_id: str, urlopen=None) -> dict | None:
+    response = _request_research_delivery_action(
+        base_url=base_url, token=token, action="claim_research_delivery",
+        context={"worker_id": str(worker_id or "")[:100]}, urlopen=urlopen)
+    delivery = response.get("delivery")
+    if delivery is None:
+        return None
+    if not isinstance(delivery, Mapping):
+        raise IntakeBridgeError("BRIDGE_RESPONSE_INVALID", "delivery claim invalid")
+    required = ("job_id", "message", "origin", "lease_token", "version", "attempts")
+    if any(key not in delivery for key in required):
+        raise IntakeBridgeError("BRIDGE_RESPONSE_INVALID", "delivery claim incomplete")
+    job_id = str(delivery.get("job_id") or "")
+    message = str(delivery.get("message") or "")
+    lease = str(delivery.get("lease_token") or "")
+    if not job_id or len(job_id) > 200 or not message or len(message) > 4000:
+        raise IntakeBridgeError("BRIDGE_RESPONSE_INVALID", "delivery claim invalid")
+    if not re.fullmatch(r"[a-f0-9]{32}", lease):
+        raise IntakeBridgeError("BRIDGE_RESPONSE_INVALID", "delivery lease invalid")
+    clean = dict(delivery)
+    clean["origin"] = _delivery_origin(delivery.get("origin"))
+    clean["version"] = int(delivery["version"])
+    clean["attempts"] = int(delivery["attempts"])
+    return clean
+
+
+def ack_research_delivery(
+    *, base_url: str, token: str, job_id: str, lease_token: str,
+    expected_version: int, outcome: str, failure_category: str = "",
+    remote_message_id: str = "", urlopen=None,
+) -> dict:
+    context = {
+        "job_id": job_id, "lease_token": lease_token,
+        "expected_version": int(expected_version), "outcome": outcome,
+    }
+    if failure_category:
+        context["failure_category"] = failure_category
+    if remote_message_id:
+        context["remote_message_id"] = remote_message_id
+    return _request_research_delivery_action(
+        base_url=base_url, token=token, action="ack_research_delivery",
+        context=context, urlopen=urlopen)
+
+
+def get_research_delivery_status(
+    *, base_url: str, token: str, job_id: str, urlopen=None
+) -> dict:
+    return _request_research_delivery_action(
+        base_url=base_url, token=token, action="get_research_delivery_status",
+        context={"job_id": job_id}, urlopen=urlopen)
+
+
+def requeue_research_delivery(
+    *, base_url: str, token: str, job_id: str, expected_version: int,
+    confirm: bool, urlopen=None,
+) -> dict:
+    return _request_research_delivery_action(
+        base_url=base_url, token=token, action="requeue_research_delivery",
+        approval_status="approved", context={
+            "job_id": job_id, "expected_version": int(expected_version),
+            "confirm": bool(confirm),
+        }, urlopen=urlopen)
+
 
 
 _VERDICT_EMOJI = {

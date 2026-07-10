@@ -5531,6 +5531,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # turn so the agent kicks off the new chat.
         asyncio.create_task(self._handoff_watcher())
 
+        if self._research_delivery_configured():
+            asyncio.create_task(self._research_delivery_watcher())
+
         # Start background async-delegation watcher — drains completion events
         # from delegate_task(background=true) subagents and injects each
         # result back into its originating session as a new turn, covering the
@@ -12710,6 +12713,99 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         evt["chat_id"] = parsed.get("chat_id", "")
         if parsed.get("thread_id"):
             evt["thread_id"] = parsed["thread_id"]
+    def _research_delivery_configured(self) -> bool:
+        try:
+            enabled, base_url, _ = self._intake_config()
+            from gateway.cogitator_intake_bridge import TOKEN_ENV
+            return bool(
+                enabled and base_url and os.environ.get(TOKEN_ENV)
+                and self.adapters.get(Platform.TELEGRAM))
+        except Exception:
+            return False
+
+    @staticmethod
+    def _research_delivery_failure(result) -> tuple[str, str]:
+        error = str(getattr(result, "error", "") or "").lower()
+        # Telegram API rejections are permanent even if a producer mistakenly
+        # labels the result retryable. Check them before transient transport.
+        if "unauthorized" in error or re.search(r"\b401\b", error):
+            return "failed", "unauthorized"
+        if "forbidden" in error or re.search(r"\b403\b", error):
+            return "failed", "forbidden"
+        if (re.search(r"\b400\b", error) or "bad request" in error
+                or "chat not found" in error or "thread not found" in error
+                or "invalid chat" in error):
+            return "failed", "invalid_route"
+        # Telegram marks connect/pool timeouts retryable because no request was
+        # sent. A post-send/read timeout is non-retryable and remains ambiguous.
+        if getattr(result, "retryable", False):
+            return "pending", "transient"
+        if "timed out" in error or "timeout" in error:
+            return "failed", "timeout_unknown"
+        return "failed", "delivery_error"
+
+    async def _research_delivery_watcher(self, interval: float = 2.0) -> None:
+        """Poll Cogitator's durable outbox and deliver through Hermes Telegram."""
+        await asyncio.sleep(3)
+        from gateway.cogitator_intake_bridge import (
+            TOKEN_ENV, ack_research_delivery, claim_research_delivery)
+        from gateway.platforms.base import (
+            _mark_notify_metadata, _thread_metadata_for_source)
+        from gateway.session import SessionSource
+
+        enabled, base_url, _ = self._intake_config()
+        token = str(os.environ.get(TOKEN_ENV, "") or "").strip()
+        worker_id = f"gateway-{os.getpid()}"
+        while self._running and enabled and base_url and token:
+            try:
+                delivery = await asyncio.to_thread(
+                    claim_research_delivery, base_url=base_url, token=token,
+                    worker_id=worker_id)
+                if not delivery:
+                    await asyncio.sleep(interval)
+                    continue
+                source = SessionSource.from_dict(delivery["origin"])
+                adapter = self.adapters.get(source.platform)
+                if adapter is None:
+                    await asyncio.to_thread(
+                        ack_research_delivery, base_url=base_url, token=token,
+                        job_id=delivery["job_id"], lease_token=delivery["lease_token"],
+                        expected_version=delivery["version"], outcome="failed",
+                        failure_category="invalid_route")
+                    continue
+                started = await asyncio.to_thread(
+                    ack_research_delivery, base_url=base_url, token=token,
+                    job_id=delivery["job_id"], lease_token=delivery["lease_token"],
+                    expected_version=delivery["version"], outcome="send_started")
+                version = int((started.get("delivery") or {}).get("version"))
+                reply_to = (source.message_id if source.platform == Platform.TELEGRAM
+                            and source.chat_type == "dm" and source.thread_id else None)
+                metadata = _mark_notify_metadata(
+                    _thread_metadata_for_source(source, reply_to))
+                result = await adapter._send_with_retry(
+                    chat_id=source.chat_id, content=delivery["message"],
+                    reply_to=reply_to, metadata=metadata, max_retries=2)
+                if getattr(result, "success", False):
+                    await asyncio.to_thread(
+                        ack_research_delivery, base_url=base_url, token=token,
+                        job_id=delivery["job_id"], lease_token=delivery["lease_token"],
+                        expected_version=version, outcome="delivered",
+                        remote_message_id=str(getattr(result, "message_id", "") or ""))
+                else:
+                    outcome, category = self._research_delivery_failure(result)
+                    await asyncio.to_thread(
+                        ack_research_delivery, base_url=base_url, token=token,
+                        job_id=delivery["job_id"], lease_token=delivery["lease_token"],
+                        expected_version=version, outcome=outcome,
+                        failure_category=category)
+                    logger.warning("Research delivery failed: job=%s category=%s",
+                                   delivery["job_id"], category)
+            except Exception as exc:
+                code = getattr(exc, "code", type(exc).__name__)
+                logger.warning("Research delivery watcher error: %s", code)
+                await asyncio.sleep(interval)
+
+
 
     async def _async_delegation_watcher(self, interval: float = 2.0) -> None:
         """Drain async-delegation completions and inject them as new turns.
