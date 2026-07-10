@@ -198,6 +198,14 @@ def _auto_research_lines(response: Mapping[str, Any]) -> list[str]:
             lines.append(f"Recommended action: {auto['recommended_action']}")
         if auto.get("note_path"):
             lines.append(f"Research note: {auto['note_path']}")
+    elif auto.get("status") in ("queued", "duplicate"):
+        # async delivery (Cogitator #1008): the job runs in the background and
+        # Cogitator pushes the verdict to this chat when it completes.
+        lines.append(
+            f"🔎 Auto-research (claim {auto.get('claim_number')}): "
+            f"job {'already running' if auto.get('status') == 'duplicate' else 'started'}"
+            f" — {auto.get('job_id', '?')}")
+        lines.append("The result will arrive here when the research completes.")
     else:
         lines.append(
             f"⚠️ Auto-research failed: {auto.get('reason') or 'unknown error'} "
@@ -315,6 +323,9 @@ def _validate_response(response: Any, *, expected_action: str) -> dict[str, Any]
     if researched not in (False, None) and not (
             researched is True and isinstance(response.get("auto_research"), Mapping)):
         raise IntakeBridgeError("BRIDGE_STATEFUL_RESPONSE", f"research_performed={researched!r}")
+    auto = response.get("auto_research")
+    if isinstance(auto, Mapping) and auto.get("status") in {"queued", "duplicate"}:
+        _validate_research_job(auto)
     stateful = [f for f in _FORBIDDEN_RESPONSE_FIELDS if f in response]
     if stateful:
         raise IntakeBridgeError("BRIDGE_STATEFUL_RESPONSE", f"fields={stateful}")
@@ -380,10 +391,38 @@ def validate_intake_research_response(response: Any) -> dict[str, Any]:
     if response.get("promotion_performed") not in (False, None):
         raise IntakeBridgeError("BRIDGE_STATEFUL_RESPONSE",
                                 f"promotion_performed={response.get('promotion_performed')!r}")
+    job = response.get("research_job")
+    if job is not None:
+        _validate_research_job(job)
+        if response.get("research_performed") not in (False, None):
+            raise IntakeBridgeError(
+                "BRIDGE_STATEFUL_RESPONSE",
+                f"research_performed={response.get('research_performed')!r}")
     stateful = [f for f in _FORBIDDEN_RESPONSE_FIELDS if f in response]
     if stateful:
         raise IntakeBridgeError("BRIDGE_STATEFUL_RESPONSE", f"fields={stateful}")
     return dict(response)
+
+
+def _validate_research_job(job: Any) -> None:
+    """Validate the bounded async receipt before Hermes tells Cal it started."""
+    if not isinstance(job, Mapping):
+        raise IntakeBridgeError("BRIDGE_RESPONSE_INVALID", "research job is not an object")
+    if job.get("status") not in {"queued", "duplicate"}:
+        raise IntakeBridgeError("BRIDGE_RESPONSE_INVALID", "invalid research job status")
+    job_id = job.get("job_id")
+    claim = job.get("claim")
+    claim_number = job.get("claim_number")
+    if not isinstance(job_id, str) or not job_id.strip() or len(job_id) > 200:
+        raise IntakeBridgeError("BRIDGE_RESPONSE_INVALID", "invalid research job id")
+    if not isinstance(claim, str) or not claim.strip():
+        raise IntakeBridgeError("BRIDGE_RESPONSE_INVALID", "invalid research claim")
+    if (
+        not isinstance(claim_number, int)
+        or isinstance(claim_number, bool)
+        or claim_number < 1
+    ):
+        raise IntakeBridgeError("BRIDGE_RESPONSE_INVALID", "invalid research claim number")
 
 
 def request_intake_research(
@@ -420,9 +459,19 @@ _VERDICT_EMOJI = {
 
 
 def render_intake_research_message(response: Mapping[str, Any]) -> str:
-    """Render a validated research response: verdict first, provenance visible."""
+    """Render a validated research response: verdict first, provenance visible.
+    An async job-start response (Cogitator #1008) renders as a job receipt —
+    the verdict is pushed to this chat by Cogitator when the job completes."""
     if response.get("status") == "rejected":
         return f"Research rejected: {response.get('message') or 'invalid selection'}"
+    job = response.get("research_job")
+    if isinstance(job, Mapping):
+        started = "already queued/running" if job.get("status") == "duplicate" else "started"
+        return "\n".join([
+            f"🔎 Research job {started}: {job.get('job_id', '?')}",
+            f"Claim: {job.get('claim', '')}",
+            "The result will arrive here when the research completes.",
+        ])
     verdict = str(response.get("verdict") or "unknown")
     lines = [
         f"{_VERDICT_EMOJI.get(verdict, '🔎')} Research verdict: {verdict}",

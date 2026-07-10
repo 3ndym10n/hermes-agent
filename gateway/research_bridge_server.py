@@ -14,6 +14,9 @@ Surface
   auth against ``HERMES_RESEARCH_BRIDGE_TOKEN`` (constant-time compare,
   fail-closed 503 when the token is unset) → ``XAIWebSearchProvider.search``
   → ``{"status": "ok", "provider": "xai", "urls": [...]}``.
+* ``POST /research_note`` durably saves one completed research note through
+  Hermes's existing local-copy path before Cogitator reports completion. It
+  uses the same bearer authentication and accepts no arbitrary target path.
 
 Trust model
 -----------
@@ -45,12 +48,14 @@ MAX_QUERY_CHARS = 500
 MAX_RESULTS_CAP = 10
 DEFAULT_MAX_RESULTS = 5
 MAX_BODY_BYTES = 16 * 1024
+MAX_NOTE_BODY_BYTES = 256 * 1024
 
 # Fixed sanitized error strings — provider internals/tokens never cross the bridge.
 _ERR_NOT_CONFIGURED = "bridge token not configured"
 _ERR_UNAUTHORIZED = "unauthorized"
 _ERR_BAD_REQUEST = "invalid request"
 _ERR_PROVIDER = "search provider failed"
+_ERR_STORE = "local note store failed"
 
 
 def _load_token() -> str:
@@ -58,6 +63,20 @@ def _load_token() -> str:
     from hermes_cli.config import get_env_value
 
     return str(get_env_value(TOKEN_ENV) or "").strip()
+
+
+def _load_local_dir() -> str:
+    """Resolve the same durable intake directory used by the gateway."""
+    try:
+        from gateway.run import _load_gateway_config
+        from hermes_cli.config import cfg_get
+
+        config = _load_gateway_config()
+        return str(
+            cfg_get(config, "intake", "local_dir", default="~/cogitator-brain") or ""
+        ).strip()
+    except Exception:
+        return ""
 
 
 def _default_search(query: str, limit: int) -> dict:
@@ -130,6 +149,50 @@ def handle_research_search(
                  "urls": _extract_urls(result, max_results)}
 
 
+def handle_research_note(
+    body: bytes,
+    auth_header: str,
+    *,
+    token: str,
+    base_dir: str,
+) -> tuple[int, dict]:
+    """Persist one bounded markdown note through the existing safe helper."""
+    if not token:
+        return 503, {"status": "error", "error": _ERR_NOT_CONFIGURED}
+    presented = auth_header.removeprefix("Bearer ").strip() if auth_header.startswith("Bearer ") else ""
+    if not presented or not hmac.compare_digest(presented, token):
+        return 401, {"status": "error", "error": _ERR_UNAUTHORIZED}
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except Exception:
+        return 400, {"status": "error", "error": _ERR_BAD_REQUEST}
+    if not isinstance(payload, dict):
+        return 400, {"status": "error", "error": _ERR_BAD_REQUEST}
+    note_path = payload.get("note_path")
+    note_markdown = payload.get("note_markdown")
+    if (
+        not isinstance(note_path, str)
+        or not note_path.strip().endswith(".md")
+        or len(note_path) > 500
+        or not isinstance(note_markdown, str)
+        or not note_markdown.strip()
+    ):
+        return 400, {"status": "error", "error": _ERR_BAD_REQUEST}
+    if not base_dir:
+        return 503, {"status": "error", "error": _ERR_STORE}
+    try:
+        from gateway.cogitator_intake_bridge import save_local_copies
+
+        saved = save_local_copies(
+            {"note_path": note_path, "note_markdown": note_markdown}, base_dir)
+    except Exception:
+        logger.warning("research_note local save failed", exc_info=True)
+        return 500, {"status": "error", "error": _ERR_STORE}
+    if len(saved) != 1:
+        return 500, {"status": "error", "error": _ERR_STORE}
+    return 200, {"status": "ok", "saved": True}
+
+
 class _Handler(BaseHTTPRequestHandler):
     server_version = "HermesResearchBridge/1.0"
 
@@ -148,23 +211,36 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_json(404, {"status": "error", "error": "not found"})
 
     def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
-        if self.path != "/research_search":
+        if self.path not in {"/research_search", "/research_note"}:
             self._send_json(404, {"status": "error", "error": "not found"})
             return
         try:
             length = int(self.headers.get("Content-Length") or 0)
         except ValueError:
             length = 0
-        if length < 0 or length > MAX_BODY_BYTES:
+        limit = (
+            MAX_NOTE_BODY_BYTES
+            if self.path == "/research_note"
+            else MAX_BODY_BYTES
+        )
+        if length < 0 or length > limit:
             self._send_json(413, {"status": "error", "error": _ERR_BAD_REQUEST})
             return
         body = self.rfile.read(length)
-        status, response = handle_research_search(
-            body,
-            self.headers.get("Authorization") or "",
-            token=self.server.bridge_token,  # type: ignore[attr-defined]
-            search=self.server.bridge_search,  # type: ignore[attr-defined]
-        )
+        if self.path == "/research_search":
+            status, response = handle_research_search(
+                body,
+                self.headers.get("Authorization") or "",
+                token=self.server.bridge_token,  # type: ignore[attr-defined]
+                search=self.server.bridge_search,  # type: ignore[attr-defined]
+            )
+        else:
+            status, response = handle_research_note(
+                body,
+                self.headers.get("Authorization") or "",
+                token=self.server.bridge_token,  # type: ignore[attr-defined]
+                base_dir=self.server.bridge_local_dir,  # type: ignore[attr-defined]
+            )
         self._send_json(status, response)
 
     def log_message(self, format: str, *args: Any) -> None:
@@ -178,11 +254,15 @@ def make_server(
     *,
     token: str | None = None,
     search: Callable[[str, int], dict] = _default_search,
+    local_dir: str | None = None,
 ) -> ThreadingHTTPServer:
     """Build the bound server (port 0 for an ephemeral test port)."""
     server = ThreadingHTTPServer((BIND_HOST, port), _Handler)
     server.bridge_token = _load_token() if token is None else token  # type: ignore[attr-defined]
     server.bridge_search = search  # type: ignore[attr-defined]
+    server.bridge_local_dir = (  # type: ignore[attr-defined]
+        _load_local_dir() if local_dir is None else local_dir
+    )
     return server
 
 
@@ -192,6 +272,8 @@ def main() -> None:
     if not server.bridge_token:  # type: ignore[attr-defined]
         # Still serve /healthz; /research_search fail-closes with 503.
         logger.warning("%s is not set — research_search will refuse all requests", TOKEN_ENV)
+    if not server.bridge_local_dir:  # type: ignore[attr-defined]
+        logger.warning("research_note will refuse writes: local store not configured")
     logger.info("research bridge listening on %s:%d", BIND_HOST, server.server_address[1])
     server.serve_forever()
 

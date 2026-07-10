@@ -245,6 +245,36 @@ def test_render_summary_shows_auto_research_failure_softly():
     assert "intake itself succeeded" in out
 
 
+def test_render_summary_shows_queued_auto_research_job():
+    # async delivery (Cogitator #1008): job receipt, never the failure branch
+    out = ib.render_intake_message(_ok_response(auto_research={
+        "status": "queued", "claim_number": 1,
+        "claim": "AI dynamic pricing lifts margins by 25%.",
+        "job_id": "2026-07-10_12-00-00-intake-claim-1",
+        "message": "Research job started.",
+    }))
+    assert "job started — 2026-07-10_12-00-00-intake-claim-1" in out
+    assert "result will arrive here" in out
+    assert "Auto-research failed" not in out
+
+
+def test_render_summary_shows_duplicate_auto_research_job():
+    out = ib.render_intake_message(_ok_response(auto_research={
+        "status": "duplicate", "claim_number": 1, "claim": "c",
+        "job_id": "stem-claim-1", "message": "already running",
+    }))
+    assert "job already running — stem-claim-1" in out
+    assert "Auto-research failed" not in out
+
+
+def test_queued_auto_research_response_requires_a_valid_job_shape():
+    with pytest.raises(ib.IntakeBridgeError) as exc:
+        ib.validate_intake_response(_ok_response(auto_research={
+            "status": "queued", "claim_number": 0, "claim": "c", "job_id": "",
+        }))
+    assert exc.value.code == "BRIDGE_RESPONSE_INVALID"
+
+
 # --- mixin handler dispatch ----------------------------------------------------
 
 def _handler_with_config(enabled, base_url, local_dir=""):
@@ -496,6 +526,32 @@ def test_render_research_message():
     assert "AI dynamic pricing" in out
     assert "Sources consulted:" in out
     assert "Research note: storage/research_notes/" in out
+
+
+def test_render_research_message_job_receipt():
+    # async job-start shape (Cogitator #1008) renders as a receipt, not verdict
+    out = ib.render_intake_research_message({
+        "status": "ok", "requested_action": "research_intake_item",
+        "research_job": {"status": "queued", "job_id": "stem-claim-2",
+                         "claim": "the claim text", "claim_number": 2},
+        "message": "Research job started: stem-claim-2.",
+        "research_performed": False, "promotion_performed": False,
+    })
+    assert "Research job started: stem-claim-2" in out
+    assert "the claim text" in out
+    assert "result will arrive here" in out
+    assert "verdict" not in out.lower()
+
+
+def test_research_job_response_requires_a_valid_job_shape():
+    with pytest.raises(ib.IntakeBridgeError) as exc:
+        ib.validate_intake_research_response({
+            "status": "ok", "requested_action": "research_intake_item",
+            "research_job": {"status": "queued", "job_id": "job-1",
+                             "claim": "", "claim_number": 1},
+            "research_performed": False, "promotion_performed": False,
+        })
+    assert exc.value.code == "BRIDGE_RESPONSE_INVALID"
 
 
 def test_render_intake_message_lists_research_targets():
