@@ -198,6 +198,14 @@ def _auto_research_lines(response: Mapping[str, Any]) -> list[str]:
             lines.append(f"Recommended action: {auto['recommended_action']}")
         if auto.get("note_path"):
             lines.append(f"Research note: {auto['note_path']}")
+    elif auto.get("status") in ("queued", "duplicate"):
+        # async delivery (Cogitator #1008): the job runs in the background and
+        # Cogitator pushes the verdict to this chat when it completes.
+        lines.append(
+            f"🔎 Auto-research (claim {auto.get('claim_number')}): "
+            f"job {'already running' if auto.get('status') == 'duplicate' else 'started'}"
+            f" — {auto.get('job_id', '?')}")
+        lines.append("The result will arrive here when the research completes.")
     else:
         lines.append(
             f"⚠️ Auto-research failed: {auto.get('reason') or 'unknown error'} "
@@ -420,9 +428,19 @@ _VERDICT_EMOJI = {
 
 
 def render_intake_research_message(response: Mapping[str, Any]) -> str:
-    """Render a validated research response: verdict first, provenance visible."""
+    """Render a validated research response: verdict first, provenance visible.
+    An async job-start response (Cogitator #1008) renders as a job receipt —
+    the verdict is pushed to this chat by Cogitator when the job completes."""
     if response.get("status") == "rejected":
         return f"Research rejected: {response.get('message') or 'invalid selection'}"
+    job = response.get("research_job")
+    if isinstance(job, Mapping):
+        started = "already queued/running" if job.get("status") == "duplicate" else "started"
+        return "\n".join([
+            f"🔎 Research job {started}: {job.get('job_id', '?')}",
+            f"Claim: {job.get('claim', '')}",
+            "The result will arrive here when the research completes.",
+        ])
     verdict = str(response.get("verdict") or "unknown")
     lines = [
         f"{_VERDICT_EMOJI.get(verdict, '🔎')} Research verdict: {verdict}",
