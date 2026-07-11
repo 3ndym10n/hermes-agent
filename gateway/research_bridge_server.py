@@ -14,6 +14,16 @@ Surface
   auth against ``HERMES_RESEARCH_BRIDGE_TOKEN`` (constant-time compare,
   fail-closed 503 when the token is unset) → ``XAIWebSearchProvider.search``
   → ``{"status": "ok", "provider": "xai", "urls": [...]}``.
+* ``POST /research_gather`` ``{"query": str, "max_sources": int}`` — same
+  auth; runs GPT Researcher *discovery only* in its isolated pinned venv
+  (``~/.hermes/gptr-venv``, see ``gateway/gptr-requirements.lock``) as a
+  bounded one-shot subprocess → ``{"status": "ok", "provider": "gptr",
+  "sources": [{"url", "title", "snippet"}], "count", "latency_s",
+  "cost_usd_estimate"}``. Gathering material ONLY: verdicts, promotion
+  recommendations, ledgers, and agent instructions never cross this
+  endpoint (Cogitator #1012 Phase 1 doctrine). Default-off consumer;
+  Cogitator re-fetches every URL through its own SSRF guard and never
+  counts snippets alone as evidence.
 * ``POST /research_note`` durably saves one completed research note through
   Hermes's existing local-copy path before Cogitator reports completion. It
   uses the same bearer authentication and accepts no arbitrary target path.
@@ -50,12 +60,21 @@ DEFAULT_MAX_RESULTS = 5
 MAX_BODY_BYTES = 16 * 1024
 MAX_NOTE_BODY_BYTES = 256 * 1024
 
+# /research_gather bounds — one GPT Researcher discovery subprocess per request.
+GATHER_MAX_SOURCES_CAP = 20
+GATHER_DEFAULT_SOURCES = 10
+GATHER_TIMEOUT_SECONDS = 150
+GATHER_SNIPPET_CHARS = 300
+GPTR_PYTHON_ENV = "HERMES_GPTR_PYTHON"  # override for tests; default pinned venv
+_GPTR_PYTHON_DEFAULT = "~/.hermes/gptr-venv/bin/python"
+
 # Fixed sanitized error strings — provider internals/tokens never cross the bridge.
 _ERR_NOT_CONFIGURED = "bridge token not configured"
 _ERR_UNAUTHORIZED = "unauthorized"
 _ERR_BAD_REQUEST = "invalid request"
 _ERR_PROVIDER = "search provider failed"
 _ERR_STORE = "local note store failed"
+_ERR_GATHER = "gather provider failed"
 
 
 def _load_token() -> str:
@@ -149,6 +168,107 @@ def handle_research_search(
                  "urls": _extract_urls(result, max_results)}
 
 
+def _default_gather(query: str, max_sources: int) -> dict:
+    """Run the GPTR discovery worker as a bounded one-shot subprocess in its
+    isolated pinned venv. cwd is a throwaway scratch dir so the worker never
+    touches either repo or ~/cogitator-brain; the OpenRouter key travels via
+    the subprocess environment only (never argv, never logs)."""
+    import os
+    import subprocess
+    import tempfile
+    from pathlib import Path
+
+    from hermes_cli.config import get_env_value
+
+    python = os.path.expanduser(
+        str(get_env_value(GPTR_PYTHON_ENV) or "").strip() or _GPTR_PYTHON_DEFAULT)
+    worker = str(Path(__file__).resolve().parent / "gptr_gather_worker.py")
+    if not Path(python).exists():
+        return {"status": "error", "error": "gather venv unavailable"}
+    env = {
+        "HOME": os.environ.get("HOME", ""),
+        "PATH": "/usr/bin:/bin",
+        "OPENROUTER_API_KEY": str(get_env_value("OPENROUTER_API_KEY") or ""),
+    }
+    with tempfile.TemporaryDirectory(prefix="gptr-scratch-") as scratch:
+        proc = subprocess.run(
+            [python, worker],
+            input=json.dumps({"query": query, "max_sources": max_sources}),
+            capture_output=True, text=True, timeout=GATHER_TIMEOUT_SECONDS,
+            cwd=scratch, env=env,
+        )
+    if proc.stderr:
+        # Worker diagnostics stay in the local log only.
+        logger.info("gptr worker stderr (%d bytes)", len(proc.stderr))
+    return json.loads(proc.stdout or "{}")
+
+
+def handle_research_gather(
+    body: bytes,
+    auth_header: str,
+    *,
+    token: str,
+    gather: Callable[[str, int], dict] = _default_gather,
+) -> tuple[int, dict]:
+    """Pure request handler for GPTR source discovery: ``(status, response)``.
+
+    Same fail-closed auth/bounds discipline as ``handle_research_search``.
+    The response is rebuilt field-by-field from a whitelist, so nothing the
+    worker (or a compromised worker) emits beyond gathering material can
+    ever cross the bridge."""
+    if not token:
+        return 503, {"status": "error", "error": _ERR_NOT_CONFIGURED}
+    presented = auth_header.removeprefix("Bearer ").strip() if auth_header.startswith("Bearer ") else ""
+    if not presented or not hmac.compare_digest(presented, token):
+        return 401, {"status": "error", "error": _ERR_UNAUTHORIZED}
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except Exception:
+        return 400, {"status": "error", "error": _ERR_BAD_REQUEST}
+    if not isinstance(payload, dict):
+        return 400, {"status": "error", "error": _ERR_BAD_REQUEST}
+    query = str(payload.get("query") or "").strip()
+    if not query or len(query) > MAX_QUERY_CHARS:
+        return 400, {"status": "error", "error": _ERR_BAD_REQUEST}
+    try:
+        max_sources = int(payload.get("max_sources", GATHER_DEFAULT_SOURCES))
+    except (TypeError, ValueError):
+        max_sources = GATHER_DEFAULT_SOURCES
+    max_sources = max(1, min(max_sources, GATHER_MAX_SOURCES_CAP))
+
+    try:
+        result = gather(query, max_sources)
+    except Exception:
+        logger.warning("research_gather provider raised", exc_info=True)
+        return 502, {"status": "error", "error": _ERR_GATHER}
+    if not (isinstance(result, dict) and result.get("status") == "ok"):
+        logger.warning("research_gather provider failed: %s",
+                       result.get("error") if isinstance(result, dict) else result)
+        return 502, {"status": "error", "error": _ERR_GATHER}
+    sources = []
+    for row in result.get("sources") or []:
+        if not isinstance(row, dict):
+            continue
+        url = str(row.get("url") or "").strip()
+        if not url.startswith(("http://", "https://")):
+            continue
+        sources.append({
+            "url": url,
+            "title": str(row.get("title") or "")[:200],
+            "snippet": str(row.get("snippet") or "")[:GATHER_SNIPPET_CHARS],
+        })
+        if len(sources) >= max_sources:
+            break
+    def _num(key: str) -> float:
+        try:
+            return round(float(result.get(key) or 0.0), 4)
+        except (TypeError, ValueError):
+            return 0.0
+    return 200, {"status": "ok", "provider": "gptr", "sources": sources,
+                 "count": len(sources), "latency_s": _num("latency_s"),
+                 "cost_usd_estimate": _num("cost_usd_estimate")}
+
+
 def handle_research_note(
     body: bytes,
     auth_header: str,
@@ -211,7 +331,7 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_json(404, {"status": "error", "error": "not found"})
 
     def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
-        if self.path not in {"/research_search", "/research_note"}:
+        if self.path not in {"/research_search", "/research_note", "/research_gather"}:
             self._send_json(404, {"status": "error", "error": "not found"})
             return
         try:
@@ -234,6 +354,13 @@ class _Handler(BaseHTTPRequestHandler):
                 token=self.server.bridge_token,  # type: ignore[attr-defined]
                 search=self.server.bridge_search,  # type: ignore[attr-defined]
             )
+        elif self.path == "/research_gather":
+            status, response = handle_research_gather(
+                body,
+                self.headers.get("Authorization") or "",
+                token=self.server.bridge_token,  # type: ignore[attr-defined]
+                gather=self.server.bridge_gather,  # type: ignore[attr-defined]
+            )
         else:
             status, response = handle_research_note(
                 body,
@@ -255,11 +382,13 @@ def make_server(
     token: str | None = None,
     search: Callable[[str, int], dict] = _default_search,
     local_dir: str | None = None,
+    gather: Callable[[str, int], dict] = _default_gather,
 ) -> ThreadingHTTPServer:
     """Build the bound server (port 0 for an ephemeral test port)."""
     server = ThreadingHTTPServer((BIND_HOST, port), _Handler)
     server.bridge_token = _load_token() if token is None else token  # type: ignore[attr-defined]
     server.bridge_search = search  # type: ignore[attr-defined]
+    server.bridge_gather = gather  # type: ignore[attr-defined]
     server.bridge_local_dir = (  # type: ignore[attr-defined]
         _load_local_dir() if local_dir is None else local_dir
     )
