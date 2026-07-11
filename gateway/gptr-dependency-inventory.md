@@ -34,7 +34,7 @@ every subsequent change.
 
 - One-shot **subprocess** per request (`gateway/gptr_gather_worker.py`),
   spawned by the bridge with: scratch `TemporaryDirectory` cwd (auto-removed),
-  minimal env (`HOME`, `PATH=/usr/bin:/bin`, `OPENROUTER_API_KEY` only),
+  scratch-scoped `HOME`/`XDG_*`, `PATH=/usr/bin:/bin`, and `OPENROUTER_API_KEY` only,
   150 s wall-clock timeout, stdout-JSON protocol.
 - The worker pins its own model/retriever env unconditionally, so host env
   drift can never silently change the proven Phase 0 configuration.

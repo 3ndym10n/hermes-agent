@@ -185,12 +185,15 @@ def _default_gather(query: str, max_sources: int) -> dict:
     worker = str(Path(__file__).resolve().parent / "gptr_gather_worker.py")
     if not Path(python).exists():
         return {"status": "error", "error": "gather venv unavailable"}
-    env = {
-        "HOME": os.environ.get("HOME", ""),
-        "PATH": "/usr/bin:/bin",
-        "OPENROUTER_API_KEY": str(get_env_value("OPENROUTER_API_KEY") or ""),
-    }
     with tempfile.TemporaryDirectory(prefix="gptr-scratch-") as scratch:
+        env = {
+            "HOME": scratch,
+            "XDG_CACHE_HOME": os.path.join(scratch, "cache"),
+            "XDG_CONFIG_HOME": os.path.join(scratch, "config"),
+            "XDG_DATA_HOME": os.path.join(scratch, "data"),
+            "PATH": "/usr/bin:/bin",
+            "OPENROUTER_API_KEY": str(get_env_value("OPENROUTER_API_KEY") or ""),
+        }
         proc = subprocess.run(
             [python, worker],
             input=json.dumps({"query": query, "max_sources": max_sources}),
@@ -239,11 +242,10 @@ def handle_research_gather(
     try:
         result = gather(query, max_sources)
     except Exception:
-        logger.warning("research_gather provider raised", exc_info=True)
+        logger.warning("research_gather provider raised")
         return 502, {"status": "error", "error": _ERR_GATHER}
     if not (isinstance(result, dict) and result.get("status") == "ok"):
-        logger.warning("research_gather provider failed: %s",
-                       result.get("error") if isinstance(result, dict) else result)
+        logger.warning("research_gather provider returned error")
         return 502, {"status": "error", "error": _ERR_GATHER}
     sources = []
     for row in result.get("sources") or []:

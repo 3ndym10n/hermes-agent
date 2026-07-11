@@ -3,6 +3,8 @@ provider-failure sanitization. Handler logic is tested pure; one live
 ephemeral-port round-trip covers the HTTP wiring."""
 
 import json
+import subprocess
+import sys
 import threading
 import urllib.error
 import urllib.request
@@ -14,6 +16,7 @@ from gateway.research_bridge_server import (
     MAX_RESULTS_CAP,
     handle_research_search,
     handle_research_note,
+    _default_gather,
     make_server,
 )
 
@@ -194,15 +197,47 @@ def test_gather_max_sources_clamped():
     assert seen["n"] >= 1
 
 
-def test_gather_provider_failures_sanitized_502():
+def test_gather_provider_failures_sanitized_502(caplog):
+    marker = "secret-upstream-token-abc123"
+
     def raises(q, n):
-        raise RuntimeError("secret upstream detail sk-abc123")
+        raise RuntimeError(marker)
 
     status, resp = _gather_call({"query": "q"}, gather=raises)
-    assert status == 502 and "sk-abc" not in json.dumps(resp)
+    assert status == 502 and marker not in json.dumps(resp)
     status, resp = _gather_call(
-        {"query": "q"}, gather=lambda q, n: {"status": "error", "error": "token=leak"})
-    assert status == 502 and "leak" not in json.dumps(resp)
+        {"query": "q"},
+        gather=lambda q, n: {"status": "error", "error": marker})
+    assert status == 502 and marker not in json.dumps(resp)
+    assert marker not in caplog.text
+
+
+def test_gather_subprocess_uses_scratch_home_and_xdg_dirs(monkeypatch):
+    seen = {}
+
+    def run(*args, **kwargs):
+        seen.update(kwargs)
+        return subprocess.CompletedProcess(
+            args=args[0], returncode=0,
+            stdout='{"status":"ok","sources":[]}', stderr="")
+
+    monkeypatch.setenv("HERMES_GPTR_PYTHON", sys.executable)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setattr(subprocess, "run", run)
+    assert _default_gather("bounded query", 3)["status"] == "ok"
+
+    scratch = seen["cwd"]
+    env = seen["env"]
+    assert env["HOME"] == scratch
+    assert env["XDG_CACHE_HOME"].startswith(scratch)
+    assert env["XDG_CONFIG_HOME"].startswith(scratch)
+    assert env["XDG_DATA_HOME"].startswith(scratch)
+    boundary = " ".join([
+        scratch, env["HOME"], env["XDG_CACHE_HOME"],
+        env["XDG_CONFIG_HOME"], env["XDG_DATA_HOME"],
+    ])
+    assert "cogitator-brain" not in boundary
+    assert "/Projects/" not in boundary
 
 
 def test_gather_response_is_whitelisted_gathering_material_only():
