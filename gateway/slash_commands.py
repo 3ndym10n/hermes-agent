@@ -2119,21 +2119,29 @@ class GatewaySlashCommandsMixin:
         response: str,
         agent_result: dict[str, Any],
     ) -> str:
-        """Record cited Cogitator use, then hide the internal refinement marker."""
+        """Record verified Cogitator use, then hide internal provenance markers."""
         receipt = self._active_intelligent_retrieval_context(event)
         if not receipt:
             return response
+        usage_marker = re.compile(
+            r"(?m)^COGITATOR USED:\s*(ki_[a-f0-9]{24})\s*$"
+        )
         marker = re.compile(
             r"(?m)^PROPOSED REFINEMENT:\s*"
             r"(ki_[a-f0-9]{24})\s*\|\s*(.+?)\s*$"
         )
+        declared = set(usage_marker.findall(response))
         proposals = marker.findall(response)
-        cleaned = marker.sub("", response).rstrip()
+        cleaned = marker.sub("", usage_marker.sub("", response)).rstrip()
         records = list(receipt.get("records") or [])
         used_item_ids = [
             record["item_id"]
             for record in records
-            if record["item_id"] in cleaned and record["citation"] in cleaned
+            if record["item_id"] in declared
+            or (
+                record["item_id"] in cleaned
+                and record["citation"] in cleaned
+            )
         ]
         refinement_item_id = ""
         refinement_text = ""
@@ -2188,7 +2196,7 @@ class GatewaySlashCommandsMixin:
                     receipt.get("retrieval_receipt_id") or ""
                 ),
                 response_task_id=response_task_id,
-                response_text=response[:16000],
+                response_text=cleaned[:16000],
                 used_item_ids=used_item_ids,
                 other_context_sources=[
                     f"tool:{name}" for name in sorted(tool_names)
@@ -2206,6 +2214,12 @@ class GatewaySlashCommandsMixin:
             receipt["refinement_review_id"] = str(
                 result.get("candidate_review_id") or ""
             )
+            confirmed = list(result.get("used_item_ids") or [])
+            if confirmed:
+                cleaned = (
+                    f"{cleaned}\n\nKNOWLEDGE USED:\n"
+                    + "\n".join(f"- {item_id}" for item_id in confirmed)
+                )
         except Exception as exc:
             logger.warning(
                 "[intelligent_usage] unavailable: %s",

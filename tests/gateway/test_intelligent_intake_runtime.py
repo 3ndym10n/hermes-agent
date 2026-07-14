@@ -190,11 +190,13 @@ def _retrieval_response():
                 "core_idea": "Use premium reasoning at decision gates.",
                 "why_relevant": "It affects provider choice.",
                 "plan_delta": "Measure five tasks.",
-                "citation": "storage/knowledge/ai-cost.md",
+                "citation": "/app/storage/promoted/isb-ki_0123456789abcdef01234567.md",
                 "lifecycle_state": "promoted",
             }
         ],
-        "citations": ["storage/knowledge/ai-cost.md"],
+        "citations": [
+            "/app/storage/promoted/isb-ki_0123456789abcdef01234567.md"
+        ],
         "retrieval_receipt_id": "isbr_12345678901234567890",
         "paid_api_used": False,
         "research_performed": False,
@@ -219,7 +221,7 @@ async def test_targeted_retrieval_stores_only_opaque_session_handle(monkeypatch)
         "Should we use premium reasoning for this decision?",
     )
 
-    assert "storage/knowledge/ai-cost.md" in rendered
+    assert "/app/storage/promoted/isb-ki_0123456789abcdef01234567.md" in rendered
     state = harness._active_intelligent_retrieval_context(
         _event("Should we use premium reasoning for this decision?")
     )
@@ -228,7 +230,7 @@ async def test_targeted_retrieval_stores_only_opaque_session_handle(monkeypatch)
         "records": [
             {
                 "item_id": "ki_0123456789abcdef01234567",
-                "citation": "storage/knowledge/ai-cost.md",
+                "citation": "/app/storage/promoted/isb-ki_0123456789abcdef01234567.md",
                 "lifecycle_state": "promoted",
             }
         ],
@@ -287,8 +289,8 @@ async def test_review_and_outcome_handlers_use_explicit_authority(monkeypatch):
     response = await harness.record_intelligent_response_usage(
         event,
         (
-            "Follow [ki_0123456789abcdef01234567]"
-            "(storage/knowledge/ai-cost.md).\n"
+            "Use premium reasoning at decision gates and measure five tasks.\n"
+            "COGITATOR USED: ki_0123456789abcdef01234567\n"
             "PROPOSED REFINEMENT: ki_0123456789abcdef01234567 | "
             "Prefer cherry-picks and require verification before deploy."
         ),
@@ -308,6 +310,10 @@ async def test_review_and_outcome_handlers_use_explicit_authority(monkeypatch):
         },
     )
     assert "PROPOSED REFINEMENT:" not in response
+    assert "COGITATOR USED:" not in response
+    assert response.endswith(
+        "KNOWLEDGE USED:\n- ki_0123456789abcdef01234567"
+    )
     assert seen["usage"]["used_item_ids"] == [
         "ki_0123456789abcdef01234567"
     ]
@@ -318,6 +324,8 @@ async def test_review_and_outcome_handlers_use_explicit_authority(monkeypatch):
     assert seen["usage"]["refinement_item_id"] == (
         "ki_0123456789abcdef01234567"
     )
+    assert "COGITATOR USED:" not in seen["usage"]["response_text"]
+    assert "/app/storage/promoted/" not in seen["usage"]["response_text"]
     receipt = harness._active_intelligent_retrieval_context(event)
     assert receipt["used_item_ids"] == [
         "ki_0123456789abcdef01234567"
