@@ -272,3 +272,264 @@ def test_synthesis_response_is_fail_closed_and_has_cost_receipt():
     rendered = ib.render_intelligent_synthesis_message(result)
     assert "PROVIDER: deterministic:no-provider" in rendered
     assert "PAID API: no (estimated cost: 0.0000)" in rendered
+
+
+def test_review_and_outcome_commands_are_explicit_and_strict():
+    approved = ib.parse_intelligent_review_command(
+        "approve knowledge inote-12"
+    )
+    assert approved == ib.IntelligentReviewCommand("inote-12", "approve", "")
+    related = ib.parse_intelligent_review_command("knowledge related inote-12")
+    assert related.action == "view_related"
+    merged = ib.parse_intelligent_review_command(
+        "knowledge merge inote-12 Merge the cost lesson"
+    )
+    assert merged.action == "update_or_merge"
+    assert merged.payload == "Merge the cost lesson"
+    assert ib.parse_intelligent_review_command(
+        "knowledge merge inote-12"
+    ).error == "payload_required"
+    assert ib.parse_intelligent_review_command("approve this idea") is None
+    assert ib.parse_intelligent_review_command("ordinary approval discussion") is None
+
+    useful = ib.parse_intelligent_outcome_command(
+        "knowledge outcome useful Reduced provider cost"
+    )
+    assert useful == ib.IntelligentOutcomeCommand(
+        "useful", "", "Reduced provider cost"
+    )
+    corrected = ib.parse_intelligent_outcome_command(
+        "knowledge outcome corrected ki_0123456789abcdef01234567 "
+        "Use premium reasoning only for irreversible gates"
+    )
+    assert corrected.outcome == "corrected"
+    assert corrected.item_id == "ki_0123456789abcdef01234567"
+    assert ib.parse_intelligent_outcome_command(
+        "knowledge outcome corrected"
+    ).error == "details_required"
+    assert ib.parse_intelligent_outcome_command(
+        "knowledge outcome useful ki_not-a-real-item Saved labour"
+    ).error == "invalid_item_id"
+    assert ib.parse_intelligent_outcome_command("the outcome was useful") is None
+
+
+def test_action_success_receipts_must_echo_durable_results():
+    class Response:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return __import__("json").dumps(self.payload).encode()
+
+    command = ib.IntelligentReviewCommand("inote-2", "approve")
+    review = {
+        "requested_action": "review_intelligent_knowledge",
+        "status": "applied",
+        "action": "approve",
+        "item_id": "ki_0123456789abcdef01234567",
+        "lifecycle_state": "promoted",
+        "promoted_path": "storage/promoted/ai-cost.md",
+        "paid_api_used": False,
+        "research_performed": False,
+    }
+    accepted = ib.request_intelligent_review(
+        base_url="http://bridge",
+        token="secret",
+        command=command,
+        urlopen=lambda *_a, **_kw: Response(review),
+    )
+    assert "Promoted Markdown: storage/promoted/ai-cost.md" in (
+        ib.render_intelligent_review_message(accepted)
+    )
+    with pytest.raises(ib.IntakeBridgeError) as wrong_review:
+        ib.request_intelligent_review(
+            base_url="http://bridge", token="secret", command=command,
+            urlopen=lambda *_a, **_kw: Response(
+                {**review, "status": "candidate_created"}
+            ),
+        )
+    assert wrong_review.value.code == "BRIDGE_RESPONSE_INVALID"
+    with pytest.raises(ib.IntakeBridgeError) as unsafe_blocked:
+        ib.request_intelligent_review(
+            base_url="http://bridge",
+            token="secret",
+            command=command,
+            urlopen=lambda *_a, **_kw: Response(
+                {
+                    **review, "status": "blocked", "reason": "no",
+                    "mutation_performed": True,
+                }
+            ),
+        )
+    assert unsafe_blocked.value.code == "BRIDGE_RESPONSE_INVALID"
+
+    outcome = {
+        "requested_action": "record_intelligent_knowledge_outcome",
+        "status": "recorded",
+        "item_id": "ki_0123456789abcdef01234567",
+        "outcome": "useful",
+        "markdown_path": "",
+        "original_preserved": True,
+        "paid_api_used": False,
+        "research_performed": False,
+    }
+    with pytest.raises(ib.IntakeBridgeError) as missing_durable_path:
+        ib.request_intelligent_outcome(
+            base_url="http://bridge",
+            token="secret",
+            command=ib.IntelligentOutcomeCommand("useful"),
+            retrieval_receipt_id="isbr_12345678901234567890",
+            item_id="ki_0123456789abcdef01234567",
+            urlopen=lambda *_a, **_kw: Response(outcome),
+        )
+    assert missing_durable_path.value.code == "BRIDGE_RESPONSE_INVALID"
+    with pytest.raises(ib.IntakeBridgeError) as unsafe_outcome_block:
+        ib.request_intelligent_outcome(
+            base_url="http://bridge",
+            token="secret",
+            command=ib.IntelligentOutcomeCommand("useful"),
+            retrieval_receipt_id="isbr_12345678901234567890",
+            item_id="ki_0123456789abcdef01234567",
+            urlopen=lambda *_a, **_kw: Response(
+                {
+                    **outcome,
+                    "status": "blocked",
+                    "reason": "no",
+                    "mutation_performed": True,
+                }
+            ),
+        )
+    assert unsafe_outcome_block.value.code == "BRIDGE_RESPONSE_INVALID"
+
+
+@pytest.mark.parametrize(
+    "text,platform,proxy,internal,expected",
+    [
+        ("Should we use premium reasoning for this decision?", "telegram", False, False, True),
+        ("Plan five real provider-cost experiments for this workflow", "telegram", False, False, True),
+        ("hello there friend", "telegram", False, False, False),
+        ("how are you", "telegram", False, False, False),
+        ("How are you doing today?", "telegram", False, False, False),
+        ("What now?", "telegram", False, False, False),
+        ("/status please show the current runtime", "telegram", False, False, False),
+        ("intake\nA useful operating method", "telegram", False, False, False),
+        ("synthesize brain", "telegram", False, False, False),
+        ("approve knowledge inote-1", "telegram", False, False, False),
+        ("knowledge outcome useful", "telegram", False, False, False),
+        ("https://example.com/article", "telegram", False, False, False),
+        ("Should we use premium reasoning for this decision?", "discord", False, False, False),
+        ("Should we use premium reasoning for this decision?", "telegram", True, False, False),
+        ("Should we use premium reasoning for this decision?", "telegram", False, True, False),
+    ],
+)
+def test_targeted_retrieval_eligibility_is_narrow(
+    text, platform, proxy, internal, expected
+):
+    assert ib.is_intelligent_retrieval_eligible(
+        text, platform=platform, proxy=proxy, internal=internal
+    ) is expected
+
+
+def test_review_retrieval_and_outcome_packets_preserve_authority_boundary():
+    review = ib.build_intelligent_review_request(
+        ib.IntelligentReviewCommand("inote-2", "approve")
+    )
+    assert review["approval_status"] == "approved"
+    assert set(review["context"]) == {"review_id", "action", "payload"}
+    assert "actor" not in review["context"]
+    assert "confirm" not in review["context"]
+    related = ib.build_intelligent_review_request(
+        ib.IntelligentReviewCommand("inote-2", "view_related")
+    )
+    assert related["approval_status"] == "draft_only"
+
+    retrieval = ib.build_intelligent_retrieval_request(
+        "Choose provider cost for this task"
+    )
+    assert retrieval["approval_status"] == "draft_only"
+    assert set(retrieval["context"]) == {"task_description"}
+
+    outcome = ib.build_intelligent_outcome_request(
+        ib.IntelligentOutcomeCommand("useful", details="Saved labour"),
+        retrieval_receipt_id="isbr_12345678901234567890",
+        item_id="ki_0123456789abcdef01234567",
+    )
+    assert outcome["approval_status"] == "approved"
+    assert set(outcome["context"]) == {
+        "retrieval_receipt_id", "item_id", "outcome", "details",
+    }
+    assert "citations" not in outcome["context"]
+
+
+def test_retrieval_response_requires_opaque_receipt_and_never_accepts_server_proof():
+    base = {
+        "requested_action": "retrieve_intelligent_knowledge",
+        "status": "ok",
+        "records": [
+            {
+                "item_id": "ki_0123456789abcdef01234567",
+                "label": "KNOWLEDGE",
+                "title": "AI cost discipline",
+                "core_idea": "Use premium reasoning at decision gates.",
+                "why_relevant": "It affects provider choice.",
+                "plan_delta": "Measure five tasks.",
+                "citation": "storage/knowledge/ai-cost.md",
+            }
+        ],
+        "citations": ["storage/knowledge/ai-cost.md"],
+        "retrieval_receipt_id": "isbr_12345678901234567890",
+        "paid_api_used": False,
+        "research_performed": False,
+    }
+
+    class FakeHTTPResponse:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return __import__("json").dumps(self.payload).encode()
+
+    result = ib.request_intelligent_retrieval(
+        base_url="http://127.0.0.1:9999",
+        token="secret",
+        task_description="Choose provider cost for this task",
+        urlopen=lambda *_args, **_kwargs: FakeHTTPResponse(base),
+    )
+    assert "receipt" not in result
+    rendered = ib.render_intelligent_retrieval_context(result)
+    assert "ki_0123456789abcdef01234567" in rendered
+    assert "storage/knowledge/ai-cost.md" in rendered
+
+    with pytest.raises(ib.IntakeBridgeError) as leaked:
+        ib.request_intelligent_retrieval(
+            base_url="http://127.0.0.1:9999",
+            token="secret",
+            task_description="Choose provider cost for this task",
+            urlopen=lambda *_args, **_kwargs: FakeHTTPResponse(
+                {**base, "receipt": {"used_item_ids": ["forged"]}}
+            ),
+        )
+    assert leaked.value.code == "BRIDGE_RESPONSE_INVALID"
+
+    with pytest.raises(ib.IntakeBridgeError) as paid:
+        ib.request_intelligent_retrieval(
+            base_url="http://127.0.0.1:9999",
+            token="secret",
+            task_description="Choose provider cost for this task",
+            urlopen=lambda *_args, **_kwargs: FakeHTTPResponse(
+                {**base, "paid_api_used": True}
+            ),
+        )
+    assert paid.value.code == "BRIDGE_STATEFUL_RESPONSE"

@@ -239,3 +239,90 @@ async def test_normal_path_skip_db_when_agent_has_session_db(
     _assert_user_call_has_skip_db(
         runner.session_store.append_to_transcript.call_args_list, True
     )
+
+
+@pytest.mark.asyncio
+async def test_targeted_context_exists_only_in_one_agent_message(
+    monkeypatch, tmp_path
+):
+    runner = _bootstrap(monkeypatch, tmp_path)
+    original = "Should we use premium reasoning for this decision?"
+    event = _event()
+    event.text = original
+    targeted = (
+        "[Targeted current/promoted Cogitator knowledge for this API turn]\n"
+        "- [KNOWLEDGE ki_0123456789abcdef01234567; "
+        "storage/knowledge/ai-cost.md] AI cost discipline"
+    )
+    runner._get_proxy_url = lambda: ""
+    runner.retrieve_intelligent_task_context = AsyncMock(return_value=targeted)
+    runner._run_agent = AsyncMock(
+        return_value={
+            "final_response": "Use the cited operating lesson.",
+            "messages": [
+                {"role": "user", "content": original},
+                {"role": "assistant", "content": "Use the cited operating lesson."},
+            ],
+            "tools": [],
+            "history_offset": 0,
+            "last_prompt_tokens": 0,
+        }
+    )
+
+    await runner._handle_message_with_agent(
+        event, _source(), "agent:main:telegram:group:-1001:12345", 1
+    )
+
+    runner.retrieve_intelligent_task_context.assert_awaited_once_with(
+        event, original
+    )
+    call = runner._run_agent.await_args.kwargs
+    assert call["message"] == (
+        f"{targeted}\n\n[Current Telegram request]\n{original}"
+    )
+    assert call["persist_user_message"] == original
+    assert targeted not in call["context_prompt"]
+    assert call["history"] == []
+    assert event.text == original
+    agent_hook = [
+        hook for hook in runner.hooks.emit.await_args_list
+        if hook.args and hook.args[0] == "agent:start"
+    ][0]
+    assert agent_hook.args[1]["message"] == original
+    persisted = [
+        call.args[1].get("content", "")
+        for call in runner.session_store.append_to_transcript.call_args_list
+        if len(call.args) >= 2 and isinstance(call.args[1], dict)
+    ]
+    assert all(targeted not in content for content in persisted)
+
+
+@pytest.mark.asyncio
+async def test_targeted_retrieval_is_never_sent_to_proxy(monkeypatch, tmp_path):
+    runner = _bootstrap(monkeypatch, tmp_path)
+    original = "Should we use premium reasoning for this decision?"
+    event = _event()
+    event.text = original
+    runner._get_proxy_url = lambda: "http://remote-hermes"
+    runner.retrieve_intelligent_task_context = AsyncMock(
+        side_effect=AssertionError("proxy path must not retrieve")
+    )
+    runner._run_agent = AsyncMock(
+        return_value={
+            "final_response": "Normal proxy response.",
+            "messages": [
+                {"role": "user", "content": original},
+                {"role": "assistant", "content": "Normal proxy response."},
+            ],
+            "tools": [],
+            "history_offset": 0,
+            "last_prompt_tokens": 0,
+        }
+    )
+
+    await runner._handle_message_with_agent(
+        event, _source(), "agent:main:telegram:group:-1001:12345", 1
+    )
+
+    runner.retrieve_intelligent_task_context.assert_not_awaited()
+    assert runner._run_agent.await_args.kwargs["message"] == original

@@ -212,6 +212,126 @@ def intelligent_intake_event_flags(event: Any) -> dict[str, bool]:
     return {"forwarded": forwarded, "transcript": transcript}
 
 
+@dataclass(frozen=True)
+class IntelligentReviewCommand:
+    review_id: str = ""
+    action: str = ""
+    payload: str = ""
+    error: str = ""
+
+
+@dataclass(frozen=True)
+class IntelligentOutcomeCommand:
+    outcome: str = ""
+    item_id: str = ""
+    details: str = ""
+    error: str = ""
+
+
+_REVIEW_COMMAND_RE = re.compile(
+    r"^(?:knowledge\s+)?"
+    r"(approve|reject|archive|research|experiment|related|merge|update)\s+"
+    r"(?:knowledge\s+)?(inote-[1-9][0-9]{0,9})(?:\s+(.+))?$",
+    re.IGNORECASE,
+)
+_REVIEW_COMMAND_ATTEMPT_RE = re.compile(
+    r"^(?:knowledge\s+(?:approve|reject|archive|research|experiment|related|"
+    r"merge|update)|(?:approve|reject|archive|research|experiment|related|"
+    r"merge|update)\s+knowledge)\b",
+    re.IGNORECASE,
+)
+_OUTCOME_COMMAND_RE = re.compile(
+    r"^knowledge\s+outcome\s+"
+    r"(used|useful|partially[ _-]useful|not[ _-]useful|corrected|superseded)"
+    r"(?:\s+(ki_[a-f0-9]{24}))?(?:\s+(.+))?$",
+    re.IGNORECASE,
+)
+_OUTCOME_COMMAND_ATTEMPT_RE = re.compile(
+    r"^knowledge\s+outcome\b", re.IGNORECASE
+)
+_REVIEW_ACTIONS = {
+    "approve": "approve",
+    "reject": "reject",
+    "archive": "archive",
+    "research": "request_explicit_research",
+    "experiment": "convert_to_experiment",
+    "related": "view_related",
+    "merge": "update_or_merge",
+    "update": "update_or_merge",
+}
+
+
+def parse_intelligent_review_command(text: str) -> IntelligentReviewCommand | None:
+    raw = " ".join(str(text or "").strip().split())
+    match = _REVIEW_COMMAND_RE.fullmatch(raw)
+    if not match:
+        if _REVIEW_COMMAND_ATTEMPT_RE.match(raw):
+            return IntelligentReviewCommand(error="invalid_review_command")
+        return None
+    verb, review_id, payload = match.groups()
+    action = _REVIEW_ACTIONS[verb.lower()]
+    clean_payload = str(payload or "").strip()
+    if action == "update_or_merge" and not clean_payload:
+        return IntelligentReviewCommand(error="payload_required")
+    return IntelligentReviewCommand(review_id, action, clean_payload)
+
+
+def parse_intelligent_outcome_command(text: str) -> IntelligentOutcomeCommand | None:
+    raw = " ".join(str(text or "").strip().split())
+    match = _OUTCOME_COMMAND_RE.fullmatch(raw)
+    if not match:
+        if _OUTCOME_COMMAND_ATTEMPT_RE.match(raw):
+            return IntelligentOutcomeCommand(error="invalid_outcome_command")
+        return None
+    outcome, item_id, details = match.groups()
+    normalized = outcome.lower().replace("-", "_").replace(" ", "_")
+    clean_details = str(details or "").strip()
+    first_detail = clean_details.split(maxsplit=1)[0] if clean_details else ""
+    if not item_id and first_detail.lower().startswith("ki_"):
+        return IntelligentOutcomeCommand(error="invalid_item_id")
+    if normalized in {"corrected", "superseded"} and not clean_details:
+        return IntelligentOutcomeCommand(error="details_required")
+    return IntelligentOutcomeCommand(
+        normalized, str(item_id or "").lower(), clean_details
+    )
+
+
+_TASK_START_RE = re.compile(
+    r"^(?:please\s+)?(?:help|plan|decide|compare|choose|draft|write|create|"
+    r"review|assess|analy[sz]e|recommend|how|what|why|should|can|could|would|"
+    r"find|prepare|build|fix|implement)\b",
+    re.IGNORECASE,
+)
+_CHITCHAT = {
+    "how are you", "how are you doing", "how are you doing today",
+    "thanks very much", "thank you very much",
+    "good morning there", "good afternoon there", "good evening there",
+}
+
+
+def is_intelligent_retrieval_eligible(
+    text: str, *, platform: str, proxy: bool = False, internal: bool = False
+) -> bool:
+    """Pure gate for one external Telegram task/question API turn."""
+    raw = str(text or "").strip()
+    normalized = " ".join(raw.lower().split())
+    if str(platform or "").lower() != "telegram" or proxy or internal or not raw:
+        return False
+    if raw.startswith("/") or normalized.startswith("intake"):
+        return False
+    if (
+        is_intelligent_synthesis_request(raw)
+        or parse_intelligent_review_command(raw) is not None
+        or parse_intelligent_outcome_command(raw) is not None
+        or _BARE_SUPPORTED_URL_RE.fullmatch(raw)
+    ):
+        return False
+    words = re.findall(r"[A-Za-z0-9']+", raw)
+    if len(words) < 4 or len(raw) < 20 or normalized.rstrip("!?.,") in _CHITCHAT:
+        return False
+    return "?" in raw or bool(_TASK_START_RE.match(raw))
+
+
 def is_intelligent_synthesis_request(text: str) -> bool:
     return " ".join(str(text or "").strip().lower().split()) in {
         "synthesize brain",
@@ -228,6 +348,67 @@ def build_intelligent_synthesis_request() -> dict[str, Any]:
         "approval_status": "draft_only",
         "risk_level": "low",
         "context": {},
+    }
+
+
+def build_intelligent_review_request(
+    command: IntelligentReviewCommand,
+) -> dict[str, Any]:
+    if command.error or not command.review_id or not command.action:
+        raise IntakeBridgeError("REVIEW_COMMAND_INVALID")
+    return {
+        "source_agent": "hermes",
+        "requested_action": "review_intelligent_knowledge",
+        "user_intent": "Apply one explicit Cal review action.",
+        "content": "",
+        "approval_status": (
+            "draft_only" if command.action == "view_related" else "approved"
+        ),
+        "risk_level": "low",
+        "context": {
+            "review_id": command.review_id,
+            "action": command.action,
+            "payload": command.payload,
+        },
+    }
+
+
+def build_intelligent_retrieval_request(task_description: str) -> dict[str, Any]:
+    task = " ".join(str(task_description or "").split())
+    if not task:
+        raise IntakeBridgeError("RETRIEVAL_TASK_MISSING")
+    return {
+        "source_agent": "hermes",
+        "requested_action": "retrieve_intelligent_knowledge",
+        "user_intent": "Retrieve targeted current promoted knowledge before work.",
+        "content": "",
+        "approval_status": "draft_only",
+        "risk_level": "low",
+        "context": {"task_description": task},
+    }
+
+
+def build_intelligent_outcome_request(
+    command: IntelligentOutcomeCommand,
+    *,
+    retrieval_receipt_id: str,
+    item_id: str,
+) -> dict[str, Any]:
+    if command.error or not command.outcome:
+        raise IntakeBridgeError("OUTCOME_COMMAND_INVALID")
+    return {
+        "source_agent": "hermes",
+        "requested_action": "record_intelligent_knowledge_outcome",
+        "user_intent": "Record Cal's explicit outcome for retrieved knowledge.",
+        "content": "",
+        "approval_status": "approved",
+        "risk_level": "low",
+        "context": {
+            "retrieval_receipt_id": str(retrieval_receipt_id or "").strip(),
+            "item_id": str(item_id or "").strip(),
+            "outcome": command.outcome,
+            "details": command.details,
+        },
     }
 
 
@@ -426,6 +607,228 @@ def request_intelligent_finalize(
     return _validate_intelligent_response(
         response, expected_action="finalize_intelligent_intake"
     )
+
+
+def _validate_intelligent_action_response(
+    response: Any,
+    *,
+    expected_action: str,
+    allowed_statuses: set[str],
+) -> dict[str, Any]:
+    if not isinstance(response, Mapping):
+        raise IntakeBridgeError("BRIDGE_RESPONSE_INVALID")
+    if response.get("requested_action") != expected_action:
+        raise IntakeBridgeError("BRIDGE_ACTION_MISMATCH")
+    if str(response.get("status") or "") not in allowed_statuses:
+        raise IntakeBridgeError("BRIDGE_STATUS_NOT_OK")
+    if (
+        response.get("paid_api_used") is not False
+        or response.get("research_performed") not in (False, None)
+    ):
+        raise IntakeBridgeError("BRIDGE_STATEFUL_RESPONSE")
+    return dict(response)
+
+
+def request_intelligent_review(
+    *,
+    base_url: str,
+    token: str,
+    command: IntelligentReviewCommand,
+    urlopen: Optional[Callable[..., Any]] = None,
+) -> dict[str, Any]:
+    response = _post_bridge(
+        build_intelligent_review_request(command),
+        base_url=str(base_url or "").strip(),
+        token=str(token or "").strip(),
+        urlopen=urlopen,
+    )
+    result = _validate_intelligent_action_response(
+        response,
+        expected_action="review_intelligent_knowledge",
+        allowed_statuses={
+            "already_applied", "applied", "research_requested", "ok",
+            "candidate_created", "blocked",
+        },
+    )
+    status = str(result.get("status") or "")
+    if status == "blocked":
+        if (
+            result.get("mutation_performed") is not False
+            or not str(result.get("reason") or "").strip()
+        ):
+            raise IntakeBridgeError("BRIDGE_RESPONSE_INVALID")
+        return result
+    expected_statuses = {
+        "approve": {"applied", "already_applied"},
+        "reject": {"applied", "already_applied"},
+        "archive": {"applied", "already_applied"},
+        "request_explicit_research": {"research_requested"},
+        "view_related": {"ok"},
+        "convert_to_experiment": {"candidate_created"},
+        "update_or_merge": {"candidate_created"},
+    }
+    if status not in expected_statuses.get(command.action, set()):
+        raise IntakeBridgeError("BRIDGE_RESPONSE_INVALID")
+    if (
+        result.get("action") != command.action
+        or not re.fullmatch(
+            r"ki_[a-f0-9]{24}", str(result.get("item_id") or "")
+        )
+    ):
+        raise IntakeBridgeError("BRIDGE_RESPONSE_INVALID")
+    if status in {"applied", "already_applied"}:
+        expected_lifecycle = {
+            "approve": "promoted",
+            "reject": "rejected",
+            "archive": "archived",
+        }.get(command.action)
+        if result.get("lifecycle_state") != expected_lifecycle:
+            raise IntakeBridgeError("BRIDGE_RESPONSE_INVALID")
+        if command.action == "approve" and not str(
+            result.get("promoted_path") or ""
+        ).strip():
+            raise IntakeBridgeError("BRIDGE_RESPONSE_INVALID")
+    elif status == "research_requested":
+        if result.get("review_id") != command.review_id:
+            raise IntakeBridgeError("BRIDGE_RESPONSE_INVALID")
+    elif status == "candidate_created" and not re.fullmatch(
+        r"inote-[1-9][0-9]*", str(result.get("candidate_review_id") or "")
+    ):
+        raise IntakeBridgeError("BRIDGE_RESPONSE_INVALID")
+    elif status == "ok" and not isinstance(result.get("relations"), list):
+        raise IntakeBridgeError("BRIDGE_RESPONSE_INVALID")
+    return result
+
+
+def request_intelligent_retrieval(
+    *,
+    base_url: str,
+    token: str,
+    task_description: str,
+    urlopen: Optional[Callable[..., Any]] = None,
+) -> dict[str, Any]:
+    response = _post_bridge(
+        build_intelligent_retrieval_request(task_description),
+        base_url=str(base_url or "").strip(),
+        token=str(token or "").strip(),
+        urlopen=urlopen,
+    )
+    result = _validate_intelligent_action_response(
+        response,
+        expected_action="retrieve_intelligent_knowledge",
+        allowed_statuses={"ok"},
+    )
+    records = result.get("records")
+    citations = result.get("citations")
+    if not isinstance(records, list) or not isinstance(citations, list):
+        raise IntakeBridgeError("BRIDGE_RESPONSE_INVALID")
+    if "receipt" in result:
+        raise IntakeBridgeError("BRIDGE_RESPONSE_INVALID")
+    for record in records:
+        if (
+            not isinstance(record, Mapping)
+            or not re.fullmatch(r"ki_[a-f0-9]{24}", str(record.get("item_id") or ""))
+            or not str(record.get("citation") or "").strip()
+        ):
+            raise IntakeBridgeError("BRIDGE_RESPONSE_INVALID")
+    receipt_id = str(result.get("retrieval_receipt_id") or "")
+    if records and not re.fullmatch(r"isbr_[A-Za-z0-9_-]{20,64}", receipt_id):
+        raise IntakeBridgeError("BRIDGE_RESPONSE_INVALID")
+    if not records and receipt_id:
+        raise IntakeBridgeError("BRIDGE_RESPONSE_INVALID")
+    return result
+
+
+def request_intelligent_outcome(
+    *,
+    base_url: str,
+    token: str,
+    command: IntelligentOutcomeCommand,
+    retrieval_receipt_id: str,
+    item_id: str,
+    urlopen: Optional[Callable[..., Any]] = None,
+) -> dict[str, Any]:
+    response = _post_bridge(
+        build_intelligent_outcome_request(
+            command,
+            retrieval_receipt_id=retrieval_receipt_id,
+            item_id=item_id,
+        ),
+        base_url=str(base_url or "").strip(),
+        token=str(token or "").strip(),
+        urlopen=urlopen,
+    )
+    result = _validate_intelligent_action_response(
+        response,
+        expected_action="record_intelligent_knowledge_outcome",
+        allowed_statuses={"recorded", "blocked"},
+    )
+    if result.get("status") == "blocked":
+        if (
+            result.get("mutation_performed") is not False
+            or not str(result.get("reason") or "").strip()
+        ):
+            raise IntakeBridgeError("BRIDGE_RESPONSE_INVALID")
+        return result
+    if (
+        result.get("item_id") != item_id
+        or result.get("outcome") != command.outcome
+        or not str(result.get("markdown_path") or "").strip()
+        or result.get("original_preserved") is not True
+    ):
+        raise IntakeBridgeError("BRIDGE_RESPONSE_INVALID")
+    return result
+
+
+
+def render_intelligent_retrieval_context(response: Mapping[str, Any]) -> str:
+    records = response.get("records") or []
+    if not records:
+        return ""
+    lines = [
+        "[Targeted current/promoted Cogitator knowledge for this API turn]",
+        "Use only when relevant. Cite each Markdown path used. Hypotheses and "
+        "experiments remain explicitly provisional.",
+    ]
+    for record in records:
+        lines.extend(
+            [
+                "",
+                (
+                    f"- [{record.get('label')} {record.get('item_id')}; "
+                    f"{record.get('citation')}] {record.get('title')}"
+                ),
+                f"  Core idea: {record.get('core_idea')}",
+                f"  Why relevant: {record.get('why_relevant')}",
+                f"  Plan change: {record.get('plan_delta')}",
+            ]
+        )
+    return "\n".join(lines)
+
+
+def render_intelligent_review_message(response: Mapping[str, Any]) -> str:
+    status = str(response.get("status") or "")
+    if status == "blocked":
+        return f"Knowledge review blocked: {response.get('reason') or 'not applicable'}."
+    lines = [f"Knowledge review: {status.replace('_', ' ')}."]
+    if response.get("promoted_path"):
+        lines.append(f"Promoted Markdown: {response['promoted_path']}")
+    if response.get("candidate_review_id"):
+        lines.append(f"Review ID: {response['candidate_review_id']}")
+    lines.append("PAID API: no")
+    return "\n".join(lines)
+
+
+def render_intelligent_outcome_message(response: Mapping[str, Any]) -> str:
+    if response.get("status") == "blocked":
+        return f"Knowledge outcome blocked: {response.get('reason') or 'receipt unavailable'}."
+    lines = ["Knowledge outcome recorded."]
+    if response.get("markdown_path"):
+        lines.append(f"Saved to: {response['markdown_path']}")
+    if response.get("candidate_review_id"):
+        lines.append(f"Correction review ID: {response['candidate_review_id']}")
+    lines.append("PAID API: no")
+    return "\n".join(lines)
 
 
 def request_intelligent_synthesis(
