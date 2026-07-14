@@ -6913,6 +6913,47 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Otherwise control/session commands like /new or /help get silently
         # consumed as update answers instead of being dispatched normally.
         _quick_key = self._session_key_for_source(source)
+
+        # Explicit ISB review/outcome controls are authority-bearing actions.
+        # Route them only from authenticated, direct Telegram messages, before
+        # generic free-text update/clarify interceptors can consume them.
+        try:
+            from gateway.cogitator_intake_bridge import (
+                intelligent_intake_event_flags,
+                parse_intelligent_outcome_command,
+                parse_intelligent_review_command,
+            )
+            _intelligent_flags = intelligent_intake_event_flags(event)
+            _intelligent_review = parse_intelligent_review_command(
+                event.text or ""
+            )
+            _intelligent_outcome = parse_intelligent_outcome_command(
+                event.text or ""
+            )
+        except Exception:
+            logger.exception(
+                "Gateway intelligent-control routing failed closed "
+                "(session=%s)", _quick_key,
+            )
+            return (
+                "Intelligent knowledge control routing failed safely.\n"
+                "No research or promotion was performed."
+            )
+        _direct_intelligent_control = (
+            source.platform == Platform.TELEGRAM
+            and not is_internal
+            and not _intelligent_flags["forwarded"]
+            and not _intelligent_flags["transcript"]
+        )
+        if _direct_intelligent_control and _intelligent_review is not None:
+            return await self.handle_intelligent_review(
+                event, _intelligent_review
+            )
+        if _direct_intelligent_control and _intelligent_outcome is not None:
+            return await self.handle_intelligent_outcome(
+                event, _intelligent_outcome
+            )
+
         _update_prompts = getattr(self, "_update_prompt_pending", {})
         if _update_prompts.get(_quick_key):
             raw = (event.text or "").strip()
@@ -7040,11 +7081,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # legacy parser below; URL-plus-question remains normal conversation.
         try:
             from gateway.cogitator_intake_bridge import (
-                intelligent_intake_event_flags,
                 is_intelligent_synthesis_request,
                 parse_intelligent_intake,
             )
-            _intelligent_flags = intelligent_intake_event_flags(event)
             _intelligent_intake = parse_intelligent_intake(
                 event.text or "", **_intelligent_flags
             )
@@ -9136,6 +9175,44 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception as _ts_err:
             logger.debug("Message timestamp injection failed (non-fatal): %s", _ts_err)
 
+        # Retrieve only for a real external Telegram task/question. Keep the
+        # retrieved packet out of event.text, context_prompt, hooks, history,
+        # persisted transcripts, proxy calls, and queued follow-ups: it exists
+        # solely in the message argument for this one local provider API turn.
+        api_message_text = message_text
+        try:
+            from gateway.cogitator_intake_bridge import (
+                is_intelligent_retrieval_eligible,
+            )
+
+            retrieval_task = (
+                persist_user_message
+                if persist_user_message is not None
+                else message_text
+            )
+            platform_name = (
+                source.platform.value if source.platform else ""
+            )
+            if is_intelligent_retrieval_eligible(
+                retrieval_task,
+                platform=platform_name,
+                proxy=bool(self._get_proxy_url()),
+                internal=bool(getattr(event, "internal", False)),
+            ):
+                targeted_context = await self.retrieve_intelligent_task_context(
+                    event, retrieval_task
+                )
+                if targeted_context:
+                    api_message_text = (
+                        f"{targeted_context}\n\n"
+                        f"[Current Telegram request]\n{message_text}"
+                    )
+        except Exception as _retrieval_err:
+            logger.warning(
+                "Targeted intelligent retrieval failed open: %s",
+                type(_retrieval_err).__name__,
+            )
+
         # Bind this gateway run generation to the adapter's active-session
         # event so deferred post-delivery callbacks can be released by the
         # same run that registered them.
@@ -9160,7 +9237,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             # Run the agent
             agent_result = await self._run_agent(
-                message=message_text,
+                message=api_message_text,
                 context_prompt=context_prompt,
                 history=history,
                 source=source,
@@ -15539,7 +15616,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if _reason == "shutdown_timeout"
                     else "a gateway interruption"
                 )
-                _persist_user_message_override = message
+                if _persist_user_message_override is None:
+                    _persist_user_message_override = message
                 message = (
                     f"[System note: A new message has arrived. The previous turn "
                     f"was interrupted by {_reason_phrase}. "
@@ -15550,7 +15628,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     + message
                 )
             elif _has_fresh_tool_tail:
-                _persist_user_message_override = message
+                if _persist_user_message_override is None:
+                    _persist_user_message_override = message
                 message = (
                     "[System note: A new message has arrived. The conversation "
                     "history contains pending tool outputs from an interrupted turn. "

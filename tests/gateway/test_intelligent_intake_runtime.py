@@ -176,3 +176,142 @@ async def test_intake_handler_orders_prepare_reason_finalize_and_renders_receipt
 
     assert sequence == ["prepare", "reason", "finalize"]
     assert result == final["telegram_message"]
+
+
+def _retrieval_response():
+    return {
+        "requested_action": "retrieve_intelligent_knowledge",
+        "status": "ok",
+        "records": [
+            {
+                "item_id": "ki_0123456789abcdef01234567",
+                "label": "KNOWLEDGE",
+                "title": "AI cost discipline",
+                "core_idea": "Use premium reasoning at decision gates.",
+                "why_relevant": "It affects provider choice.",
+                "plan_delta": "Measure five tasks.",
+                "citation": "storage/knowledge/ai-cost.md",
+            }
+        ],
+        "citations": ["storage/knowledge/ai-cost.md"],
+        "retrieval_receipt_id": "isbr_12345678901234567890",
+        "paid_api_used": False,
+        "research_performed": False,
+    }
+
+
+@pytest.mark.asyncio
+async def test_targeted_retrieval_stores_only_opaque_session_handle(monkeypatch):
+    import gateway.cogitator_intake_bridge as bridge
+
+    harness = RuntimeHarness()
+    harness._intake_config = lambda: (True, "http://bridge", "")
+    monkeypatch.setenv(bridge.TOKEN_ENV, "secret")
+    monkeypatch.setattr(
+        bridge,
+        "request_intelligent_retrieval",
+        lambda **_kwargs: _retrieval_response(),
+    )
+
+    rendered = await harness.retrieve_intelligent_task_context(
+        _event("Should we use premium reasoning for this decision?"),
+        "Should we use premium reasoning for this decision?",
+    )
+
+    assert "storage/knowledge/ai-cost.md" in rendered
+    state = harness._active_intelligent_retrieval_context(
+        _event("Should we use premium reasoning for this decision?")
+    )
+    assert state == {
+        "retrieval_receipt_id": "isbr_12345678901234567890",
+        "item_ids": ["ki_0123456789abcdef01234567"],
+        "ts": state["ts"],
+    }
+    assert "citations" not in state
+    assert "records" not in state
+
+
+@pytest.mark.asyncio
+async def test_review_and_outcome_handlers_use_explicit_authority(monkeypatch):
+    import gateway.cogitator_intake_bridge as bridge
+
+    harness = RuntimeHarness()
+    harness._intake_config = lambda: (True, "http://bridge", "")
+    monkeypatch.setenv(bridge.TOKEN_ENV, "secret")
+    event = _event("approve knowledge inote-7")
+    seen = {}
+
+    def review(**kwargs):
+        seen["review"] = kwargs
+        return {
+            "requested_action": "review_intelligent_knowledge",
+            "status": "applied",
+            "promoted_path": "storage/promoted/ai-cost.md",
+            "paid_api_used": False,
+            "research_performed": False,
+        }
+
+    monkeypatch.setattr(bridge, "request_intelligent_review", review)
+    review_result = await harness.handle_intelligent_review(
+        event, bridge.parse_intelligent_review_command(event.text)
+    )
+    assert "Promoted Markdown" in review_result
+    assert seen["review"]["command"].action == "approve"
+
+    harness._set_intelligent_retrieval_context(event, _retrieval_response())
+
+    def outcome(**kwargs):
+        seen["outcome"] = kwargs
+        return {
+            "requested_action": "record_intelligent_knowledge_outcome",
+            "status": "recorded",
+            "markdown_path": "storage/notes/outcome.md",
+            "paid_api_used": False,
+            "research_performed": False,
+        }
+
+    monkeypatch.setattr(bridge, "request_intelligent_outcome", outcome)
+    command = bridge.parse_intelligent_outcome_command(
+        "knowledge outcome useful Reduced cost"
+    )
+    outcome_result = await harness.handle_intelligent_outcome(event, command)
+    assert "Knowledge outcome recorded" in outcome_result
+    assert seen["outcome"]["retrieval_receipt_id"] == (
+        "isbr_12345678901234567890"
+    )
+    assert seen["outcome"]["item_id"] == "ki_0123456789abcdef01234567"
+
+
+@pytest.mark.asyncio
+async def test_retrieval_handle_expires_and_wrong_item_fails_before_bridge(monkeypatch):
+    import gateway.cogitator_intake_bridge as bridge
+    import gateway.slash_commands as slash_commands
+
+    now = [100.0]
+    monkeypatch.setattr(slash_commands.time, "time", lambda: now[0])
+    harness = RuntimeHarness()
+    event = _event("knowledge outcome useful")
+    harness._set_intelligent_retrieval_context(event, _retrieval_response())
+    assert harness._active_intelligent_retrieval_context(event)
+    now[0] += harness._INTELLIGENT_RETRIEVAL_TTL_SECONDS
+    assert harness._active_intelligent_retrieval_context(event) is None
+
+    harness._set_intelligent_retrieval_context(event, _retrieval_response())
+    command = bridge.parse_intelligent_outcome_command(
+        "knowledge outcome useful ki_ffffffffffffffffffffffff"
+    )
+    monkeypatch.setattr(
+        bridge,
+        "request_intelligent_outcome",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("wrong item must fail before bridge")
+        ),
+    )
+    result = await harness.handle_intelligent_outcome(event, command)
+    assert result == "That item was not cited in the latest targeted retrieval."
+
+    malformed = bridge.parse_intelligent_outcome_command(
+        "knowledge outcome useful ki_not-a-real-item Saved labour"
+    )
+    result = await harness.handle_intelligent_outcome(event, malformed)
+    assert result.startswith("Knowledge outcome format:")

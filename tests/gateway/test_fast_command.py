@@ -2,6 +2,7 @@
 
 import sys
 import threading
+import time
 import types
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -193,3 +194,76 @@ async def test_run_agent_passes_priority_processing_to_gateway_agent(monkeypatch
     assert result["final_response"] == "ok"
     assert _CapturingAgent.last_init["service_tier"] == "priority"
     assert _CapturingAgent.last_init["request_overrides"] == {"service_tier": "priority"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("interruption", ["resume_pending", "tool_tail"])
+async def test_run_agent_keeps_targeted_context_out_of_persisted_resume_message(
+    monkeypatch, tmp_path, interruption
+):
+    _install_fake_agent(monkeypatch)
+    runner = _make_runner()
+    session_key = "agent:main:telegram:dm:12345"
+    runner.session_store._entries = {}
+    history = [
+        {
+            "role": "assistant",
+            "content": "unfinished work",
+            "timestamp": time.time(),
+        }
+    ]
+    if interruption == "resume_pending":
+        runner.session_store._entries[session_key] = SimpleNamespace(
+            resume_pending=True,
+            resume_reason="restart_timeout",
+        )
+    else:
+        history = [
+            {
+                "role": "tool",
+                "content": "pending result",
+                "tool_call_id": "call-1",
+                "timestamp": time.time(),
+            }
+        ]
+
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_env_path", tmp_path / ".env")
+    monkeypatch.setattr(gateway_run, "load_dotenv", lambda *args, **kwargs: None)
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
+    monkeypatch.setattr(gateway_run, "_load_gateway_runtime_config", lambda: {})
+    monkeypatch.setattr(
+        gateway_run, "_resolve_gateway_model", lambda config=None: "gpt-5.4"
+    )
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_runtime_agent_kwargs",
+        lambda: {
+            "provider": "openai-codex",
+            "api_mode": "codex_responses",
+            "api_key": "***",
+        },
+    )
+    import hermes_cli.tools_config as tools_config
+    monkeypatch.setattr(
+        tools_config,
+        "_get_platform_tools",
+        lambda _config, _platform: {"core"},
+    )
+
+    clean = "Should we use premium reasoning for this decision?"
+    targeted = "[Targeted current/promoted Cogitator knowledge]\n" + clean
+    _CapturingAgent.last_run = None
+    await runner._run_agent(
+        message=targeted,
+        context_prompt="",
+        history=history,
+        source=_make_source(),
+        session_id="session-1",
+        session_key=session_key,
+        persist_user_message=clean,
+    )
+
+    assert _CapturingAgent.last_run["persist_user_message"] == clean
+    assert targeted in _CapturingAgent.last_run["user_message"]
+    assert _CapturingAgent.last_run["user_message"].startswith("[System note:")

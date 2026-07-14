@@ -2030,6 +2030,79 @@ class GatewaySlashCommandsMixin:
         return origin
 
 
+    _INTELLIGENT_RETRIEVAL_TTL_SECONDS = 25 * 60
+    _MAX_INTELLIGENT_RETRIEVAL_STATES = 64
+
+    def _intelligent_retrieval_states(self) -> dict[str, dict[str, Any]]:
+        states = getattr(self, "_intelligent_retrieval_ctx", None)
+        if not isinstance(states, dict):
+            states = {}
+            setattr(self, "_intelligent_retrieval_ctx", states)
+        now = time.time()
+        for key, value in list(states.items()):
+            if now - float(value.get("ts") or 0) >= self._INTELLIGENT_RETRIEVAL_TTL_SECONDS:
+                states.pop(key, None)
+        return states
+
+    def _set_intelligent_retrieval_context(
+        self, event: MessageEvent, response: dict[str, Any]
+    ) -> None:
+        states = self._intelligent_retrieval_states()
+        key = build_session_key(event.source)
+        states.pop(key, None)
+        records = response.get("records") or []
+        if not records:
+            return
+        while len(states) >= self._MAX_INTELLIGENT_RETRIEVAL_STATES:
+            states.pop(next(iter(states)))
+        states[key] = {
+            "retrieval_receipt_id": str(
+                response.get("retrieval_receipt_id") or ""
+            ),
+            "item_ids": [str(record.get("item_id") or "") for record in records],
+            "ts": time.time(),
+        }
+
+    def _active_intelligent_retrieval_context(
+        self, event: MessageEvent
+    ) -> Optional[dict[str, Any]]:
+        return self._intelligent_retrieval_states().get(
+            build_session_key(event.source)
+        )
+
+    async def retrieve_intelligent_task_context(
+        self, event: MessageEvent, task_description: str
+    ) -> str:
+        from gateway.cogitator_intake_bridge import (
+            TOKEN_ENV,
+            request_intelligent_retrieval,
+            render_intelligent_retrieval_context,
+        )
+
+        self._intelligent_retrieval_states().pop(
+            build_session_key(event.source), None
+        )
+        enabled, base_url, _local_dir = self._intake_config()
+        token = str(os.environ.get(TOKEN_ENV, "") or "").strip()
+        if not enabled or not base_url or not token:
+            return ""
+        try:
+            result = await asyncio.to_thread(
+                request_intelligent_retrieval,
+                base_url=base_url,
+                token=token,
+                task_description=task_description,
+            )
+            self._set_intelligent_retrieval_context(event, result)
+            return render_intelligent_retrieval_context(result)
+        except Exception as exc:
+            logger.warning(
+                "[intelligent_retrieval] unavailable: %s",
+                getattr(exc, "code", type(exc).__name__),
+            )
+            return ""
+
+
     async def _run_isolated_intelligent_assessment(
         self, prompt: str, event: MessageEvent
     ) -> dict:
@@ -2192,6 +2265,97 @@ class GatewaySlashCommandsMixin:
         except Exception:
             logger.exception("[intelligent_synthesis] unexpected failure")
             return "Brain synthesis failed safely."
+
+
+    async def handle_intelligent_review(self, event: MessageEvent, command) -> str:
+        from gateway.cogitator_intake_bridge import (
+            TOKEN_ENV,
+            IntakeBridgeError,
+            render_intelligent_review_message,
+            request_intelligent_review,
+        )
+
+        if command.error:
+            return (
+                "Knowledge review format: approve knowledge inote-N; reject, "
+                "archive, research, experiment, related, merge, and update "
+                "use the same form. Merge/update also require a short payload."
+            )
+        enabled, base_url, _local_dir = self._intake_config()
+        token = str(os.environ.get(TOKEN_ENV, "") or "").strip()
+        if not enabled or not base_url or not token:
+            return "Knowledge review is unavailable: intake bridge not configured."
+        try:
+            result = await asyncio.to_thread(
+                request_intelligent_review,
+                base_url=base_url,
+                token=token,
+                command=command,
+            )
+            return render_intelligent_review_message(result)
+        except IntakeBridgeError as exc:
+            logger.warning("[intelligent_review] bridge error code=%s", exc.code)
+            return f"Knowledge review unavailable.\nReason: {exc.code}."
+        except Exception:
+            logger.exception("[intelligent_review] unexpected failure")
+            return "Knowledge review failed safely."
+
+
+    async def handle_intelligent_outcome(
+        self, event: MessageEvent, command
+    ) -> str:
+        from gateway.cogitator_intake_bridge import (
+            TOKEN_ENV,
+            IntakeBridgeError,
+            render_intelligent_outcome_message,
+            request_intelligent_outcome,
+        )
+
+        if command.error:
+            return (
+                "Knowledge outcome format: knowledge outcome useful "
+                "[ki_item] [details]. Corrected and superseded require details."
+            )
+        receipt = self._active_intelligent_retrieval_context(event)
+        if not receipt:
+            return (
+                "No active cited-knowledge receipt. Ask a relevant task question "
+                "first, then record the outcome within 25 minutes."
+            )
+        item_ids = list(receipt.get("item_ids") or [])
+        item_id = str(command.item_id or "")
+        if not item_id:
+            if len(item_ids) != 1:
+                return (
+                    "Choose the knowledge item explicitly: "
+                    + ", ".join(item_ids)
+                )
+            item_id = item_ids[0]
+        if item_id not in item_ids:
+            return "That item was not cited in the latest targeted retrieval."
+
+        enabled, base_url, _local_dir = self._intake_config()
+        token = str(os.environ.get(TOKEN_ENV, "") or "").strip()
+        if not enabled or not base_url or not token:
+            return "Knowledge outcome is unavailable: intake bridge not configured."
+        try:
+            result = await asyncio.to_thread(
+                request_intelligent_outcome,
+                base_url=base_url,
+                token=token,
+                command=command,
+                retrieval_receipt_id=str(
+                    receipt.get("retrieval_receipt_id") or ""
+                ),
+                item_id=item_id,
+            )
+            return render_intelligent_outcome_message(result)
+        except IntakeBridgeError as exc:
+            logger.warning("[intelligent_outcome] bridge error code=%s", exc.code)
+            return f"Knowledge outcome unavailable.\nReason: {exc.code}."
+        except Exception:
+            logger.exception("[intelligent_outcome] unexpected failure")
+            return "Knowledge outcome failed safely."
 
 
     async def handle_intake_message(self, event: MessageEvent, cmd) -> str:

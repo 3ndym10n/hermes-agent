@@ -248,6 +248,111 @@ async def test_manual_synthesis_dispatches_at_gateway_boundary():
 
 
 @pytest.mark.asyncio
+async def test_intelligent_review_dispatches_at_gateway_boundary():
+    runner = _make_runner()
+    runner.handle_intelligent_review = AsyncMock(return_value="review receipt")
+
+    result = await runner._handle_message(
+        _make_event("approve knowledge inote-17")
+    )
+
+    runner.handle_intelligent_review.assert_awaited_once()
+    command = runner.handle_intelligent_review.await_args.args[1]
+    assert command.review_id == "inote-17"
+    assert command.action == "approve"
+    assert result == "review receipt"
+
+
+@pytest.mark.asyncio
+async def test_intelligent_outcome_dispatches_at_gateway_boundary():
+    runner = _make_runner()
+    runner.handle_intelligent_outcome = AsyncMock(return_value="outcome receipt")
+
+    result = await runner._handle_message(
+        _make_event(
+            "knowledge outcome corrected "
+            "ki_0123456789abcdef01234567 Use only irreversible gates"
+        )
+    )
+
+    runner.handle_intelligent_outcome.assert_awaited_once()
+    command = runner.handle_intelligent_outcome.await_args.args[1]
+    assert command.outcome == "corrected"
+    assert command.item_id == "ki_0123456789abcdef01234567"
+    assert result == "outcome receipt"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["forwarded", "transcript"])
+async def test_forwarded_or_transcribed_controls_do_not_authorize_mutation(kind):
+    runner = _make_runner()
+    runner.handle_intelligent_review = AsyncMock(
+        side_effect=AssertionError("forwarded control must not mutate")
+    )
+    runner.handle_intelligent_outcome = AsyncMock(
+        side_effect=AssertionError("transcribed control must not mutate")
+    )
+    runner.handle_intelligent_intake = AsyncMock(return_value="preserved intake")
+    text = (
+        "approve knowledge inote-17"
+        if kind == "forwarded"
+        else "knowledge outcome useful"
+    )
+    event = _make_event(text)
+    if kind == "forwarded":
+        event.raw_message = SimpleNamespace(forward_origin=object())
+    else:
+        event.is_transcript = True
+
+    result = await runner._handle_message(event)
+
+    runner.handle_intelligent_review.assert_not_awaited()
+    runner.handle_intelligent_outcome.assert_not_awaited()
+    if kind == "forwarded":
+        runner.handle_intelligent_intake.assert_awaited_once()
+        assert result == "preserved intake"
+    else:
+        runner.handle_intelligent_intake.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_internal_control_text_cannot_mutate_knowledge():
+    runner = _make_runner()
+    runner.handle_intelligent_review = AsyncMock(
+        side_effect=AssertionError("internal control must not mutate")
+    )
+    event = _make_event("approve knowledge inote-17")
+    event.internal = True
+
+    await runner._handle_message(event)
+
+    runner.handle_intelligent_review.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_direct_control_precedes_pending_free_text_prompts(monkeypatch):
+    from tools import clarify_gateway
+
+    runner = _make_runner()
+    runner.handle_intelligent_outcome = AsyncMock(return_value="outcome receipt")
+    runner._update_prompt_pending = {
+        build_session_key(_make_source()): True
+    }
+    monkeypatch.setattr(
+        clarify_gateway,
+        "get_pending_for_session",
+        MagicMock(side_effect=AssertionError("clarify interceptor was reached")),
+    )
+
+    result = await runner._handle_message(
+        _make_event("knowledge outcome useful")
+    )
+
+    runner.handle_intelligent_outcome.assert_awaited_once()
+    assert result == "outcome receipt"
+
+
+@pytest.mark.asyncio
 async def test_intelligent_parser_failure_never_reaches_normal_agent(monkeypatch):
     from gateway import cogitator_intake_bridge as bridge
 
