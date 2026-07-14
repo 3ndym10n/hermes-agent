@@ -596,7 +596,8 @@ def test_response_usage_client_validates_provenance_and_no_promotion():
             "Use [ki_0123456789abcdef01234567]"
             "(storage/knowledge/ai-cost.md)."
         ),
-        "used_item_ids": ["ki_0123456789abcdef01234567"],
+        "used_item_ids": [],
+        "retrieved_item_ids": ["ki_0123456789abcdef01234567"],
         "other_context_sources": ["tool:session_search"],
         "provider_path": "openai-codex:gpt-5",
         "paid_web_research_api_used": False,
@@ -606,6 +607,18 @@ def test_response_usage_client_validates_provenance_and_no_promotion():
         urlopen=lambda *_args, **_kwargs: FakeHTTPResponse(payload),
     )
     assert result["candidate_review_id"] == "inote-8"
+
+    with pytest.raises(ib.IntakeBridgeError) as forged:
+        ib.request_intelligent_response_usage(
+            **kwargs,
+            urlopen=lambda *_args, **_kwargs: FakeHTTPResponse(
+                {
+                    **payload,
+                    "used_item_ids": ["ki_ffffffffffffffffffffffff"],
+                }
+            ),
+        )
+    assert forged.value.code == "BRIDGE_RESPONSE_INVALID"
 
     with pytest.raises(ib.IntakeBridgeError) as promoted:
         ib.request_intelligent_response_usage(

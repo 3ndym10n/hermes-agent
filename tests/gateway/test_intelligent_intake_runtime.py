@@ -317,6 +317,9 @@ async def test_review_and_outcome_handlers_use_explicit_authority(monkeypatch):
     assert seen["usage"]["used_item_ids"] == [
         "ki_0123456789abcdef01234567"
     ]
+    assert seen["usage"]["retrieved_item_ids"] == [
+        "ki_0123456789abcdef01234567"
+    ]
     assert seen["usage"]["other_context_sources"] == [
         "tool:session_search"
     ]
@@ -352,6 +355,55 @@ async def test_review_and_outcome_handlers_use_explicit_authority(monkeypatch):
         "isbr_12345678901234567890"
     )
     assert seen["outcome"]["item_id"] == "ki_0123456789abcdef01234567"
+
+
+@pytest.mark.asyncio
+async def test_markerless_grounded_response_uses_server_confirmation(monkeypatch):
+    import gateway.cogitator_intake_bridge as bridge
+
+    harness = RuntimeHarness()
+    harness._intake_config = lambda: (True, "http://bridge", "")
+    monkeypatch.setenv(bridge.TOKEN_ENV, "secret")
+    event = _event("What is our Hermes fork update policy?")
+    harness._set_intelligent_retrieval_context(event, _retrieval_response())
+    seen = {}
+
+    def usage(**kwargs):
+        seen.update(kwargs)
+        return {
+            "requested_action": "record_intelligent_response_usage",
+            "status": "recorded",
+            "response_task_id": kwargs["response_task_id"],
+            "provenance_markdown_path": "Outcomes/provenance.md",
+            "used_item_ids": ["ki_0123456789abcdef01234567"],
+            "candidate_review_id": "inote-10",
+            "promotion_performed": False,
+            "paid_api_used": False,
+            "research_performed": False,
+        }
+
+    monkeypatch.setattr(bridge, "request_intelligent_response_usage", usage)
+    response = await harness.record_intelligent_response_usage(
+        event,
+        (
+            "Never auto-merge or auto-deploy upstream changes. "
+            "Compare upstream and choose cherry-pick, merge, wait, or ignore."
+        ),
+        {
+            "messages": [],
+            "history_offset": 0,
+            "provider": "openai-codex",
+            "model": "gpt-5.5",
+            "session_id": "session-markerless",
+        },
+    )
+    assert seen["used_item_ids"] == []
+    assert seen["retrieved_item_ids"] == [
+        "ki_0123456789abcdef01234567"
+    ]
+    assert response.endswith(
+        "KNOWLEDGE USED:\n- ki_0123456789abcdef01234567"
+    )
 
 
 @pytest.mark.asyncio

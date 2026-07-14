@@ -2198,6 +2198,9 @@ class GatewaySlashCommandsMixin:
                 response_task_id=response_task_id,
                 response_text=cleaned[:16000],
                 used_item_ids=used_item_ids,
+                retrieved_item_ids=[
+                    str(record.get("item_id") or "") for record in records
+                ],
                 other_context_sources=[
                     f"tool:{name}" for name in sorted(tool_names)
                 ],
