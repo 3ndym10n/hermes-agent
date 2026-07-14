@@ -188,3 +188,85 @@ async def test_btw_dispatches_mid_run():
     runner._handle_background_command.assert_awaited_once()
     assert result is not None
     assert "can't run mid-turn" not in result
+
+
+@pytest.mark.asyncio
+async def test_intelligent_bare_url_dispatches_at_gateway_boundary():
+    runner = _make_runner()
+    runner.handle_intelligent_intake = AsyncMock(return_value="intelligent receipt")
+
+    result = await runner._handle_message(
+        _make_event("https://x.com/i/status/2076300807189024873")
+    )
+
+    runner.handle_intelligent_intake.assert_awaited_once()
+    intake = runner.handle_intelligent_intake.await_args.args[1]
+    assert intake.input_kind == "bare_url"
+    assert result == "intelligent receipt"
+
+
+@pytest.mark.asyncio
+async def test_intelligent_forwarded_post_dispatches_at_gateway_boundary():
+    runner = _make_runner()
+    runner.handle_intelligent_intake = AsyncMock(return_value="forwarded receipt")
+    event = _make_event("Forwarded operating playbook")
+    event.raw_message = SimpleNamespace(forward_origin=object())
+
+    result = await runner._handle_message(event)
+
+    intake = runner.handle_intelligent_intake.await_args.args[1]
+    assert intake.input_kind == "forwarded_post"
+    assert result == "forwarded receipt"
+
+
+@pytest.mark.asyncio
+async def test_url_plus_question_does_not_dispatch_intelligent_intake():
+    runner = _make_runner()
+    runner.handle_intelligent_intake = AsyncMock(
+        side_effect=AssertionError("question must stay conversational")
+    )
+
+    await runner._handle_message(
+        _make_event(
+            "What do you think of "
+            "https://x.com/i/status/2076300807189024873?"
+        )
+    )
+
+    runner.handle_intelligent_intake.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_manual_synthesis_dispatches_at_gateway_boundary():
+    runner = _make_runner()
+    runner.handle_intelligent_synthesis = AsyncMock(return_value="synthesis receipt")
+
+    result = await runner._handle_message(_make_event("synthesize brain"))
+
+    runner.handle_intelligent_synthesis.assert_awaited_once()
+    assert result == "synthesis receipt"
+
+
+@pytest.mark.asyncio
+async def test_intelligent_parser_failure_never_reaches_normal_agent(monkeypatch):
+    from gateway import cogitator_intake_bridge as bridge
+
+    runner = _make_runner()
+    runner.handle_intelligent_intake = AsyncMock(
+        side_effect=AssertionError("failed parser must not dispatch intake")
+    )
+
+    def fail_closed(*_args, **_kwargs):
+        raise RuntimeError("synthetic parser failure")
+
+    monkeypatch.setattr(bridge, "parse_intelligent_intake", fail_closed)
+
+    result = await runner._handle_message(
+        _make_event("https://x.com/i/status/2076300807189024873")
+    )
+
+    runner.handle_intelligent_intake.assert_not_awaited()
+    assert result == (
+        "Intelligent intake routing failed safely.\n"
+        "No research or promotion was performed."
+    )

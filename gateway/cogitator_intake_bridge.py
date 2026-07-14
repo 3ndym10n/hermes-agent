@@ -180,6 +180,57 @@ def parse_intelligent_intake(
     return None
 
 
+def _declared_event_value(value: Any, name: str) -> Any:
+    """Avoid dynamic mock/proxy attributes becoming trusted routing metadata."""
+    if value is None:
+        return None
+    declared = getattr(value, "__dict__", None)
+    if isinstance(declared, Mapping) and name in declared:
+        return declared[name]
+    if type(value).__module__.startswith("telegram"):
+        return getattr(value, name, None)
+    return None
+
+
+def intelligent_intake_event_flags(event: Any) -> dict[str, bool]:
+    """Read only bounded routing metadata; never serialize the raw event."""
+    raw = _declared_event_value(event, "raw_message")
+    forward_origin = _declared_event_value(raw, "forward_origin")
+    forward_date = _declared_event_value(raw, "forward_date")
+    event_forwarded = _declared_event_value(event, "forwarded")
+    event_transcript = _declared_event_value(event, "is_transcript")
+    raw_transcript = _declared_event_value(raw, "transcript")
+    forwarded = bool(
+        forward_origin is not None
+        or forward_date is not None
+        or event_forwarded is True
+    )
+    transcript = bool(
+        event_transcript is True
+        or (isinstance(raw_transcript, str) and raw_transcript.strip())
+    )
+    return {"forwarded": forwarded, "transcript": transcript}
+
+
+def is_intelligent_synthesis_request(text: str) -> bool:
+    return " ".join(str(text or "").strip().lower().split()) in {
+        "synthesize brain",
+        "brain synthesis",
+    }
+
+
+def build_intelligent_synthesis_request() -> dict[str, Any]:
+    return {
+        "source_agent": "hermes",
+        "requested_action": "build_intelligent_synthesis",
+        "user_intent": "Build one manual evidence-linked brain synthesis.",
+        "content": "",
+        "approval_status": "draft_only",
+        "risk_level": "low",
+        "context": {},
+    }
+
+
 def build_intelligent_prepare_request(
     intake: IntelligentIntake,
     *,
@@ -321,6 +372,13 @@ def _validate_intelligent_response(
             raise IntakeBridgeError(
                 "BRIDGE_RESPONSE_INVALID", "final receipt incomplete"
             )
+        message = str(response.get("telegram_message") or "")
+        for heading in ("VALUE:", "REVIEW ID:", "PROVIDER:", "PAID API:"):
+            if heading not in message:
+                raise IntakeBridgeError(
+                    "BRIDGE_RESPONSE_INVALID",
+                    "final Telegram receipt incomplete",
+                )
     return dict(response)
 
 
@@ -367,6 +425,66 @@ def request_intelligent_finalize(
     )
     return _validate_intelligent_response(
         response, expected_action="finalize_intelligent_intake"
+    )
+
+
+def request_intelligent_synthesis(
+    *,
+    base_url: str,
+    token: str,
+    urlopen: Optional[Callable[..., Any]] = None,
+) -> dict[str, Any]:
+    response = _post_bridge(
+        build_intelligent_synthesis_request(),
+        base_url=str(base_url or "").strip(),
+        token=str(token or "").strip(),
+        urlopen=urlopen,
+    )
+    if not isinstance(response, Mapping):
+        raise IntakeBridgeError("BRIDGE_RESPONSE_INVALID")
+    if (
+        response.get("requested_action") != "build_intelligent_synthesis"
+        or response.get("status") != "ok"
+        or response.get("paid_api_used") is not False
+        or float(response.get("estimated_paid_cost") or 0) != 0
+        or response.get("research_performed") not in (False, None)
+        or response.get("promotion_performed") not in (False, None)
+        or not str(response.get("synthesis") or "").strip()
+    ):
+        raise IntakeBridgeError("BRIDGE_RESPONSE_INVALID")
+    return dict(response)
+
+
+def render_intelligent_intake_message(response: Mapping[str, Any]) -> str:
+    status = str(response.get("status") or "")
+    if status == "ok":
+        return str(response.get("telegram_message") or "").strip()
+    reason = {
+        "failed_source": "Reliable full source content was unavailable.",
+        "failed_reasoning": "The eligible subscription reasoning turn failed.",
+        "failed_validation": "The assessment response failed validation.",
+        "rejected": str(response.get("error") or "The preparation expired."),
+    }.get(status, "The intelligent intake path was unavailable.")
+    raw_path = str(response.get("raw_path") or "").strip()
+    lines = [
+        "Intelligent intake could not complete.",
+        f"Reason: {reason}",
+    ]
+    if raw_path:
+        lines.append(f"Raw input preserved at: {raw_path}")
+    lines.append("No research or promotion was performed.")
+    return "\n".join(lines)
+
+
+def render_intelligent_synthesis_message(response: Mapping[str, Any]) -> str:
+    synthesis = str(response.get("synthesis") or "").strip()
+    return "\n".join(
+        [
+            synthesis,
+            "",
+            f"PROVIDER: {response.get('provider_path') or 'deterministic:no-provider'}",
+            "PAID API: no (estimated cost: 0.0000)",
+        ]
     )
 
 

@@ -3072,6 +3072,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         source: Optional[SessionSource] = None,
         session_key: Optional[str] = None,
         user_config: Optional[dict] = None,
+        cache_result: bool = True,
     ) -> tuple[str, dict]:
         """Resolve model/runtime for a session, honoring session-scoped /model overrides.
 
@@ -3167,7 +3168,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         resolved_session_key or "", _recovered,
                     )
                     model = _recovered
-            elif model:
+            elif model and cache_result:
                 # Cache the good resolution for future recovery turns.
                 if resolved_session_key:
                     _last_good[resolved_session_key] = model
@@ -7032,6 +7033,43 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "Open the Decision Inbox first with /decision_batch, then reply "
                     "research <n> or approve-candidate <n> preview."
                 )
+
+        # Intelligent Second Brain V1: explicit valid intake, forwarded text,
+        # transcript text, and one bare supported URL enter the source-first
+        # assessment path. Malformed intake/research attempts remain for the
+        # legacy parser below; URL-plus-question remains normal conversation.
+        try:
+            from gateway.cogitator_intake_bridge import (
+                intelligent_intake_event_flags,
+                is_intelligent_synthesis_request,
+                parse_intelligent_intake,
+            )
+            _intelligent_flags = intelligent_intake_event_flags(event)
+            _intelligent_intake = parse_intelligent_intake(
+                event.text or "", **_intelligent_flags
+            )
+            _intelligent_synthesis = is_intelligent_synthesis_request(
+                event.text or ""
+            )
+        except Exception:
+            logger.exception(
+                "Gateway intelligent-intake routing failed closed "
+                "(session=%s)", _quick_key,
+            )
+            return (
+                "Intelligent intake routing failed safely.\n"
+                "No research or promotion was performed."
+            )
+        if _intelligent_intake is not None:
+            logger.info(
+                "Gateway routed intelligent intake (session=%s, kind=%s)",
+                _quick_key, _intelligent_intake.input_kind,
+            )
+            return await self.handle_intelligent_intake(
+                event, _intelligent_intake
+            )
+        if _intelligent_synthesis:
+            return await self.handle_intelligent_synthesis(event)
 
         # Universal text intake: a message whose first line is ``intake`` (or
         # ``intake lens <label>``) is routed deterministically to the Cogitator
