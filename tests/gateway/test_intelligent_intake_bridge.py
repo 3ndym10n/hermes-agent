@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -51,6 +52,12 @@ def test_event_metadata_routes_forwarded_posts_and_transcripts():
     assert ib.intelligent_intake_event_flags(transcript) == {
         "forwarded": False,
         "transcript": True,
+    }
+
+
+def test_dynamic_mock_attributes_are_not_trusted_as_forward_metadata():
+    assert ib.intelligent_intake_event_flags(MagicMock()) == {
+        "forwarded": False, "transcript": False,
     }
 
 

@@ -180,17 +180,34 @@ def parse_intelligent_intake(
     return None
 
 
+def _declared_event_value(value: Any, name: str) -> Any:
+    """Avoid dynamic mock/proxy attributes becoming trusted routing metadata."""
+    if value is None:
+        return None
+    declared = getattr(value, "__dict__", None)
+    if isinstance(declared, Mapping) and name in declared:
+        return declared[name]
+    if type(value).__module__.startswith("telegram"):
+        return getattr(value, name, None)
+    return None
+
+
 def intelligent_intake_event_flags(event: Any) -> dict[str, bool]:
     """Read only bounded routing metadata; never serialize the raw event."""
-    raw = getattr(event, "raw_message", None)
+    raw = _declared_event_value(event, "raw_message")
+    forward_origin = _declared_event_value(raw, "forward_origin")
+    forward_date = _declared_event_value(raw, "forward_date")
+    event_forwarded = _declared_event_value(event, "forwarded")
+    event_transcript = _declared_event_value(event, "is_transcript")
+    raw_transcript = _declared_event_value(raw, "transcript")
     forwarded = bool(
-        getattr(raw, "forward_origin", None)
-        or getattr(raw, "forward_date", None)
-        or getattr(event, "forwarded", False)
+        forward_origin is not None
+        or forward_date is not None
+        or event_forwarded is True
     )
     transcript = bool(
-        getattr(event, "is_transcript", False)
-        or getattr(raw, "transcript", None)
+        event_transcript is True
+        or (isinstance(raw_transcript, str) and raw_transcript.strip())
     )
     return {"forwarded": forwarded, "transcript": transcript}
 
