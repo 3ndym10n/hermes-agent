@@ -134,6 +134,242 @@ def is_url_only_body(raw_text: str) -> bool:
     return bool(lines) and all(_URL_LINE_RE.match(line) for line in lines)
 
 
+@dataclass(frozen=True)
+class IntelligentIntake:
+    """One message that should enter the V1 assessment path."""
+
+    raw_text: str
+    input_kind: str
+    explicit: bool = False
+
+
+_BARE_SUPPORTED_URL_RE = re.compile(r"^https?://[^\s]+$", re.IGNORECASE)
+_OAUTH_ASSESSMENT_PROVIDERS = frozenset({
+    "openai-codex",
+    "xai-oauth",
+    "qwen-oauth",
+    "minimax-oauth",
+    "google-gemini-cli",
+})
+
+
+def parse_intelligent_intake(
+    text: str,
+    *,
+    forwarded: bool = False,
+    transcript: bool = False,
+) -> IntelligentIntake | None:
+    """Route explicit intake, forwarded content, or one bare URL.
+
+    A URL plus any direct question/prose is deliberately not matched and
+    remains a normal Hermes conversation.
+    """
+    command = parse_intake_message(text)
+    if command is not None:
+        if command.error or command.research_number is not None:
+            return None
+        kind = "bare_url" if is_url_only_body(command.raw_text) else (
+            "transcript" if transcript else "pasted_text"
+        )
+        return IntelligentIntake(command.raw_text, kind, explicit=True)
+    raw = str(text or "").strip()
+    if forwarded and raw:
+        return IntelligentIntake(raw, "forwarded_post")
+    if _BARE_SUPPORTED_URL_RE.fullmatch(raw):
+        return IntelligentIntake(raw, "bare_url")
+    return None
+
+
+def build_intelligent_prepare_request(
+    intake: IntelligentIntake,
+    *,
+    origin: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    context: dict[str, Any] = {
+        "raw_text": intake.raw_text,
+        "input_kind": intake.input_kind,
+    }
+    if origin is not None:
+        context["origin"] = _delivery_origin(origin)
+    return {
+        "source_agent": "hermes",
+        "requested_action": "prepare_intelligent_intake",
+        "user_intent": "Prepare one source-first, context-aware V1 assessment.",
+        "content": "",
+        "approval_status": "draft_only",
+        "risk_level": "low",
+        "context": context,
+    }
+
+
+def build_intelligent_finalize_request(
+    *,
+    preparation_id: str,
+    model_response: str | None,
+    provider_path: str,
+    latency_ms: int,
+    provider_invoked: bool,
+) -> dict[str, Any]:
+    if not str(preparation_id or "").strip():
+        raise IntakeBridgeError("PREPARATION_ID_MISSING")
+    return {
+        "source_agent": "hermes",
+        "requested_action": "finalize_intelligent_intake",
+        "user_intent": "Validate and persist one V1 assessment.",
+        "content": "",
+        "approval_status": "draft_only",
+        "risk_level": "low",
+        "context": {
+            "preparation_id": str(preparation_id).strip(),
+            "model_response": model_response,
+            "provider_path": str(provider_path or "").strip(),
+            "latency_ms": int(latency_ms),
+            "provider_invoked": bool(provider_invoked),
+        },
+    }
+
+
+def subscription_assessment_route(provider: str, api_mode: str = "") -> dict[str, Any] | None:
+    """Return a pinned, tool-free route or None before any provider call."""
+    normalized = str(provider or "").strip().lower()
+    if normalized not in _OAUTH_ASSESSMENT_PROVIDERS:
+        return None
+    if normalized in {"openai-codex", "xai-oauth"} and api_mode != "codex_responses":
+        return None
+    return {
+        "provider": normalized,
+        "api_mode": str(api_mode or ""),
+        "providers_allowed": [normalized],
+        "providers_order": [normalized],
+        "providers_ignored": ["openrouter"],
+        "fallback_model": None,
+        "enabled_toolsets": [],
+        "disabled_toolsets": ["web", "research", "delegate", "browser"],
+        "max_iterations": 1,
+    }
+
+
+def run_subscription_assessment(
+    prompt: str,
+    *,
+    provider: str,
+    api_mode: str,
+    run_turn: Callable[[str, dict[str, Any]], Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Run exactly one injected OAuth turn, or abstain before invocation."""
+    route = subscription_assessment_route(provider, api_mode)
+    if route is None:
+        return {"provider_invoked": False, "reason": "no_eligible_oauth_route"}
+    started = __import__("time").monotonic()
+    try:
+        result = run_turn(prompt, route)
+    except Exception:
+        result = None
+    latency_ms = max(0, int((__import__("time").monotonic() - started) * 1000))
+    if not isinstance(result, Mapping) or result.get("tools"):
+        return {
+            "provider_invoked": True,
+            "provider_path": f"hermes:{route['provider']}:oauth",
+            "latency_ms": latency_ms,
+            "model_response": None,
+        }
+    return {
+        "provider_invoked": True,
+        "provider_path": f"hermes:{route['provider']}:oauth",
+        "latency_ms": latency_ms,
+        "model_response": str(result.get("final_response") or "") or None,
+    }
+
+
+def _validate_intelligent_response(
+    response: Any,
+    *,
+    expected_action: str,
+) -> dict[str, Any]:
+    if not isinstance(response, Mapping):
+        raise IntakeBridgeError(
+            "BRIDGE_RESPONSE_INVALID", "response is not an object"
+        )
+    if response.get("requested_action") != expected_action:
+        raise IntakeBridgeError("BRIDGE_ACTION_MISMATCH")
+    status = str(response.get("status") or "")
+    if status not in {
+        "ready", "ok", "rejected", "failed_source",
+        "failed_reasoning", "failed_validation",
+    }:
+        raise IntakeBridgeError("BRIDGE_STATUS_NOT_OK", f"status={status!r}")
+    if (
+        response.get("research_performed") not in (False, None)
+        or response.get("promotion_performed") not in (False, None)
+    ):
+        raise IntakeBridgeError("BRIDGE_STATEFUL_RESPONSE")
+    if expected_action == "prepare_intelligent_intake" and status == "ready":
+        if (
+            not str(response.get("preparation_id") or "").strip()
+            or not str(response.get("prompt") or "").strip()
+        ):
+            raise IntakeBridgeError(
+                "BRIDGE_RESPONSE_INVALID", "preparation receipt incomplete"
+            )
+    if expected_action == "finalize_intelligent_intake" and status == "ok":
+        if (
+            response.get("paid_api_used") is not False
+            or float(response.get("estimated_paid_cost") or 0) != 0
+            or not str(response.get("item_id") or "").strip()
+            or not str(response.get("review_id") or "").strip()
+        ):
+            raise IntakeBridgeError(
+                "BRIDGE_RESPONSE_INVALID", "final receipt incomplete"
+            )
+    return dict(response)
+
+
+def request_intelligent_prepare(
+    *,
+    base_url: str,
+    token: str,
+    intake: IntelligentIntake,
+    origin: Mapping[str, Any] | None = None,
+    urlopen: Optional[Callable[..., Any]] = None,
+) -> dict[str, Any]:
+    packet = build_intelligent_prepare_request(intake, origin=origin)
+    response = _post_bridge(
+        packet,
+        base_url=str(base_url or "").strip(),
+        token=str(token or "").strip(),
+        urlopen=urlopen,
+    )
+    return _validate_intelligent_response(
+        response, expected_action="prepare_intelligent_intake"
+    )
+
+
+def request_intelligent_finalize(
+    *,
+    base_url: str,
+    token: str,
+    preparation_id: str,
+    reasoning_result: Mapping[str, Any],
+    urlopen: Optional[Callable[..., Any]] = None,
+) -> dict[str, Any]:
+    packet = build_intelligent_finalize_request(
+        preparation_id=preparation_id,
+        model_response=reasoning_result.get("model_response"),
+        provider_path=str(reasoning_result.get("provider_path") or ""),
+        latency_ms=int(reasoning_result.get("latency_ms") or 0),
+        provider_invoked=bool(reasoning_result.get("provider_invoked")),
+    )
+    response = _post_bridge(
+        packet,
+        base_url=str(base_url or "").strip(),
+        token=str(token or "").strip(),
+        urlopen=urlopen,
+    )
+    return _validate_intelligent_response(
+        response, expected_action="finalize_intelligent_intake"
+    )
+
+
 def _delivery_origin(origin: Mapping[str, Any] | None) -> dict[str, str]:
     if not isinstance(origin, Mapping):
         raise IntakeBridgeError("BRIDGE_ROUTE_INVALID", "origin missing")
