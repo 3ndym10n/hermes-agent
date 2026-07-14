@@ -782,6 +782,7 @@ def request_intelligent_response_usage(
     response_task_id: str,
     response_text: str,
     used_item_ids: list[str],
+    retrieved_item_ids: Optional[list[str]] = None,
     other_context_sources: list[str],
     provider_path: str,
     paid_web_research_api_used: bool,
@@ -822,10 +823,17 @@ def request_intelligent_response_usage(
             raise IntakeBridgeError("BRIDGE_RESPONSE_INVALID")
         return result
     returned_used = result.get("used_item_ids")
+    allowed_grounded = set(
+        retrieved_item_ids if retrieved_item_ids is not None else used_item_ids
+    )
     if (
         result.get("response_task_id") != response_task_id
         or not isinstance(returned_used, list)
-        or not set(returned_used).issubset(set(used_item_ids))
+        or any(
+            not re.fullmatch(r"ki_[a-f0-9]{24}", str(item_id or ""))
+            for item_id in returned_used
+        )
+        or not set(returned_used).issubset(allowed_grounded)
         or not str(result.get("provenance_markdown_path") or "").strip()
         or result.get("promotion_performed") is not False
         or result.get("paid_api_used") is not paid_web_research_api_used
