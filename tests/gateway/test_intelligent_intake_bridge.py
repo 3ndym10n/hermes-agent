@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 import pytest
 
 from gateway import cogitator_intake_bridge as ib
@@ -33,6 +35,32 @@ def test_explicit_pasted_forwarded_and_transcript_inputs_route():
     )
     assert transcript.input_kind == "transcript"
     assert ib.parse_intelligent_intake("ordinary conversation") is None
+
+
+def test_event_metadata_routes_forwarded_posts_and_transcripts():
+    forwarded = SimpleNamespace(
+        raw_message=SimpleNamespace(forward_origin=object())
+    )
+    transcript = SimpleNamespace(
+        raw_message=SimpleNamespace(transcript="voice transcript")
+    )
+    assert ib.intelligent_intake_event_flags(forwarded) == {
+        "forwarded": True,
+        "transcript": False,
+    }
+    assert ib.intelligent_intake_event_flags(transcript) == {
+        "forwarded": False,
+        "transcript": True,
+    }
+
+
+def test_manual_synthesis_phrase_and_packet_are_exact():
+    assert ib.is_intelligent_synthesis_request("  Synthesize   brain ")
+    assert ib.is_intelligent_synthesis_request("brain synthesis")
+    assert not ib.is_intelligent_synthesis_request("please synthesize my brain")
+    packet = ib.build_intelligent_synthesis_request()
+    assert packet["requested_action"] == "build_intelligent_synthesis"
+    assert packet["approval_status"] == "draft_only"
 
 
 def test_prepare_and_finalize_packets_are_draft_only_and_bounded():
@@ -192,6 +220,10 @@ def test_intelligent_response_validation_is_fail_closed():
             "estimated_paid_cost": 0,
             "research_performed": False,
             "promotion_performed": False,
+            "telegram_message": (
+                "VALUE: high\nREVIEW ID: inote-1\n"
+                "PROVIDER: hermes:openai-codex:oauth\nPAID API: no"
+            ),
         },
         expected_action="finalize_intelligent_intake",
     )
@@ -201,3 +233,35 @@ def test_intelligent_response_validation_is_fail_closed():
             {**final, "research_performed": True},
             expected_action="finalize_intelligent_intake",
         )
+
+
+def test_synthesis_response_is_fail_closed_and_has_cost_receipt():
+    response = {
+        "requested_action": "build_intelligent_synthesis",
+        "status": "ok",
+        "synthesis": "WHAT THE BRAIN CURRENTLY BELIEVES\n- Evidence [ki_1]",
+        "provider_path": "deterministic:no-provider",
+        "paid_api_used": False,
+        "estimated_paid_cost": 0,
+        "research_performed": False,
+        "promotion_performed": False,
+    }
+
+    class FakeHTTPResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return __import__("json").dumps(response).encode()
+
+    result = ib.request_intelligent_synthesis(
+        base_url="http://127.0.0.1:9999",
+        token="secret",
+        urlopen=lambda *_args, **_kwargs: FakeHTTPResponse(),
+    )
+    rendered = ib.render_intelligent_synthesis_message(result)
+    assert "PROVIDER: deterministic:no-provider" in rendered
+    assert "PAID API: no (estimated cost: 0.0000)" in rendered

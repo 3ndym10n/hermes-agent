@@ -2030,6 +2030,170 @@ class GatewaySlashCommandsMixin:
         return origin
 
 
+    async def _run_isolated_intelligent_assessment(
+        self, prompt: str, event: MessageEvent
+    ) -> dict:
+        """Run one current-provider OAuth turn with no tools, memory or history."""
+        import uuid
+
+        from gateway.cogitator_intake_bridge import (
+            run_subscription_assessment,
+        )
+        from gateway.run import _load_gateway_config
+        from run_agent import AIAgent
+
+        user_config = _load_gateway_config()
+        model, runtime_kwargs = self._resolve_session_agent_runtime(
+            source=event.source,
+            user_config=user_config,
+            cache_result=False,
+        )
+        provider = str(runtime_kwargs.get("provider") or "")
+        api_mode = str(runtime_kwargs.get("api_mode") or "")
+
+        def invoke():
+            def run_turn(assessment_prompt, route):
+                task_id = f"isb-{uuid.uuid4().hex}"
+                turn_route = self._resolve_turn_agent_config(
+                    assessment_prompt, model, runtime_kwargs
+                )
+                agent = AIAgent(
+                    model=turn_route["model"],
+                    **turn_route["runtime"],
+                    max_iterations=1,
+                    quiet_mode=True,
+                    verbose_logging=False,
+                    enabled_toolsets=[],
+                    disabled_toolsets=[
+                        "web", "research", "delegate", "browser",
+                    ],
+                    reasoning_config=self._resolve_session_reasoning_config(
+                        source=event.source
+                    ),
+                    request_overrides=turn_route.get("request_overrides"),
+                    providers_allowed=route["providers_allowed"],
+                    providers_ignored=route["providers_ignored"],
+                    providers_order=route["providers_order"],
+                    fallback_model=None,
+                    session_id=task_id,
+                    session_db=None,
+                    skip_context_files=True,
+                    load_soul_identity=False,
+                    skip_memory=True,
+                    checkpoints_enabled=False,
+                    pass_session_id=False,
+                )
+                try:
+                    return agent.run_conversation(
+                        user_message=assessment_prompt,
+                        conversation_history=[],
+                        task_id=task_id,
+                    )
+                finally:
+                    self._cleanup_agent_resources(agent)
+
+            return run_subscription_assessment(
+                prompt,
+                provider=provider,
+                api_mode=api_mode,
+                run_turn=run_turn,
+            )
+
+        return await self._run_in_executor_with_context(invoke)
+
+
+    async def handle_intelligent_intake(
+        self, event: MessageEvent, intake
+    ) -> str:
+        from gateway.cogitator_intake_bridge import (
+            TOKEN_ENV,
+            IntakeBridgeError,
+            render_intelligent_intake_message,
+            request_intelligent_finalize,
+            request_intelligent_prepare,
+        )
+
+        enabled, base_url, _local_dir = self._intake_config()
+        if not enabled:
+            return (
+                "Intelligent intake is disabled.\n"
+                "Enable the existing Cogitator intake bridge to use it."
+            )
+        token = str(os.environ.get(TOKEN_ENV, "") or "").strip()
+        if not base_url or not token:
+            return (
+                "Intelligent intake is not configured.\n"
+                "The existing Cogitator bridge URL/token is required."
+            )
+        try:
+            prepared = await asyncio.to_thread(
+                request_intelligent_prepare,
+                base_url=base_url,
+                token=token,
+                intake=intake,
+                origin=self._intake_origin(event),
+            )
+            if prepared.get("status") != "ready":
+                return render_intelligent_intake_message(prepared)
+            reasoning = await self._run_isolated_intelligent_assessment(
+                str(prepared["prompt"]), event
+            )
+            finalized = await asyncio.to_thread(
+                request_intelligent_finalize,
+                base_url=base_url,
+                token=token,
+                preparation_id=str(prepared["preparation_id"]),
+                reasoning_result=reasoning,
+            )
+            return render_intelligent_intake_message(finalized)
+        except IntakeBridgeError as exc:
+            logger.warning(
+                "[intelligent_intake] bridge error code=%s", exc.code
+            )
+            return (
+                "Intelligent intake unavailable.\n"
+                f"Reason: {exc.code}.\n"
+                "No research or promotion was performed."
+            )
+        except Exception:
+            logger.exception("[intelligent_intake] unexpected failure")
+            return (
+                "Intelligent intake failed safely.\n"
+                "Raw input may have been preserved by Cogitator; no research "
+                "or promotion was performed."
+            )
+
+
+    async def handle_intelligent_synthesis(self, event: MessageEvent) -> str:
+        from gateway.cogitator_intake_bridge import (
+            TOKEN_ENV,
+            IntakeBridgeError,
+            render_intelligent_synthesis_message,
+            request_intelligent_synthesis,
+        )
+
+        del event
+        enabled, base_url, _local_dir = self._intake_config()
+        token = str(os.environ.get(TOKEN_ENV, "") or "").strip()
+        if not enabled or not base_url or not token:
+            return "Brain synthesis is unavailable: intake bridge not configured."
+        try:
+            result = await asyncio.to_thread(
+                request_intelligent_synthesis,
+                base_url=base_url,
+                token=token,
+            )
+            return render_intelligent_synthesis_message(result)
+        except IntakeBridgeError as exc:
+            logger.warning(
+                "[intelligent_synthesis] bridge error code=%s", exc.code
+            )
+            return f"Brain synthesis unavailable.\nReason: {exc.code}."
+        except Exception:
+            logger.exception("[intelligent_synthesis] unexpected failure")
+            return "Brain synthesis failed safely."
+
+
     async def handle_intake_message(self, event: MessageEvent, cmd) -> str:
         """Handle a parsed plain-text intake command (never reaches the model).
 
