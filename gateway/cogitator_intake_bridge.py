@@ -388,6 +388,39 @@ def build_intelligent_retrieval_request(task_description: str) -> dict[str, Any]
     }
 
 
+def build_intelligent_usage_request(
+    *,
+    retrieval_receipt_id: str,
+    response_task_id: str,
+    response_text: str,
+    used_item_ids: list[str],
+    other_context_sources: list[str],
+    provider_path: str,
+    paid_web_research_api_used: bool,
+    refinement_item_id: str = "",
+    refinement_text: str = "",
+) -> dict[str, Any]:
+    return {
+        "source_agent": "hermes",
+        "requested_action": "record_intelligent_response_usage",
+        "user_intent": "Record honest post-response knowledge provenance.",
+        "content": "",
+        "approval_status": "draft_only",
+        "risk_level": "low",
+        "context": {
+            "retrieval_receipt_id": retrieval_receipt_id,
+            "response_task_id": response_task_id,
+            "response_text": response_text,
+            "used_item_ids": used_item_ids,
+            "other_context_sources": other_context_sources,
+            "provider_path": provider_path,
+            "paid_web_research_api_used": paid_web_research_api_used,
+            "refinement_item_id": refinement_item_id,
+            "refinement_text": refinement_text,
+        },
+    }
+
+
 def build_intelligent_outcome_request(
     command: IntelligentOutcomeCommand,
     *,
@@ -729,12 +762,77 @@ def request_intelligent_retrieval(
             not isinstance(record, Mapping)
             or not re.fullmatch(r"ki_[a-f0-9]{24}", str(record.get("item_id") or ""))
             or not str(record.get("citation") or "").strip()
+            or record.get("lifecycle_state")
+            not in {"approved", "promoted"}
         ):
             raise IntakeBridgeError("BRIDGE_RESPONSE_INVALID")
     receipt_id = str(result.get("retrieval_receipt_id") or "")
     if records and not re.fullmatch(r"isbr_[A-Za-z0-9_-]{20,64}", receipt_id):
         raise IntakeBridgeError("BRIDGE_RESPONSE_INVALID")
     if not records and receipt_id:
+        raise IntakeBridgeError("BRIDGE_RESPONSE_INVALID")
+    return result
+
+
+def request_intelligent_response_usage(
+    *,
+    base_url: str,
+    token: str,
+    retrieval_receipt_id: str,
+    response_task_id: str,
+    response_text: str,
+    used_item_ids: list[str],
+    other_context_sources: list[str],
+    provider_path: str,
+    paid_web_research_api_used: bool,
+    refinement_item_id: str = "",
+    refinement_text: str = "",
+    urlopen: Optional[Callable[..., Any]] = None,
+) -> dict[str, Any]:
+    response = _post_bridge(
+        build_intelligent_usage_request(
+            retrieval_receipt_id=retrieval_receipt_id,
+            response_task_id=response_task_id,
+            response_text=response_text,
+            used_item_ids=used_item_ids,
+            other_context_sources=other_context_sources,
+            provider_path=provider_path,
+            paid_web_research_api_used=paid_web_research_api_used,
+            refinement_item_id=refinement_item_id,
+            refinement_text=refinement_text,
+        ),
+        base_url=str(base_url or "").strip(),
+        token=str(token or "").strip(),
+        urlopen=urlopen,
+    )
+    if (
+        not isinstance(response, Mapping)
+        or response.get("requested_action")
+        != "record_intelligent_response_usage"
+        or response.get("status") not in {"recorded", "blocked"}
+        or response.get("research_performed") not in (False, None)
+    ):
+        raise IntakeBridgeError("BRIDGE_RESPONSE_INVALID")
+    result = dict(response)
+    if result["status"] == "blocked":
+        if (
+            result.get("mutation_performed") is not False
+            or not str(result.get("reason") or "").strip()
+        ):
+            raise IntakeBridgeError("BRIDGE_RESPONSE_INVALID")
+        return result
+    returned_used = result.get("used_item_ids")
+    if (
+        result.get("response_task_id") != response_task_id
+        or not isinstance(returned_used, list)
+        or not set(returned_used).issubset(set(used_item_ids))
+        or not str(result.get("provenance_markdown_path") or "").strip()
+        or result.get("promotion_performed") is not False
+        or result.get("paid_api_used") is not paid_web_research_api_used
+    ):
+        raise IntakeBridgeError("BRIDGE_RESPONSE_INVALID")
+    candidate_id = str(result.get("candidate_review_id") or "")
+    if candidate_id and not re.fullmatch(r"inote-[1-9][0-9]*", candidate_id):
         raise IntakeBridgeError("BRIDGE_RESPONSE_INVALID")
     return result
 
@@ -787,8 +885,13 @@ def render_intelligent_retrieval_context(response: Mapping[str, Any]) -> str:
         return ""
     lines = [
         "[Targeted current/promoted Cogitator knowledge for this API turn]",
-        "Use only when relevant. Cite each Markdown path used. Hypotheses and "
-        "experiments remain explicitly provisional.",
+        "Use only when relevant. For every item actually used, include the exact "
+        "visible citation [item_id](Markdown path); do not cite merely retrieved "
+        "items. Hypotheses and experiments remain explicitly provisional.",
+        "If the answer adds a substantive policy refinement, append exactly one "
+        "line: PROPOSED REFINEMENT: <item_id> | <addition>. Omit it for wording "
+        "changes or when no retrieved item was used. This marker is removed before "
+        "delivery and creates only an approval-required candidate.",
     ]
     for record in records:
         lines.extend(

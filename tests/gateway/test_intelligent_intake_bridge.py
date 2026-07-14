@@ -412,6 +412,11 @@ def test_action_success_receipts_must_echo_durable_results():
     "text,platform,proxy,internal,expected",
     [
         ("Should we use premium reasoning for this decision?", "telegram", False, False, True),
+        (
+            "What is our policy for keeping our Hermes fork updated without "
+            "breaking Cogitator or wasting development tokens?",
+            "telegram", False, False, True,
+        ),
         ("Plan five real provider-cost experiments for this workflow", "telegram", False, False, True),
         ("hello there friend", "telegram", False, False, False),
         ("how are you", "telegram", False, False, False),
@@ -455,6 +460,21 @@ def test_review_retrieval_and_outcome_packets_preserve_authority_boundary():
     assert retrieval["approval_status"] == "draft_only"
     assert set(retrieval["context"]) == {"task_description"}
 
+    usage = ib.build_intelligent_usage_request(
+        retrieval_receipt_id="isbr_12345678901234567890",
+        response_task_id="isbt_0123456789abcdef01234567",
+        response_text=(
+            "Use [ki_0123456789abcdef01234567]"
+            "(storage/knowledge/ai-cost.md)."
+        ),
+        used_item_ids=["ki_0123456789abcdef01234567"],
+        other_context_sources=["tool:session_search"],
+        provider_path="openai-codex:gpt-5",
+        paid_web_research_api_used=False,
+    )
+    assert usage["approval_status"] == "draft_only"
+    assert usage["requested_action"] == "record_intelligent_response_usage"
+    assert "approval" not in usage["context"]
     outcome = ib.build_intelligent_outcome_request(
         ib.IntelligentOutcomeCommand("useful", details="Saved labour"),
         retrieval_receipt_id="isbr_12345678901234567890",
@@ -480,6 +500,7 @@ def test_retrieval_response_requires_opaque_receipt_and_never_accepts_server_pro
                 "why_relevant": "It affects provider choice.",
                 "plan_delta": "Measure five tasks.",
                 "citation": "storage/knowledge/ai-cost.md",
+                "lifecycle_state": "promoted",
             }
         ],
         "citations": ["storage/knowledge/ai-cost.md"],
@@ -511,6 +532,8 @@ def test_retrieval_response_requires_opaque_receipt_and_never_accepts_server_pro
     rendered = ib.render_intelligent_retrieval_context(result)
     assert "ki_0123456789abcdef01234567" in rendered
     assert "storage/knowledge/ai-cost.md" in rendered
+    assert "[item_id](Markdown path)" in rendered
+    assert "PROPOSED REFINEMENT:" in rendered
 
     with pytest.raises(ib.IntakeBridgeError) as leaked:
         ib.request_intelligent_retrieval(
@@ -533,3 +556,62 @@ def test_retrieval_response_requires_opaque_receipt_and_never_accepts_server_pro
             ),
         )
     assert paid.value.code == "BRIDGE_STATEFUL_RESPONSE"
+
+
+
+def test_response_usage_client_validates_provenance_and_no_promotion():
+    payload = {
+        "requested_action": "record_intelligent_response_usage",
+        "status": "recorded",
+        "response_task_id": "isbt_0123456789abcdef01234567",
+        "provenance_markdown_path": "Outcomes/provenance.md",
+        "retrieved_item_ids": ["ki_0123456789abcdef01234567"],
+        "used_item_ids": ["ki_0123456789abcdef01234567"],
+        "citations": ["storage/knowledge/ai-cost.md"],
+        "candidate_review_id": "inote-8",
+        "promotion_performed": False,
+        "paid_api_used": False,
+        "research_performed": False,
+    }
+
+    class FakeHTTPResponse:
+        def __init__(self, value):
+            self.value = value
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return __import__("json").dumps(self.value).encode()
+
+    kwargs = {
+        "base_url": "http://127.0.0.1:9999",
+        "token": "secret",
+        "retrieval_receipt_id": "isbr_12345678901234567890",
+        "response_task_id": "isbt_0123456789abcdef01234567",
+        "response_text": (
+            "Use [ki_0123456789abcdef01234567]"
+            "(storage/knowledge/ai-cost.md)."
+        ),
+        "used_item_ids": ["ki_0123456789abcdef01234567"],
+        "other_context_sources": ["tool:session_search"],
+        "provider_path": "openai-codex:gpt-5",
+        "paid_web_research_api_used": False,
+    }
+    result = ib.request_intelligent_response_usage(
+        **kwargs,
+        urlopen=lambda *_args, **_kwargs: FakeHTTPResponse(payload),
+    )
+    assert result["candidate_review_id"] == "inote-8"
+
+    with pytest.raises(ib.IntakeBridgeError) as promoted:
+        ib.request_intelligent_response_usage(
+            **kwargs,
+            urlopen=lambda *_args, **_kwargs: FakeHTTPResponse(
+                {**payload, "promotion_performed": True}
+            ),
+        )
+    assert promoted.value.code == "BRIDGE_RESPONSE_INVALID"
