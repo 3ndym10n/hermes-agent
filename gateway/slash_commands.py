@@ -2059,7 +2059,17 @@ class GatewaySlashCommandsMixin:
             "retrieval_receipt_id": str(
                 response.get("retrieval_receipt_id") or ""
             ),
-            "item_ids": [str(record.get("item_id") or "") for record in records],
+            "records": [
+                {
+                    "item_id": str(record.get("item_id") or ""),
+                    "citation": str(record.get("citation") or ""),
+                    "lifecycle_state": str(
+                        record.get("lifecycle_state") or ""
+                    ),
+                }
+                for record in records[:5]
+            ],
+            "used_item_ids": [],
             "ts": time.time(),
         }
 
@@ -2102,6 +2112,106 @@ class GatewaySlashCommandsMixin:
             )
             return ""
 
+
+    async def record_intelligent_response_usage(
+        self,
+        event: MessageEvent,
+        response: str,
+        agent_result: dict[str, Any],
+    ) -> str:
+        """Record cited Cogitator use, then hide the internal refinement marker."""
+        receipt = self._active_intelligent_retrieval_context(event)
+        if not receipt:
+            return response
+        marker = re.compile(
+            r"(?m)^PROPOSED REFINEMENT:\s*"
+            r"(ki_[a-f0-9]{24})\s*\|\s*(.+?)\s*$"
+        )
+        proposals = marker.findall(response)
+        cleaned = marker.sub("", response).rstrip()
+        records = list(receipt.get("records") or [])
+        used_item_ids = [
+            record["item_id"]
+            for record in records
+            if record["item_id"] in cleaned and record["citation"] in cleaned
+        ]
+        refinement_item_id = ""
+        refinement_text = ""
+        if len(proposals) == 1 and proposals[0][0] in used_item_ids:
+            refinement_item_id, refinement_text = proposals[0]
+
+        tool_names = set()
+        messages = list(agent_result.get("messages") or [])
+        offset = int(agent_result.get("history_offset") or 0)
+        for message in messages[offset:]:
+            if not isinstance(message, dict):
+                continue
+            for call in message.get("tool_calls") or []:
+                name = str((call.get("function") or {}).get("name") or "")
+                if not isinstance(call, dict):
+                    continue
+                if name:
+                    tool_names.add(name)
+        paid = any(
+            "gptr" in name.lower()
+            or (
+                "openrouter" in name.lower()
+                and "research" in name.lower()
+            )
+            for name in tool_names
+        )
+        provider = str(agent_result.get("provider") or "unknown")
+        model = str(agent_result.get("model") or "")
+        provider_path = f"{provider}:{model}".rstrip(":")[:160]
+        response_task_id = "isbt_" + hashlib.sha256(
+            (
+                f"{agent_result.get('session_id') or ''}|"
+                f"{getattr(event, 'message_id', '') or ''}|{cleaned}"
+            ).encode("utf-8")
+        ).hexdigest()[:24]
+
+        from gateway.cogitator_intake_bridge import (
+            TOKEN_ENV,
+            request_intelligent_response_usage,
+        )
+
+        enabled, base_url, _local_dir = self._intake_config()
+        token = str(os.environ.get(TOKEN_ENV, "") or "").strip()
+        if not enabled or not base_url or not token:
+            return cleaned
+        try:
+            result = await asyncio.to_thread(
+                request_intelligent_response_usage,
+                base_url=base_url,
+                token=token,
+                retrieval_receipt_id=str(
+                    receipt.get("retrieval_receipt_id") or ""
+                ),
+                response_task_id=response_task_id,
+                response_text=response[:16000],
+                used_item_ids=used_item_ids,
+                other_context_sources=[
+                    f"tool:{name}" for name in sorted(tool_names)
+                ],
+                provider_path=provider_path,
+                paid_web_research_api_used=paid,
+                refinement_item_id=refinement_item_id,
+                refinement_text=refinement_text,
+            )
+            receipt["used_item_ids"] = list(result.get("used_item_ids") or [])
+            receipt["response_task_id"] = response_task_id
+            receipt["provenance_markdown_path"] = str(
+                result.get("provenance_markdown_path") or ""
+            )
+            receipt["refinement_review_id"] = str(
+                result.get("candidate_review_id") or ""
+            )
+        except Exception as exc:
+            logger.warning(
+                "[intelligent_usage] unavailable: %s",
+                getattr(exc, "code", type(exc).__name__),
+            )
+        return cleaned
 
     async def _run_isolated_intelligent_assessment(
         self, prompt: str, event: MessageEvent
@@ -2322,7 +2432,12 @@ class GatewaySlashCommandsMixin:
                 "No active cited-knowledge receipt. Ask a relevant task question "
                 "first, then record the outcome within 25 minutes."
             )
-        item_ids = list(receipt.get("item_ids") or [])
+        item_ids = list(receipt.get("used_item_ids") or [])
+        if not item_ids:
+            return (
+                "The latest answer did not visibly cite a retrieved Cogitator "
+                "item, so no knowledge outcome can be attached."
+            )
         item_id = str(command.item_id or "")
         if not item_id:
             if len(item_ids) != 1:

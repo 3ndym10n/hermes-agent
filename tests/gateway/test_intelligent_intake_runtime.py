@@ -191,6 +191,7 @@ def _retrieval_response():
                 "why_relevant": "It affects provider choice.",
                 "plan_delta": "Measure five tasks.",
                 "citation": "storage/knowledge/ai-cost.md",
+                "lifecycle_state": "promoted",
             }
         ],
         "citations": ["storage/knowledge/ai-cost.md"],
@@ -224,11 +225,17 @@ async def test_targeted_retrieval_stores_only_opaque_session_handle(monkeypatch)
     )
     assert state == {
         "retrieval_receipt_id": "isbr_12345678901234567890",
-        "item_ids": ["ki_0123456789abcdef01234567"],
+        "records": [
+            {
+                "item_id": "ki_0123456789abcdef01234567",
+                "citation": "storage/knowledge/ai-cost.md",
+                "lifecycle_state": "promoted",
+            }
+        ],
+        "used_item_ids": [],
         "ts": state["ts"],
     }
     assert "citations" not in state
-    assert "records" not in state
 
 
 @pytest.mark.asyncio
@@ -260,6 +267,63 @@ async def test_review_and_outcome_handlers_use_explicit_authority(monkeypatch):
 
     harness._set_intelligent_retrieval_context(event, _retrieval_response())
 
+    def usage(**kwargs):
+        seen["usage"] = kwargs
+        return {
+            "requested_action": "record_intelligent_response_usage",
+            "status": "recorded",
+            "response_task_id": kwargs["response_task_id"],
+            "provenance_markdown_path": "Outcomes/provenance.md",
+            "used_item_ids": ["ki_0123456789abcdef01234567"],
+            "candidate_review_id": "inote-9",
+            "promotion_performed": False,
+            "paid_api_used": False,
+            "research_performed": False,
+        }
+
+    monkeypatch.setattr(
+        bridge, "request_intelligent_response_usage", usage
+    )
+    response = await harness.record_intelligent_response_usage(
+        event,
+        (
+            "Follow [ki_0123456789abcdef01234567]"
+            "(storage/knowledge/ai-cost.md).\n"
+            "PROPOSED REFINEMENT: ki_0123456789abcdef01234567 | "
+            "Prefer cherry-picks and require verification before deploy."
+        ),
+        {
+            "messages": [
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {"function": {"name": "session_search"}}
+                    ],
+                }
+            ],
+            "history_offset": 0,
+            "provider": "openai-codex",
+            "model": "gpt-5",
+            "session_id": "session-1",
+        },
+    )
+    assert "PROPOSED REFINEMENT:" not in response
+    assert seen["usage"]["used_item_ids"] == [
+        "ki_0123456789abcdef01234567"
+    ]
+    assert seen["usage"]["other_context_sources"] == [
+        "tool:session_search"
+    ]
+    assert seen["usage"]["paid_web_research_api_used"] is False
+    assert seen["usage"]["refinement_item_id"] == (
+        "ki_0123456789abcdef01234567"
+    )
+    receipt = harness._active_intelligent_retrieval_context(event)
+    assert receipt["used_item_ids"] == [
+        "ki_0123456789abcdef01234567"
+    ]
+    assert receipt["refinement_review_id"] == "inote-9"
+
     def outcome(**kwargs):
         seen["outcome"] = kwargs
         return {
@@ -283,6 +347,57 @@ async def test_review_and_outcome_handlers_use_explicit_authority(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_retrieved_but_uncited_item_is_not_used_or_refined(monkeypatch):
+    import gateway.cogitator_intake_bridge as bridge
+
+    harness = RuntimeHarness()
+    harness._intake_config = lambda: (True, "http://bridge", "")
+    monkeypatch.setenv(bridge.TOKEN_ENV, "secret")
+    event = _event("What is our Hermes fork update policy?")
+    harness._set_intelligent_retrieval_context(event, _retrieval_response())
+    seen = {}
+
+    def usage(**kwargs):
+        seen.update(kwargs)
+        return {
+            "requested_action": "record_intelligent_response_usage",
+            "status": "recorded",
+            "response_task_id": kwargs["response_task_id"],
+            "provenance_markdown_path": "Outcomes/provenance.md",
+            "used_item_ids": [],
+            "candidate_review_id": "",
+            "promotion_performed": False,
+            "paid_api_used": False,
+            "research_performed": False,
+        }
+
+    monkeypatch.setattr(
+        bridge, "request_intelligent_response_usage", usage
+    )
+    cleaned = await harness.record_intelligent_response_usage(
+        event,
+        (
+            "Prefer selective updates and verify before deploy.\n"
+            "PROPOSED REFINEMENT: ki_0123456789abcdef01234567 | "
+            "Prefer cherry-picks."
+        ),
+        {
+            "messages": [],
+            "history_offset": 0,
+            "provider": "openai-codex",
+            "model": "gpt-5",
+            "session_id": "session-2",
+        },
+    )
+    assert "PROPOSED REFINEMENT:" not in cleaned
+    assert seen["used_item_ids"] == []
+    assert seen["refinement_item_id"] == ""
+    assert harness._active_intelligent_retrieval_context(event)[
+        "used_item_ids"
+    ] == []
+
+
+@pytest.mark.asyncio
 async def test_retrieval_handle_expires_and_wrong_item_fails_before_bridge(monkeypatch):
     import gateway.cogitator_intake_bridge as bridge
     import gateway.slash_commands as slash_commands
@@ -297,6 +412,9 @@ async def test_retrieval_handle_expires_and_wrong_item_fails_before_bridge(monke
     assert harness._active_intelligent_retrieval_context(event) is None
 
     harness._set_intelligent_retrieval_context(event, _retrieval_response())
+    harness._active_intelligent_retrieval_context(event)["used_item_ids"] = [
+        "ki_0123456789abcdef01234567"
+    ]
     command = bridge.parse_intelligent_outcome_command(
         "knowledge outcome useful ki_ffffffffffffffffffffffff"
     )

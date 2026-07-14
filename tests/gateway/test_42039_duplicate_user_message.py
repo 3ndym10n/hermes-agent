@@ -256,6 +256,9 @@ async def test_targeted_context_exists_only_in_one_agent_message(
     )
     runner._get_proxy_url = lambda: ""
     runner.retrieve_intelligent_task_context = AsyncMock(return_value=targeted)
+    runner.record_intelligent_response_usage = AsyncMock(
+        return_value="Use the cited operating lesson."
+    )
     runner._run_agent = AsyncMock(
         return_value={
             "final_response": "Use the cited operating lesson.",
@@ -275,6 +278,11 @@ async def test_targeted_context_exists_only_in_one_agent_message(
 
     runner.retrieve_intelligent_task_context.assert_awaited_once_with(
         event, original
+    )
+    runner.record_intelligent_response_usage.assert_awaited_once_with(
+        event,
+        "Use the cited operating lesson.",
+        runner._run_agent.return_value,
     )
     call = runner._run_agent.await_args.kwargs
     assert call["message"] == (
