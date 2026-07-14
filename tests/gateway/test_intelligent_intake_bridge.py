@@ -532,7 +532,7 @@ def test_retrieval_response_requires_opaque_receipt_and_never_accepts_server_pro
     rendered = ib.render_intelligent_retrieval_context(result)
     assert "ki_0123456789abcdef01234567" in rendered
     assert "storage/knowledge/ai-cost.md" in rendered
-    assert "[item_id](Markdown path)" in rendered
+    assert "COGITATOR USED: <item_id>" in rendered
     assert "PROPOSED REFINEMENT:" in rendered
 
     with pytest.raises(ib.IntakeBridgeError) as leaked:

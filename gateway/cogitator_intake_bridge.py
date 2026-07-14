@@ -885,9 +885,11 @@ def render_intelligent_retrieval_context(response: Mapping[str, Any]) -> str:
         return ""
     lines = [
         "[Targeted current/promoted Cogitator knowledge for this API turn]",
-        "Use only when relevant. For every item actually used, include the exact "
-        "visible citation [item_id](Markdown path); do not cite merely retrieved "
-        "items. Hypotheses and experiments remain explicitly provisional.",
+        "Use only when relevant. For every item actually used, append one exact "
+        "internal line: COGITATOR USED: <item_id>. Do not declare merely retrieved "
+        "items. The marker is removed before delivery; the user-facing answer does "
+        "not need to expose an internal filesystem path. Hypotheses and experiments "
+        "remain explicitly provisional.",
         "If the answer adds a substantive policy refinement, append exactly one "
         "line: PROPOSED REFINEMENT: <item_id> | <addition>. Omit it for wording "
         "changes or when no retrieved item was used. This marker is removed before "
