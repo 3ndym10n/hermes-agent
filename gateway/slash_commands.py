@@ -2328,6 +2328,7 @@ class GatewaySlashCommandsMixin:
                 "Intelligent intake is not configured.\n"
                 "The existing Cogitator bridge URL/token is required."
             )
+        authenticated_source = None
         try:
             prepared = await asyncio.to_thread(
                 request_intelligent_prepare,
@@ -2377,6 +2378,10 @@ class GatewaySlashCommandsMixin:
                 preparation_id=str(prepared["preparation_id"]),
                 reasoning_result=reasoning,
             )
+            if finalized.get("status") == "failed_reasoning":
+                self._persist_intelligent_reasoning_failure_receipt(
+                    prepared, authenticated_source, reasoning
+                )
             repair_prompt = str(finalized.get("repair_prompt") or "").strip()
             if (
                 finalized.get("status") == "failed_validation"
@@ -2409,6 +2414,59 @@ class GatewaySlashCommandsMixin:
                 "Raw input may have been preserved by Cogitator; no research "
                 "or promotion was performed."
             )
+
+
+    @staticmethod
+    def _persist_intelligent_reasoning_failure_receipt(
+        prepared: dict,
+        authenticated_source: Optional[dict],
+        reasoning: dict,
+        *,
+        receipt_root: Optional[Path] = None,
+    ) -> str:
+        if not authenticated_source:
+            return ""
+        raw_path = str(prepared.get("raw_path") or "")
+        stem = Path(raw_path).stem
+        if not re.fullmatch(r"isb-[a-f0-9]{64}", stem):
+            return ""
+        text = str(authenticated_source.get("text") or "")
+        root = receipt_root or (
+            Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
+            / "intake"
+            / "receipts"
+        )
+        root.mkdir(parents=True, exist_ok=True)
+        path = root / f"{stem}-provider-failure.json"
+        atomic_json_write(
+            path,
+            {
+                "receipt_version": "intelligent_intake_provider_failure_v1",
+                "raw_path": raw_path,
+                "canonical_url": str(authenticated_source.get("canonical_url") or ""),
+                "post_id": str(authenticated_source.get("post_id") or ""),
+                "author_identity_verified": bool(
+                    authenticated_source.get("author_handle")
+                ),
+                "source_type": str(authenticated_source.get("source_type") or ""),
+                "complete_source": authenticated_source.get("complete") is True,
+                "acquisition_mode": str(
+                    authenticated_source.get("acquisition_mode") or ""
+                ),
+                "source_length": len(text),
+                "source_sha256": hashlib.sha256(text.encode()).hexdigest(),
+                "provider_path": str(reasoning.get("provider_path") or ""),
+                "processing_status": "failed_reasoning",
+                "failure_category": str(reasoning.get("failure_category") or ""),
+                "retry_count": int(reasoning.get("retry_count") or 0),
+                "http_status": int(reasoning.get("http_status") or 0),
+                "paid_api_used": False,
+                "research_performed": False,
+                "promotion_performed": False,
+            },
+            indent=2,
+        )
+        return str(path)
 
 
     async def handle_intelligent_synthesis(self, event: MessageEvent) -> str:

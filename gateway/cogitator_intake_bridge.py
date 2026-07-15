@@ -534,18 +534,62 @@ def run_subscription_assessment(
     except Exception:
         result = None
     latency_ms = max(0, int((__import__("time").monotonic() - started) * 1000))
+    provider_path = f"hermes:{route['provider']}:oauth"
     if not isinstance(result, Mapping) or result.get("tools"):
         return {
             "provider_invoked": True,
-            "provider_path": f"hermes:{route['provider']}:oauth",
+            "provider_path": provider_path,
             "latency_ms": latency_ms,
             "model_response": None,
+            "processing_status": "failed_reasoning",
+            "failure_category": (
+                "tool_use_rejected" if isinstance(result, Mapping)
+                else "provider_unavailable"
+            ),
+            "retry_count": 0,
+            "http_status": 0,
+        }
+    final_response = str(result.get("final_response") or "").strip()
+    provider_error = str(result.get("error") or "").strip()
+    failure_text = provider_error or final_response
+    retry_match = re.search(r"after\s+(\d+)\s+retr(?:y|ies)", failure_text, re.I)
+    status_match = re.search(r"\bHTTP\s+(\d{3})\b", failure_text, re.I)
+    lower = final_response.lower()
+    failed = bool(
+        result.get("failed")
+        or provider_error
+        or not final_response
+        or lower.startswith("api call failed after")
+        or lower.startswith("<!doctype html")
+        or lower.startswith("<html")
+        or lower.startswith("⚠️ proxy error")
+        or lower.startswith("⚠️ proxy connection error")
+    )
+    if failed:
+        category = (
+            "empty_response"
+            if not final_response and not provider_error
+            else "provider_http_error"
+            if status_match
+            else "provider_retries_exhausted"
+            if retry_match
+            else "provider_error"
+        )
+        return {
+            "provider_invoked": True,
+            "provider_path": provider_path,
+            "latency_ms": latency_ms,
+            "model_response": None,
+            "processing_status": "failed_reasoning",
+            "failure_category": category,
+            "retry_count": int(retry_match.group(1)) if retry_match else 0,
+            "http_status": int(status_match.group(1)) if status_match else 0,
         }
     return {
         "provider_invoked": True,
-        "provider_path": f"hermes:{route['provider']}:oauth",
+        "provider_path": provider_path,
         "latency_ms": latency_ms,
-        "model_response": str(result.get("final_response") or "") or None,
+        "model_response": final_response,
     }
 
 
@@ -998,7 +1042,10 @@ def render_intelligent_intake_message(response: Mapping[str, Any]) -> str:
     }.get(source_status, "Reliable full source content was unavailable.")
     reason = {
         "failed_source": source_reason,
-        "failed_reasoning": "The eligible subscription reasoning turn failed.",
+        "failed_reasoning": (
+            "Source was recovered, but the reasoning provider was temporarily "
+            "unavailable. The item was preserved for retry."
+        ),
         "failed_validation": "The assessment response failed validation.",
         "rejected": str(response.get("error") or "The preparation expired."),
     }.get(status, "The intelligent intake path was unavailable.")

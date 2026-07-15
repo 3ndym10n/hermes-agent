@@ -183,6 +183,49 @@ def test_provider_failure_is_sanitized_for_safe_finalization():
     assert "error" not in result
 
 
+@pytest.mark.parametrize(
+    ("provider_result", "category", "retries", "status"),
+    [
+        (
+            {
+                "failed": True,
+                "error": (
+                    "API call failed after 3 retries: HTTP 520 — "
+                    "HTML error page (title not found)"
+                ),
+                "final_response": (
+                    "API call failed after 3 retries: HTTP 520 — "
+                    "HTML error page (title not found)"
+                ),
+                "tools": [],
+            },
+            "provider_http_error",
+            3,
+            520,
+        ),
+        ({"final_response": "<html>upstream failure</html>", "tools": []},
+         "provider_error", 0, 0),
+        ({"final_response": "", "tools": []}, "empty_response", 0, 0),
+    ],
+)
+def test_provider_failure_results_never_become_assessment_text(
+    provider_result, category, retries, status
+):
+    result = ib.run_subscription_assessment(
+        "assessment prompt",
+        provider="openai-codex",
+        api_mode="codex_responses",
+        run_turn=lambda *_args: provider_result,
+    )
+
+    assert result["processing_status"] == "failed_reasoning"
+    assert result["model_response"] is None
+    assert result["failure_category"] == category
+    assert result["retry_count"] == retries
+    assert result["http_status"] == status
+    assert "html" not in str(result).lower()
+
+
 def test_finalize_requires_preparation_but_allows_safe_no_provider_fallback():
     with pytest.raises(ib.IntakeBridgeError) as missing_id:
         ib.build_intelligent_finalize_request(
