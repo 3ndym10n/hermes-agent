@@ -505,6 +505,8 @@ def build_intelligent_finalize_request(
     provider_path: str,
     latency_ms: int,
     provider_invoked: bool,
+    retry_count: int = 0,
+    repair_attempt: bool = False,
 ) -> dict[str, Any]:
     if not str(preparation_id or "").strip():
         raise IntakeBridgeError("PREPARATION_ID_MISSING")
@@ -521,6 +523,8 @@ def build_intelligent_finalize_request(
             "provider_path": str(provider_path or "").strip(),
             "latency_ms": int(latency_ms),
             "provider_invoked": bool(provider_invoked),
+            "retry_count": max(0, int(retry_count or 0)),
+            "repair_attempt": bool(repair_attempt),
         },
     }
 
@@ -643,6 +647,18 @@ def _validate_intelligent_response(
         or response.get("promotion_performed") not in (False, None)
     ):
         raise IntakeBridgeError("BRIDGE_STATEFUL_RESPONSE")
+    if expected_action == "finalize_intelligent_intake":
+        expected_state = {
+            "ok": {"complete_assessment", "partial_assessment"},
+            "failed_reasoning": {"failed_reasoning"},
+            "failed_validation": {"invalid_core_assessment"},
+            "failed_source": {"needs_full_source"},
+            "rejected": {"failed_reasoning"},
+        }.get(status)
+        if expected_state and str(response.get("final_state") or "") not in expected_state:
+            raise IntakeBridgeError(
+                "BRIDGE_RESPONSE_INVALID", "final state does not match status"
+            )
     if expected_action == "prepare_intelligent_intake" and status == "ready":
         if (
             not str(response.get("preparation_id") or "").strip()
@@ -700,6 +716,7 @@ def request_intelligent_finalize(
     token: str,
     preparation_id: str,
     reasoning_result: Mapping[str, Any],
+    repair_attempt: bool = False,
     urlopen: Optional[Callable[..., Any]] = None,
 ) -> dict[str, Any]:
     packet = build_intelligent_finalize_request(
@@ -708,6 +725,8 @@ def request_intelligent_finalize(
         provider_path=str(reasoning_result.get("provider_path") or ""),
         latency_ms=int(reasoning_result.get("latency_ms") or 0),
         provider_invoked=bool(reasoning_result.get("provider_invoked")),
+        retry_count=int(reasoning_result.get("retry_count") or 0),
+        repair_attempt=repair_attempt,
     )
     response = _post_bridge(
         packet,
@@ -1196,13 +1215,17 @@ def render_intelligent_intake_message(response: Mapping[str, Any]) -> str:
         "partial_source_rejected": "X returned only partial source content.",
         "provider_unavailable": "The authenticated X provider was unavailable.",
     }.get(source_status, "Reliable full source content was unavailable.")
+    validation_error = str(response.get("error") or "").strip()
     reason = {
         "failed_source": source_reason,
         "failed_reasoning": (
             "Source was recovered, but the reasoning provider was temporarily "
             "unavailable. The item was preserved for retry."
         ),
-        "failed_validation": "The assessment response failed validation.",
+        "failed_validation": (
+            "The model response could not safely support a core assessment."
+            + (f" Field error: {validation_error}" if validation_error else "")
+        ),
         "rejected": str(response.get("error") or "The preparation expired."),
     }.get(status, "The intelligent intake path was unavailable.")
     raw_path = str(response.get("raw_path") or "").strip()

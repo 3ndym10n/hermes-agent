@@ -96,6 +96,8 @@ def test_prepare_and_finalize_packets_are_draft_only_and_bounded():
     assert finalize["requested_action"] == "finalize_intelligent_intake"
     assert finalize["approval_status"] == "draft_only"
     assert "promoted" not in finalize
+    assert finalize["context"]["retry_count"] == 0
+    assert finalize["context"]["repair_attempt"] is False
 
 
 @pytest.mark.parametrize(
@@ -263,6 +265,7 @@ def test_intelligent_response_validation_is_fail_closed():
     final = ib._validate_intelligent_response(
         {
             "status": "ok",
+            "final_state": "complete_assessment",
             "requested_action": "finalize_intelligent_intake",
             "item_id": "ki_1",
             "review_id": "inote-1",
@@ -278,6 +281,23 @@ def test_intelligent_response_validation_is_fail_closed():
         expected_action="finalize_intelligent_intake",
     )
     assert final["paid_api_used"] is False
+    with pytest.raises(ib.IntakeBridgeError) as state_error:
+        ib._validate_intelligent_response(
+            {**final, "final_state": "failed_reasoning"},
+            expected_action="finalize_intelligent_intake",
+        )
+    assert state_error.value.code == "BRIDGE_RESPONSE_INVALID"
+    rejected = ib._validate_intelligent_response(
+        {
+            "status": "rejected",
+            "final_state": "failed_reasoning",
+            "requested_action": "finalize_intelligent_intake",
+            "research_performed": False,
+            "promotion_performed": False,
+        },
+        expected_action="finalize_intelligent_intake",
+    )
+    assert rejected["final_state"] == "failed_reasoning"
     with pytest.raises(ib.IntakeBridgeError):
         ib._validate_intelligent_response(
             {**final, "research_performed": True},

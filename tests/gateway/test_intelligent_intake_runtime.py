@@ -350,7 +350,10 @@ async def test_intake_handler_repairs_structurally_close_response_once(
         }
 
     def finalize(**kwargs):
-        finalizations.append(kwargs["reasoning_result"]["model_response"])
+        finalizations.append((
+            kwargs["reasoning_result"]["model_response"],
+            kwargs.get("repair_attempt", False),
+        ))
         if len(finalizations) == 1:
             return {
                 "status": "failed_validation",
@@ -378,7 +381,9 @@ async def test_intake_handler_repairs_structurally_close_response_once(
     result = await harness.handle_intelligent_intake(_event(), intake)
 
     assert prompts == ["canonical assessment", "strict field repair"]
-    assert finalizations == ["invalid-empty-action", "repaired"]
+    assert finalizations == [
+        ("invalid-empty-action", False), ("repaired", True),
+    ]
     assert "REVIEW ID: inote-1" in result
     assert "PAID API: no" in result
 
@@ -427,7 +432,7 @@ async def test_intake_handler_never_attempts_a_third_reasoning_turn(
     )
 
     assert turns == ["first", "repair-again"]
-    assert "assessment response failed validation" in result.lower()
+    assert "could not safely support a core assessment" in result.lower()
     assert "/app/storage/intake/raw/preserved.txt" in result
 
 
