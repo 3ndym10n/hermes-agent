@@ -2345,6 +2345,21 @@ class GatewaySlashCommandsMixin:
                 preparation_id=str(prepared["preparation_id"]),
                 reasoning_result=reasoning,
             )
+            repair_prompt = str(finalized.get("repair_prompt") or "").strip()
+            if (
+                finalized.get("status") == "failed_validation"
+                and finalized.get("repair_allowed") is True
+                and repair_prompt
+            ):
+                repaired = await self._run_isolated_intelligent_assessment(
+                    repair_prompt, event
+                )
+                finalized = await asyncio.to_thread(
+                    request_intelligent_finalize,
+                    base_url=base_url, token=token,
+                    preparation_id=str(prepared["preparation_id"]),
+                    reasoning_result=repaired,
+                )
             return render_intelligent_intake_message(finalized)
         except IntakeBridgeError as exc:
             logger.warning(
