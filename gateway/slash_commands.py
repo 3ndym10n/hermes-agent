@@ -2305,6 +2305,9 @@ class GatewaySlashCommandsMixin:
     async def handle_intelligent_intake(
         self, event: MessageEvent, intake
     ) -> str:
+        from gateway.authenticated_x_source import (
+            fetch_authenticated_x_source,
+        )
         from gateway.cogitator_intake_bridge import (
             TOKEN_ENV,
             IntakeBridgeError,
@@ -2333,6 +2336,35 @@ class GatewaySlashCommandsMixin:
                 intake=intake,
                 origin=self._intake_origin(event),
             )
+            if (
+                prepared.get("status") != "ready"
+                and prepared.get("authenticated_fallback_eligible") is True
+            ):
+                authenticated_source = await asyncio.to_thread(
+                    fetch_authenticated_x_source, intake.raw_text
+                )
+                if (
+                    authenticated_source.get("status")
+                    == "fetched_full_authenticated"
+                    and authenticated_source.get("complete") is True
+                ):
+                    prepared = await asyncio.to_thread(
+                        request_intelligent_prepare,
+                        base_url=base_url,
+                        token=token,
+                        intake=intake,
+                        origin=self._intake_origin(event),
+                        authenticated_source=authenticated_source,
+                    )
+                else:
+                    prepared = dict(prepared)
+                    prepared["source_failure"] = {
+                        "status": str(
+                            authenticated_source.get("status")
+                            or "provider_unavailable"
+                        ),
+                        "via": "authenticated_x_fallback",
+                    }
             if prepared.get("status") != "ready":
                 return render_intelligent_intake_message(prepared)
             reasoning = await self._run_isolated_intelligent_assessment(

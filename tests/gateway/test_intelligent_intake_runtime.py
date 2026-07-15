@@ -130,6 +130,7 @@ async def test_ineligible_runtime_abstains_before_agent_construction(monkeypatch
 async def test_intake_handler_orders_prepare_reason_finalize_and_renders_receipt(
     monkeypatch,
 ):
+    import gateway.authenticated_x_source as xsource
     import gateway.cogitator_intake_bridge as bridge
 
     sequence = []
@@ -167,6 +168,13 @@ async def test_intake_handler_orders_prepare_reason_finalize_and_renders_receipt
         return final
 
     monkeypatch.setenv(bridge.TOKEN_ENV, "secret")
+    monkeypatch.setattr(
+        xsource,
+        "fetch_authenticated_x_source",
+        lambda _url: (_ for _ in ()).throw(
+            AssertionError("public ready source must not invoke fallback")
+        ),
+    )
     monkeypatch.setattr(bridge, "request_intelligent_prepare", prepare)
     monkeypatch.setattr(bridge, "request_intelligent_finalize", finalize)
     harness._run_isolated_intelligent_assessment = reason
@@ -611,3 +619,172 @@ async def test_retrieval_handle_expires_and_wrong_item_fails_before_bridge(monke
     )
     result = await harness.handle_intelligent_outcome(event, malformed)
     assert result.startswith("Knowledge outcome format:")
+
+
+@pytest.mark.parametrize(
+    ("failure_via", "source_type"),
+    [
+        ("x_longform_note_unavailable", "long_form_note"),
+        ("x_tweettombstone", "protected_post"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_recoverable_public_failure_uses_authenticated_source_once(
+    monkeypatch, failure_via, source_type
+):
+    import gateway.authenticated_x_source as xsource
+    import gateway.cogitator_intake_bridge as bridge
+
+    sequence = []
+    source = {
+        "status": "fetched_full_authenticated",
+        "canonical_url": "https://x.com/i/status/2076879176586699257",
+        "post_id": "2076879176586699257",
+        "author_handle": "viveksoft77",
+        "source_type": source_type,
+        "complete": True,
+        "text": "Complete source",
+        "captured_at": "2026-07-15T12:00:00+00:00",
+        "acquisition_mode": "authenticated_x_fallback",
+    }
+    harness = RuntimeHarness()
+    harness._intake_config = lambda: (True, "http://bridge", "")
+    harness._intake_origin = lambda _event: {}
+    monkeypatch.setenv(bridge.TOKEN_ENV, "secret")
+
+    def prepare(**kwargs):
+        sequence.append(
+            "authenticated_prepare"
+            if kwargs.get("authenticated_source")
+            else "public_prepare"
+        )
+        if kwargs.get("authenticated_source"):
+            assert kwargs["authenticated_source"] == source
+            return {
+                "status": "ready",
+                "preparation_id": "isbp_authenticated",
+                "prompt": "assess verified source",
+            }
+        return {
+            "status": "failed_source",
+            "authenticated_fallback_eligible": True,
+            "source_failure": {
+                "status": "needs_full_source",
+                "via": failure_via,
+            },
+        }
+
+    def fetch(url):
+        sequence.append("authenticated_fetch")
+        assert url.endswith("2076879176586699257")
+        return source
+
+    async def reason(prompt, _event):
+        sequence.append("reason")
+        assert prompt == "assess verified source"
+        return {
+            "provider_invoked": True,
+            "provider_path": "hermes:openai-codex:oauth",
+            "latency_ms": 1,
+            "model_response": "{}",
+        }
+
+    def finalize(**_kwargs):
+        sequence.append("finalize")
+        return {
+            "status": "ok",
+            "telegram_message": (
+                "VALUE: high\\nTYPE: operating_playbook\\n"
+                "REVIEW ID: inote-1\\n"
+                "PROVIDER: hermes:openai-codex:oauth\\nPAID API: no"
+            ),
+        }
+
+    monkeypatch.setattr(bridge, "request_intelligent_prepare", prepare)
+    monkeypatch.setattr(bridge, "request_intelligent_finalize", finalize)
+    monkeypatch.setattr(xsource, "fetch_authenticated_x_source", fetch)
+    harness._run_isolated_intelligent_assessment = reason
+
+    result = await harness.handle_intelligent_intake(
+        _event(),
+        ib.IntelligentIntake(
+            "https://x.com/i/status/2076879176586699257", "bare_url"
+        ),
+    )
+    assert sequence == [
+        "public_prepare",
+        "authenticated_fetch",
+        "authenticated_prepare",
+        "reason",
+        "finalize",
+    ]
+    assert "PAID API: no" in result
+
+
+@pytest.mark.asyncio
+async def test_ineligible_public_failure_never_calls_authenticated_fallback(monkeypatch):
+    import gateway.authenticated_x_source as xsource
+    import gateway.cogitator_intake_bridge as bridge
+
+    harness = RuntimeHarness()
+    harness._intake_config = lambda: (True, "http://bridge", "")
+    harness._intake_origin = lambda _event: {}
+    monkeypatch.setenv(bridge.TOKEN_ENV, "secret")
+    monkeypatch.setattr(
+        bridge,
+        "request_intelligent_prepare",
+        lambda **_kwargs: {
+            "status": "failed_source",
+            "authenticated_fallback_eligible": False,
+        },
+    )
+    monkeypatch.setattr(
+        xsource,
+        "fetch_authenticated_x_source",
+        lambda _url: (_ for _ in ()).throw(
+            AssertionError("fallback must remain untouched")
+        ),
+    )
+    result = await harness.handle_intelligent_intake(
+        _event(), ib.IntelligentIntake("https://x.com/i/status/1", "bare_url")
+    )
+    assert "could not complete" in result
+
+
+@pytest.mark.parametrize(
+    ("failure_status", "message"),
+    [
+        ("login_required", "burner X session requires login"),
+        ("forbidden_to_burner", "source is not visible to the burner account"),
+        ("source_not_found", "X did not return the requested source"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_authenticated_failure_surfaces_sanitized_category(
+    monkeypatch, failure_status, message
+):
+    import gateway.authenticated_x_source as xsource
+    import gateway.cogitator_intake_bridge as bridge
+
+    harness = RuntimeHarness()
+    harness._intake_config = lambda: (True, "http://bridge", "")
+    harness._intake_origin = lambda _event: {}
+    monkeypatch.setenv(bridge.TOKEN_ENV, "secret")
+    monkeypatch.setattr(
+        bridge,
+        "request_intelligent_prepare",
+        lambda **_kwargs: {
+            "status": "failed_source",
+            "authenticated_fallback_eligible": True,
+        },
+    )
+    monkeypatch.setattr(
+        xsource,
+        "fetch_authenticated_x_source",
+        lambda _url: {"status": failure_status, "complete": False},
+    )
+    result = await harness.handle_intelligent_intake(
+        _event(), ib.IntelligentIntake("https://x.com/i/status/1", "bare_url")
+    )
+    assert message in result
+    assert "No research or promotion was performed" in result
