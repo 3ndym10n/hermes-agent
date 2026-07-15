@@ -240,6 +240,17 @@ _REVIEW_COMMAND_ATTEMPT_RE = re.compile(
     r"merge|update)\s+knowledge)\b",
     re.IGNORECASE,
 )
+_REVIEW_DETAIL_RE = re.compile(
+    r"^(?:show(?:\s+me)?(?:\s+the)?(?:\s+full)?\s+assessment(?:\s+for)?|"
+    r"show\s+lifecycle(?:\s+for)?|view|review\s+details(?:\s+for)?)\s+"
+    r"(inote-[1-9][0-9]{0,9})[.?!]?$",
+    re.IGNORECASE,
+)
+_REVIEW_DETAIL_ATTEMPT_RE = re.compile(
+    r"^(?:show(?:\s+me)?(?:\s+the)?(?:\s+full)?\s+assessment|"
+    r"show\s+lifecycle|view|review\s+details)\b",
+    re.IGNORECASE,
+)
 _OUTCOME_COMMAND_RE = re.compile(
     r"^knowledge\s+outcome\s+"
     r"(used|useful|partially[ _-]useful|not[ _-]useful|corrected|superseded)"
@@ -263,6 +274,16 @@ _REVIEW_ACTIONS = {
 
 def parse_intelligent_review_command(text: str) -> IntelligentReviewCommand | None:
     raw = " ".join(str(text or "").strip().split())
+    if raw.lower().rstrip(".?!") == "list review candidates":
+        return IntelligentReviewCommand(action="list_candidates")
+    detail = _REVIEW_DETAIL_RE.fullmatch(raw)
+    if detail:
+        payload = "" if raw.lower().startswith("show lifecycle") else "assessment"
+        return IntelligentReviewCommand(detail.group(1), "view_related", payload)
+    if _REVIEW_DETAIL_ATTEMPT_RE.match(raw) and re.search(
+        r"\binote-\S+", raw, re.IGNORECASE
+    ):
+        return IntelligentReviewCommand(error="invalid_review_command")
     match = _REVIEW_COMMAND_RE.fullmatch(raw)
     if not match:
         if _REVIEW_COMMAND_ATTEMPT_RE.match(raw):
@@ -354,7 +375,12 @@ def build_intelligent_synthesis_request() -> dict[str, Any]:
 def build_intelligent_review_request(
     command: IntelligentReviewCommand,
 ) -> dict[str, Any]:
-    if command.error or not command.review_id or not command.action:
+    if (
+        command.error
+        or not command.action
+        or (command.action != "list_candidates" and not command.review_id)
+        or (command.action == "list_candidates" and command.review_id)
+    ):
         raise IntakeBridgeError("REVIEW_COMMAND_INVALID")
     return {
         "source_agent": "hermes",
@@ -362,7 +388,9 @@ def build_intelligent_review_request(
         "user_intent": "Apply one explicit Cal review action.",
         "content": "",
         "approval_status": (
-            "draft_only" if command.action == "view_related" else "approved"
+            "draft_only"
+            if command.action in {"view_related", "list_candidates"}
+            else "approved"
         ),
         "risk_level": "low",
         "context": {
@@ -747,16 +775,29 @@ def request_intelligent_review(
         "archive": {"applied", "already_applied"},
         "request_explicit_research": {"research_requested"},
         "view_related": {"ok"},
+        "list_candidates": {"ok"},
         "convert_to_experiment": {"candidate_created"},
         "update_or_merge": {"candidate_created"},
     }
     if status not in expected_statuses.get(command.action, set()):
         raise IntakeBridgeError("BRIDGE_RESPONSE_INVALID")
-    if (
-        result.get("action") != command.action
-        or not re.fullmatch(
-            r"ki_[a-f0-9]{24}", str(result.get("item_id") or "")
-        )
+    if result.get("action") != command.action:
+        raise IntakeBridgeError("BRIDGE_RESPONSE_INVALID")
+    if command.action == "list_candidates":
+        candidates = result.get("candidates")
+        if not isinstance(candidates, list) or result.get("mutation_performed") is not False:
+            raise IntakeBridgeError("BRIDGE_RESPONSE_INVALID")
+        for candidate in candidates:
+            if (
+                not isinstance(candidate, Mapping)
+                or not re.fullmatch(
+                    r"inote-[1-9][0-9]*", str(candidate.get("review_id") or "")
+                )
+            ):
+                raise IntakeBridgeError("BRIDGE_RESPONSE_INVALID")
+        return result
+    if not re.fullmatch(
+        r"ki_[a-f0-9]{24}", str(result.get("item_id") or "")
     ):
         raise IntakeBridgeError("BRIDGE_RESPONSE_INVALID")
     if status in {"applied", "already_applied"}:
@@ -778,8 +819,22 @@ def request_intelligent_review(
         r"inote-[1-9][0-9]*", str(result.get("candidate_review_id") or "")
     ):
         raise IntakeBridgeError("BRIDGE_RESPONSE_INVALID")
-    elif status == "ok" and not isinstance(result.get("relations"), list):
-        raise IntakeBridgeError("BRIDGE_RESPONSE_INVALID")
+    elif status == "ok":
+        if (
+            result.get("review_id") != command.review_id
+            or not isinstance(result.get("relations"), list)
+        ):
+            raise IntakeBridgeError("BRIDGE_RESPONSE_INVALID")
+        if command.payload == "assessment":
+            detail = result.get("assessment_detail")
+            if (
+                not isinstance(detail, Mapping)
+                or detail.get("knowledge_item_id") != result.get("item_id")
+                or detail.get("markdown_path") != result.get("markdown_path")
+                or detail.get("lifecycle") != result.get("lifecycle_state")
+                or result.get("mutation_performed") is not False
+            ):
+                raise IntakeBridgeError("BRIDGE_RESPONSE_INVALID")
     return result
 
 
@@ -973,6 +1028,107 @@ def render_intelligent_review_message(response: Mapping[str, Any]) -> str:
     status = str(response.get("status") or "")
     if status == "blocked":
         return f"Knowledge review blocked: {response.get('reason') or 'not applicable'}."
+    candidates = response.get("candidates")
+    if isinstance(candidates, list):
+        lines = ["Review candidates:"]
+        for candidate in candidates[:25]:
+            title = " ".join(str(candidate.get("title") or "Untitled").split())
+            if len(title) > 120:
+                title = f"{title[:117]}..."
+            lines.append(
+                f"- {candidate.get('review_id')} | "
+                f"{candidate.get('disposition') or 'unknown'} | {title}"
+            )
+        if not candidates:
+            lines.append("No review candidates are currently available.")
+        elif len(candidates) > 25:
+            lines.append(f"- {len(candidates) - 25} more")
+        lines.append("PAID API: no")
+        return "\n".join(lines)
+    detail = response.get("assessment_detail")
+    if isinstance(detail, Mapping):
+        unavailable = "Not available in persisted assessment"
+
+        def stored(value: Any) -> str:
+            if value is None or value == "" or value == []:
+                return unavailable
+            if isinstance(value, bool):
+                return "yes" if value else "no"
+            if isinstance(value, list):
+                return "; ".join(str(entry) for entry in value) or unavailable
+            return str(value)
+
+        related = [
+            f"{relation_type} {item_id}"
+            for item_id, relation_type in zip(
+                detail.get("related_memory_ids") or [],
+                detail.get("relation_types") or [],
+            )
+        ]
+        if not related:
+            current = str(detail.get("knowledge_item_id") or "")
+            for relation in response.get("relations") or []:
+                if not isinstance(relation, Mapping):
+                    continue
+                source = str(relation.get("source_item_id") or "")
+                target = str(relation.get("target_item_id") or "")
+                other = target if source == current else source
+                if other:
+                    related.append(
+                        f"{relation.get('relation_type') or 'related'} {other}"
+                    )
+        comparison = stored(detail.get("duplication_status"))
+        additions = []
+        for label, field in (
+            ("reinforcement", "reinforcement"),
+            ("refinement", "refinement"),
+            ("contradiction", "contradictions"),
+        ):
+            values = detail.get(field)
+            if values:
+                additions.append(f"{label}: {stored(values)}")
+        if additions:
+            comparison = f"{comparison}; {'; '.join(additions)}"
+        evidence = stored(detail.get("evidence_quality"))
+        confidence = stored(detail.get("confidence"))
+        trust = (
+            unavailable
+            if evidence == unavailable and confidence == unavailable
+            else f"{evidence} evidence; confidence {confidence}"
+        )
+        cost = detail.get("estimated_paid_cost")
+        cost_text = f"{float(cost):.4f}" if isinstance(cost, (int, float)) else stored(cost)
+        return "\n".join(
+            [
+                f"VALUE: {stored(detail.get('value'))}",
+                f"TYPE: {stored(detail.get('content_type'))}",
+                f"CORE IDEA: {stored(detail.get('core_idea'))}",
+                f"TRUST: {trust}",
+                f"WHY IT MATTERS: {stored(detail.get('why_it_matters'))}",
+                f"RELATED KNOWLEDGE: {stored(related)}",
+                f"NEW / DUPLICATE / REINFORCEMENT / REFINEMENT / CONTRADICTION: {comparison}",
+                f"WHAT IT CHANGES: {stored(detail.get('what_this_changes'))}",
+                f"RECOMMENDED ACTION: {stored(detail.get('recommended_action'))}",
+                f"SMALLEST TEST: {stored(detail.get('smallest_test'))}",
+                f"DO NOT: {stored(detail.get('do_not_do'))}",
+                f"LIFECYCLE: {stored(detail.get('lifecycle'))}",
+                f"KNOWLEDGE ITEM: {stored(detail.get('knowledge_item_id'))}",
+                f"MARKDOWN: {stored(detail.get('markdown_path'))}",
+                f"REVIEW ID: {stored(response.get('review_id'))}",
+                f"PROVIDER: {stored(detail.get('provider_path'))}",
+                f"PAID API: {stored(detail.get('paid_api_used'))} (estimated cost: {cost_text})",
+            ]
+        )
+    if status == "ok" and response.get("lifecycle_state"):
+        return "\n".join(
+            [
+                f"LIFECYCLE: {response['lifecycle_state']}",
+                f"KNOWLEDGE ITEM: {response.get('item_id') or 'not available'}",
+                f"MARKDOWN: {response.get('markdown_path') or 'not available'}",
+                f"REVIEW ID: {response.get('review_id') or 'not available'}",
+                "PAID API: no",
+            ]
+        )
     lines = [f"Knowledge review: {status.replace('_', ' ')}."]
     if response.get("promoted_path"):
         lines.append(f"Promoted Markdown: {response['promoted_path']}")

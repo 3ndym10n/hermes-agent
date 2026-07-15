@@ -264,6 +264,54 @@ async def test_intelligent_review_dispatches_at_gateway_boundary():
 
 
 @pytest.mark.asyncio
+async def test_assessment_detail_bypasses_busy_or_failed_provider_boundary():
+    runner = _make_runner()
+    runner.handle_intelligent_review = AsyncMock(return_value="stored assessment")
+    agent = next(iter(runner._running_agents.values()))
+    agent.run_conversation.side_effect = AssertionError(
+        "deterministic review must not invoke the provider"
+    )
+
+    result = await runner._handle_message(
+        _make_event("Show me the full assessment for inote-384.")
+    )
+
+    runner.handle_intelligent_review.assert_awaited_once()
+    command = runner.handle_intelligent_review.await_args.args[1]
+    assert (
+        command.review_id,
+        command.action,
+        command.payload,
+    ) == ("inote-384", "view_related", "assessment")
+    agent.run_conversation.assert_not_called()
+    assert result == "stored assessment"
+
+
+@pytest.mark.asyncio
+async def test_list_review_candidates_bypasses_provider_boundary():
+    runner = _make_runner()
+    runner.handle_intelligent_review = AsyncMock(
+        return_value="stored review candidates"
+    )
+    agent = next(iter(runner._running_agents.values()))
+    agent.run_conversation.side_effect = AssertionError(
+        "candidate listing must not invoke the provider"
+    )
+
+    result = await runner._handle_message(
+        _make_event("List review candidates.")
+    )
+
+    runner.handle_intelligent_review.assert_awaited_once()
+    command = runner.handle_intelligent_review.await_args.args[1]
+    assert (command.review_id, command.action, command.payload) == (
+        "", "list_candidates", ""
+    )
+    agent.run_conversation.assert_not_called()
+    assert result == "stored review candidates"
+
+
+@pytest.mark.asyncio
 async def test_intelligent_outcome_dispatches_at_gateway_boundary():
     runner = _make_runner()
     runner.handle_intelligent_outcome = AsyncMock(return_value="outcome receipt")
