@@ -2396,6 +2396,7 @@ class GatewaySlashCommandsMixin:
                     base_url=base_url, token=token,
                     preparation_id=str(prepared["preparation_id"]),
                     reasoning_result=repaired,
+                    repair_attempt=True,
                 )
             return render_intelligent_intake_message(finalized)
         except IntakeBridgeError as exc:
