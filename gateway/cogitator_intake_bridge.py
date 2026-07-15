@@ -449,11 +449,14 @@ def build_intelligent_prepare_request(
     intake: IntelligentIntake,
     *,
     origin: Mapping[str, Any] | None = None,
+    authenticated_source: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     context: dict[str, Any] = {
         "raw_text": intake.raw_text,
         "input_kind": intake.input_kind,
     }
+    if authenticated_source is not None:
+        context["authenticated_source"] = dict(authenticated_source)
     if origin is not None:
         context["origin"] = _delivery_origin(origin)
     return {
@@ -602,9 +605,12 @@ def request_intelligent_prepare(
     token: str,
     intake: IntelligentIntake,
     origin: Mapping[str, Any] | None = None,
+    authenticated_source: Mapping[str, Any] | None = None,
     urlopen: Optional[Callable[..., Any]] = None,
 ) -> dict[str, Any]:
-    packet = build_intelligent_prepare_request(intake, origin=origin)
+    packet = build_intelligent_prepare_request(
+        intake, origin=origin, authenticated_source=authenticated_source
+    )
     response = _post_bridge(
         packet,
         base_url=str(base_url or "").strip(),
@@ -975,8 +981,23 @@ def render_intelligent_intake_message(response: Mapping[str, Any]) -> str:
     status = str(response.get("status") or "")
     if status == "ok":
         return str(response.get("telegram_message") or "").strip()
+    source_failure = response.get("source_failure")
+    source_status = (
+        str(source_failure.get("status") or "")
+        if isinstance(source_failure, Mapping)
+        else ""
+    )
+    source_reason = {
+        "auth_session_expired": "The burner X session expired.",
+        "login_required": "The burner X session requires login.",
+        "forbidden_to_burner": "The source is not visible to the burner account.",
+        "source_not_found": "X did not return the requested source.",
+        "identity_mismatch": "X returned a different source identity.",
+        "partial_source_rejected": "X returned only partial source content.",
+        "provider_unavailable": "The authenticated X provider was unavailable.",
+    }.get(source_status, "Reliable full source content was unavailable.")
     reason = {
-        "failed_source": "Reliable full source content was unavailable.",
+        "failed_source": source_reason,
         "failed_reasoning": "The eligible subscription reasoning turn failed.",
         "failed_validation": "The assessment response failed validation.",
         "rejected": str(response.get("error") or "The preparation expired."),
