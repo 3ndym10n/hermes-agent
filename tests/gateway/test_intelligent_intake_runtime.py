@@ -1,3 +1,6 @@
+import hashlib
+import json
+
 import pytest
 
 from gateway import cogitator_intake_bridge as ib
@@ -184,6 +187,130 @@ async def test_intake_handler_orders_prepare_reason_finalize_and_renders_receipt
 
     assert sequence == ["prepare", "reason", "finalize"]
     assert result == final["telegram_message"]
+
+
+def test_failed_reasoning_receipt_is_safe_and_traceable(tmp_path):
+    raw_path = (
+        "/app/storage/intake/raw/"
+        "isb-20b43d376a74f9ece633d71fb2e228ac7bdfec960a607eb8cdc4bff9f9e11de5.txt"
+    )
+    source = {
+        "canonical_url": "https://x.com/i/status/2077156239059107867",
+        "post_id": "2077156239059107867",
+        "author_handle": "verified_author",
+        "source_type": "long_form_note",
+        "complete": True,
+        "text": "complete recovered source",
+        "acquisition_mode": "authenticated_x_fallback",
+    }
+    reasoning = {
+        "provider_path": "hermes:openai-codex:oauth",
+        "failure_category": "provider_http_error",
+        "retry_count": 3,
+        "http_status": 520,
+    }
+
+    path = RuntimeHarness._persist_intelligent_reasoning_failure_receipt(
+        {"raw_path": raw_path}, source, reasoning, receipt_root=tmp_path
+    )
+    receipt = json.loads(open(path, encoding="utf-8").read())
+
+    assert receipt["raw_path"] == raw_path
+    assert receipt["acquisition_mode"] == "authenticated_x_fallback"
+    assert receipt["complete_source"] is True
+    assert receipt["source_length"] == len(source["text"])
+    assert receipt["source_sha256"] == hashlib.sha256(
+        source["text"].encode()
+    ).hexdigest()
+    assert receipt["retry_count"] == 3
+    assert receipt["http_status"] == 520
+    assert receipt["paid_api_used"] is False
+    assert receipt["research_performed"] is False
+    assert receipt["promotion_performed"] is False
+    assert source["text"] not in open(path, encoding="utf-8").read()
+
+
+@pytest.mark.asyncio
+async def test_provider_failure_skips_schema_repair_and_remains_retryable(monkeypatch):
+    import gateway.authenticated_x_source as xsource
+    import gateway.cogitator_intake_bridge as bridge
+
+    harness = RuntimeHarness()
+    harness._intake_config = lambda: (True, "http://bridge", "")
+    harness._intake_origin = lambda _event: {
+        "platform": "telegram", "chat_id": "1", "chat_type": "dm"
+    }
+    source = {
+        "status": "fetched_full_authenticated",
+        "canonical_url": "https://x.com/i/status/2077156239059107867",
+        "post_id": "2077156239059107867",
+        "author_handle": "verified_author",
+        "source_type": "long_form_note",
+        "complete": True,
+        "text": "complete source",
+        "captured_at": "2026-07-15T08:40:00+00:00",
+        "acquisition_mode": "authenticated_x_fallback",
+    }
+    prepares = []
+    finalizations = []
+    receipts = []
+
+    def prepare(**kwargs):
+        prepares.append(kwargs)
+        if kwargs.get("authenticated_source"):
+            return {
+                "status": "ready",
+                "preparation_id": "isbp_provider_failure",
+                "prompt": "canonical assessment",
+                "raw_path": (
+                    "/app/storage/intake/raw/"
+                    "isb-20b43d376a74f9ece633d71fb2e228ac7bdfec960a607eb8cdc4bff9f9e11de5.txt"
+                ),
+            }
+        return {"status": "failed_source", "authenticated_fallback_eligible": True}
+
+    async def reason(_prompt, _event):
+        return {
+            "provider_invoked": True,
+            "provider_path": "hermes:openai-codex:oauth",
+            "latency_ms": 10,
+            "model_response": None,
+            "processing_status": "failed_reasoning",
+            "failure_category": "provider_http_error",
+            "retry_count": 3,
+            "http_status": 520,
+        }
+
+    def finalize(**kwargs):
+        finalizations.append(kwargs)
+        assert kwargs["reasoning_result"]["model_response"] is None
+        return {
+            "status": "failed_reasoning",
+            "raw_path": prepares[-1]["intake"].raw_text,
+            "research_performed": False,
+            "promotion_performed": False,
+        }
+
+    monkeypatch.setenv(bridge.TOKEN_ENV, "secret")
+    monkeypatch.setattr(bridge, "request_intelligent_prepare", prepare)
+    monkeypatch.setattr(bridge, "request_intelligent_finalize", finalize)
+    monkeypatch.setattr(xsource, "fetch_authenticated_x_source", lambda _url: source)
+    harness._run_isolated_intelligent_assessment = reason
+    harness._persist_intelligent_reasoning_failure_receipt = (
+        lambda *args: receipts.append(args) or "receipt.json"
+    )
+
+    result = await harness.handle_intelligent_intake(
+        _event(),
+        ib.IntelligentIntake(
+            "https://x.com/i/status/2077156239059107867", "bare_url"
+        ),
+    )
+
+    assert len(finalizations) == 1
+    assert len(receipts) == 1
+    assert "temporarily unavailable" in result
+    assert "preserved for retry" in result
 
 
 @pytest.mark.asyncio
