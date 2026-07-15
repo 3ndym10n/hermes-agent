@@ -34,7 +34,12 @@ def _failed(status: str) -> dict[str, Any]:
 def _session_values(cookie_path: Path, *, now: float) -> tuple[str, str] | str:
     try:
         info = cookie_path.stat()
-        if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) & 0o077:
+        geteuid = getattr(os, "geteuid", None)
+        if (
+            geteuid is None
+            or info.st_uid != geteuid()
+            or stat.S_IMODE(info.st_mode) & 0o077
+        ):
             return "login_required"
         jar = http.cookiejar.MozillaCookieJar(str(cookie_path))
         jar.load(ignore_discard=True, ignore_expires=True)

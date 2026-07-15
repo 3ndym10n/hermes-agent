@@ -87,6 +87,17 @@ def test_gate_is_checked_before_cookie_or_provider_access(tmp_path):
     assert result == {"status": "provider_unavailable", "complete": False}
 
 
+def test_session_ownership_check_fails_closed_without_geteuid(tmp_path, monkeypatch):
+    monkeypatch.delattr(xsource.os, "geteuid")
+    result = xsource.fetch_authenticated_x_source(
+        URL,
+        environ={xsource.FEATURE_ENV: "true"},
+        cookie_path=_session(tmp_path),
+        binary_path=_binary(tmp_path),
+    )
+    assert result == {"status": "login_required", "complete": False}
+
+
 def test_fixed_read_only_command_and_minimal_child_environment(tmp_path):
     result, calls = _fetch(tmp_path, _completed())
     assert result["status"] == "fetched_full_authenticated"
