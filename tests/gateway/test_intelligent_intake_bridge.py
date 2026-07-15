@@ -324,6 +324,31 @@ def test_review_and_outcome_commands_are_explicit_and_strict():
     assert approved == ib.IntelligentReviewCommand("inote-12", "approve", "")
     related = ib.parse_intelligent_review_command("knowledge related inote-12")
     assert related.action == "view_related"
+    for text in (
+        "show assessment for inote-384",
+        "view inote-384",
+        "review details inote-384",
+        "Show me the full assessment for inote-384.",
+    ):
+        detail = ib.parse_intelligent_review_command(text)
+        assert detail == ib.IntelligentReviewCommand(
+            "inote-384", "view_related", "assessment"
+        )
+    assert ib.parse_intelligent_review_command("view inote-0").error == (
+        "invalid_review_command"
+    )
+    lifecycle = ib.parse_intelligent_review_command(
+        "show lifecycle inote-384"
+    )
+    assert lifecycle == ib.IntelligentReviewCommand(
+        "inote-384", "view_related", ""
+    )
+    candidates = ib.parse_intelligent_review_command(
+        "List review candidates."
+    )
+    assert candidates == ib.IntelligentReviewCommand(
+        "", "list_candidates", ""
+    )
     merged = ib.parse_intelligent_review_command(
         "knowledge merge inote-12 Merge the cost lesson"
     )
@@ -354,6 +379,163 @@ def test_review_and_outcome_commands_are_explicit_and_strict():
         "knowledge outcome useful ki_not-a-real-item Saved labour"
     ).error == "invalid_item_id"
     assert ib.parse_intelligent_outcome_command("the outcome was useful") is None
+
+
+def test_persisted_assessment_detail_is_validated_and_rendered_without_model():
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return __import__("json").dumps(payload).encode()
+
+    payload = {
+        "requested_action": "review_intelligent_knowledge",
+        "status": "ok",
+        "action": "view_related",
+        "item_id": "ki_20b43d376a74f9ece633d71f",
+        "review_id": "inote-384",
+        "lifecycle_state": "review_candidate",
+        "markdown_path": (
+            "storage/notes/knowledge/ki_20b43d376a74f9ece633d71f.md"
+        ),
+        "relations": [],
+        "mutation_performed": False,
+        "paid_api_used": False,
+        "research_performed": False,
+        "assessment_detail": {
+            "value": "medium",
+            "content_type": "operating_playbook",
+            "core_idea": "Automate bounded workflows with deterministic guardrails.",
+            "evidence_quality": "weak",
+            "confidence": 0.74,
+            "why_it_matters": "It identifies practical high-ROI agent work.",
+            "related_memory_ids": [],
+            "relation_types": [],
+            "duplication_status": "new",
+            "reinforcement": [],
+            "refinement": [],
+            "contradictions": [],
+            "what_this_changes": "Use deterministic code around model judgment.",
+            "recommended_action": "Keep as latent operating context.",
+            "smallest_test": "Map one workflow and measure it.",
+            "do_not_do": None,
+            "lifecycle": "review_candidate",
+            "knowledge_item_id": "ki_20b43d376a74f9ece633d71f",
+            "markdown_path": (
+                "storage/notes/knowledge/ki_20b43d376a74f9ece633d71f.md"
+            ),
+            "provider_path": "hermes:openai-codex:oauth",
+            "paid_api_used": False,
+            "estimated_paid_cost": 0,
+        },
+    }
+    command = ib.IntelligentReviewCommand(
+        "inote-384", "view_related", "assessment"
+    )
+    result = ib.request_intelligent_review(
+        base_url="http://bridge",
+        token="secret",
+        command=command,
+        urlopen=lambda *_args, **_kwargs: Response(),
+    )
+    rendered = ib.render_intelligent_review_message(result)
+
+    assert "VALUE: medium" in rendered
+    assert "TYPE: operating_playbook" in rendered
+    assert "KNOWLEDGE ITEM: ki_20b43d376a74f9ece633d71f" in rendered
+    assert "PROVIDER: hermes:openai-codex:oauth" in rendered
+    assert "PAID API: no (estimated cost: 0.0000)" in rendered
+    assert "DO NOT: Not available in persisted assessment" in rendered
+    assert "RELATED KNOWLEDGE: Not available in persisted assessment" in rendered
+
+    payload["review_id"] = "inote-999"
+    with pytest.raises(ib.IntakeBridgeError):
+        ib.request_intelligent_review(
+            base_url="http://bridge",
+            token="secret",
+            command=command,
+            urlopen=lambda *_args, **_kwargs: Response(),
+        )
+    payload["review_id"] = "inote-384"
+    payload["assessment_detail"]["knowledge_item_id"] = (
+        "ki_ffffffffffffffffffffffff"
+    )
+    with pytest.raises(ib.IntakeBridgeError):
+        ib.request_intelligent_review(
+            base_url="http://bridge",
+            token="secret",
+            command=command,
+            urlopen=lambda *_args, **_kwargs: Response(),
+        )
+
+
+def test_candidate_list_is_validated_and_rendered_without_provider():
+    command = ib.IntelligentReviewCommand(action="list_candidates")
+    packet = ib.build_intelligent_review_request(command)
+    assert packet["approval_status"] == "draft_only"
+    assert packet["context"] == {
+        "review_id": "",
+        "action": "list_candidates",
+        "payload": "",
+    }
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return __import__("json").dumps(payload).encode()
+
+    payload = {
+        "requested_action": "review_intelligent_knowledge",
+        "status": "ok",
+        "action": "list_candidates",
+        "candidates": [
+            {
+                "review_id": "inote-384",
+                "title": "Stored assessment",
+                "disposition": "review",
+                "reason": "Awaiting Cal",
+            }
+        ],
+        "mutation_performed": False,
+        "paid_api_used": False,
+        "research_performed": False,
+    }
+    result = ib.request_intelligent_review(
+        base_url="http://bridge",
+        token="secret",
+        command=command,
+        urlopen=lambda *_args, **_kwargs: Response(),
+    )
+    rendered = ib.render_intelligent_review_message(result)
+    assert "inote-384 | review | Stored assessment" in rendered
+    assert "PAID API: no" in rendered
+
+
+def test_lifecycle_view_renders_canonical_stored_state():
+    rendered = ib.render_intelligent_review_message(
+        {
+            "status": "ok",
+            "item_id": "ki_20b43d376a74f9ece633d71f",
+            "review_id": "inote-384",
+            "lifecycle_state": "review_candidate",
+            "markdown_path": (
+                "storage/notes/knowledge/ki_20b43d376a74f9ece633d71f.md"
+            ),
+        }
+    )
+
+    assert "LIFECYCLE: review_candidate" in rendered
+    assert "KNOWLEDGE ITEM: ki_20b43d376a74f9ece633d71f" in rendered
+    assert "PAID API: no" in rendered
 
 
 def test_action_success_receipts_must_echo_durable_results():
