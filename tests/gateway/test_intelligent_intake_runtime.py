@@ -178,6 +178,124 @@ async def test_intake_handler_orders_prepare_reason_finalize_and_renders_receipt
     assert result == final["telegram_message"]
 
 
+@pytest.mark.asyncio
+async def test_intake_handler_repairs_structurally_close_response_once(
+    monkeypatch,
+):
+    import gateway.cogitator_intake_bridge as bridge
+
+    prompts = []
+    finalizations = []
+    harness = RuntimeHarness()
+    harness._intake_config = lambda: (True, "http://bridge", "")
+    harness._intake_origin = lambda _event: {
+        "platform": "telegram", "chat_id": "c1", "chat_type": "dm",
+    }
+
+    monkeypatch.setenv(bridge.TOKEN_ENV, "secret")
+    monkeypatch.setattr(
+        bridge,
+        "request_intelligent_prepare",
+        lambda **_kwargs: {
+            "status": "ready",
+            "preparation_id": "isbp_exact_x",
+            "prompt": "canonical assessment",
+        },
+    )
+
+    async def reason(prompt, _event):
+        prompts.append(prompt)
+        return {
+            "provider_invoked": True,
+            "provider_path": "hermes:openai-codex:oauth",
+            "latency_ms": 1,
+            "model_response": (
+                "invalid-empty-action" if len(prompts) == 1 else "repaired"
+            ),
+        }
+
+    def finalize(**kwargs):
+        finalizations.append(kwargs["reasoning_result"]["model_response"])
+        if len(finalizations) == 1:
+            return {
+                "status": "failed_validation",
+                "repair_allowed": True,
+                "repair_prompt": "strict field repair",
+            }
+        return {
+            "status": "ok",
+            "telegram_message": (
+                "VALUE: high\nTYPE: technical_insight\n"
+                "REVIEW ID: inote-1\n"
+                "PROVIDER: hermes:openai-codex:oauth\n"
+                "PAID API: no"
+            ),
+        }
+
+    monkeypatch.setattr(bridge, "request_intelligent_finalize", finalize)
+    harness._run_isolated_intelligent_assessment = reason
+    intake = ib.IntelligentIntake(
+        "https://x.com/i/status/2076620451007119673",
+        "bare_url",
+        True,
+    )
+
+    result = await harness.handle_intelligent_intake(_event(), intake)
+
+    assert prompts == ["canonical assessment", "strict field repair"]
+    assert finalizations == ["invalid-empty-action", "repaired"]
+    assert "REVIEW ID: inote-1" in result
+    assert "PAID API: no" in result
+
+
+@pytest.mark.asyncio
+async def test_intake_handler_never_attempts_a_third_reasoning_turn(
+    monkeypatch,
+):
+    import gateway.cogitator_intake_bridge as bridge
+
+    turns = []
+    harness = RuntimeHarness()
+    harness._intake_config = lambda: (True, "http://bridge", "")
+    harness._intake_origin = lambda _event: {}
+    monkeypatch.setenv(bridge.TOKEN_ENV, "secret")
+    monkeypatch.setattr(
+        bridge, "request_intelligent_prepare",
+        lambda **_kwargs: {
+            "status": "ready", "preparation_id": "isbp_1", "prompt": "first",
+        },
+    )
+    async def reason(prompt, _event):
+        turns.append(prompt)
+        return {
+            "provider_invoked": True,
+            "provider_path": "hermes:openai-codex:oauth",
+            "latency_ms": 1,
+            "model_response": "still-invalid",
+        }
+
+    monkeypatch.setattr(
+        bridge,
+        "request_intelligent_finalize",
+        lambda **_kwargs: {
+            "status": "failed_validation",
+            "repair_allowed": True,
+            "repair_prompt": "repair-again",
+            "raw_path": "/app/storage/intake/raw/preserved.txt",
+        },
+    )
+    harness._run_isolated_intelligent_assessment = reason
+
+    result = await harness.handle_intelligent_intake(
+        _event(),
+        ib.IntelligentIntake("https://x.com/i/status/1", "bare_url", True),
+    )
+
+    assert turns == ["first", "repair-again"]
+    assert "assessment response failed validation" in result.lower()
+    assert "/app/storage/intake/raw/preserved.txt" in result
+
+
 def _retrieval_response():
     return {
         "requested_action": "retrieve_intelligent_knowledge",
