@@ -8,7 +8,8 @@ Covers:
   - a normal conversation / self-improvement *suggestion* (foreground origin)
     cannot write to ~/.hermes/skills
   - an explicit curator flow (allow_skill_writes) can write when allowed
-  - the background self-improvement review fork can write
+  - the background self-improvement review fork cannot write
+  - an explicit top-level request stages a preview instead of writing
   - an allowed write snapshots the skills tree first
   - a blocked write returns a clear error
   - a cron / reflective foreground run does not patch skills
@@ -23,15 +24,28 @@ from unittest.mock import patch
 import pytest
 
 from hermes_constants import get_hermes_home
-from tools.skill_manager_tool import skill_manage
+from tools.skill_manager_tool import apply_skill_pending, skill_manage
 from tools.skills_tool import skill_view
 from tools.skill_provenance import (
     allow_skill_writes,
+    bind_explicit_skill_write_request,
+    explicit_skill_write_requested,
     skill_writes_allowed,
     set_current_write_origin,
     reset_current_write_origin,
     BACKGROUND_REVIEW,
 )
+
+
+@pytest.fixture(autouse=True)
+def _reset_explicit_skill_intent():
+    bind_explicit_skill_write_request(
+        "", origin="assistant_tool", platform="cron", parent_session_id=""
+    )
+    yield
+    bind_explicit_skill_write_request(
+        "", origin="assistant_tool", platform="cron", parent_session_id=""
+    )
 
 
 VALID_SKILL = """\
@@ -135,21 +149,94 @@ def test_curator_flow_can_create():
         assert (skills_dir / "probe-skill" / "SKILL.md").exists()
 
 
-def test_background_review_fork_can_patch():
-    """The self-improvement review fork (background_review origin) may write."""
+def test_background_review_fork_cannot_patch():
+    """Automatic background review has no skill-write authority."""
     with _skills_env() as skills_dir:
         skill_md = _seed_skill(skills_dir)
+        before = skill_md.read_text(encoding="utf-8")
         token = set_current_write_origin(BACKGROUND_REVIEW)
         try:
-            assert skill_writes_allowed() is True
+            assert skill_writes_allowed() is False
             result = json.loads(skill_manage(
                 action="patch", name="probe-skill",
                 old_string="original body.", new_string="review-fork patched.",
             ))
         finally:
             reset_current_write_origin(token)
+        assert result["success"] is False
+        assert skill_md.read_text(encoding="utf-8") == before
+
+
+def test_explicit_top_level_skill_request_stages_preview_without_writing():
+    with _skills_env() as skills_dir:
+        skill_md = _seed_skill(skills_dir)
+        before = skill_md.read_text(encoding="utf-8")
+        assert bind_explicit_skill_write_request(
+            "@ponytail full\nPlease update the probe skill with this verified rule.",
+            origin="assistant_tool",
+            platform="telegram",
+            parent_session_id="",
+        ) is True
+        with patch("tools.write_approval.stage_write", return_value={"id": "pending1"}) as stage:
+            result = json.loads(skill_manage(
+                action="patch", name="probe-skill",
+                old_string="original body.", new_string="approved later.",
+            ))
         assert result["success"] is True
-        assert "review-fork patched." in skill_md.read_text(encoding="utf-8")
+        assert result["staged"] is True
+        assert result["pending_id"] == "pending1"
+        stage.assert_called_once()
+        assert skill_md.read_text(encoding="utf-8") == before
+
+
+def test_explicit_skill_request_is_denied_for_subagent_cron_and_negation():
+    assert bind_explicit_skill_write_request(
+        "Update the probe skill.", origin="assistant_tool",
+        platform="telegram", parent_session_id="parent-1",
+    ) is False
+    assert bind_explicit_skill_write_request(
+        "Update the probe skill.", origin="assistant_tool",
+        platform="cron", parent_session_id="",
+    ) is False
+    assert bind_explicit_skill_write_request(
+        "Do not modify any skill or SKILL.md file.", origin="assistant_tool",
+        platform="telegram", parent_session_id="",
+    ) is False
+    assert explicit_skill_write_requested() is False
+
+
+def test_explicit_skill_request_fails_closed_when_approval_boundary_unavailable():
+    with _skills_env() as skills_dir:
+        skill_md = _seed_skill(skills_dir)
+        before = skill_md.read_text(encoding="utf-8")
+        bind_explicit_skill_write_request(
+            "Update the probe skill.", origin="assistant_tool",
+            platform="telegram", parent_session_id="",
+        )
+        with patch(
+            "tools.skill_manager_tool._load_write_approval",
+            side_effect=ImportError("unavailable"),
+        ):
+            result = json.loads(skill_manage(
+                action="patch", name="probe-skill",
+                old_string="original body.", new_string="must not land.",
+            ))
+        assert result["success"] is False
+        assert "approval gate is unavailable" in result["error"]
+        assert skill_md.read_text(encoding="utf-8") == before
+
+
+def test_approved_pending_replay_is_the_only_foreground_application_path():
+    with _skills_env() as skills_dir:
+        skill_md = _seed_skill(skills_dir)
+        result = json.loads(apply_skill_pending({
+            "action": "patch",
+            "name": "probe-skill",
+            "old_string": "original body.",
+            "new_string": "approved change.",
+        }))
+        assert result["success"] is True
+        assert "approved change." in skill_md.read_text(encoding="utf-8")
 
 
 def test_allowed_write_snapshots_first():

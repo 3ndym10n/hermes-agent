@@ -30,6 +30,7 @@ from typing import Any, Dict, List, Optional
 
 from agent.iteration_budget import IterationBudget
 from agent.model_metadata import estimate_request_tokens_rough
+from tools.skill_provenance import bind_explicit_skill_write_request
 
 logger = logging.getLogger(__name__)
 
@@ -107,7 +108,8 @@ def build_turn_context(
     set_session_context(agent.session_id)
 
     # Bind the skill write-origin ContextVar for this thread.
-    set_current_write_origin(getattr(agent, "_memory_write_origin", "assistant_tool"))
+    write_origin = getattr(agent, "_memory_write_origin", "assistant_tool")
+    set_current_write_origin(write_origin)
 
     # Restore the primary runtime if the previous turn activated fallback.
     agent._restore_primary_runtime()
@@ -117,6 +119,16 @@ def build_turn_context(
         user_message = sanitize_surrogates(user_message)
     if isinstance(persist_user_message, str):
         persist_user_message = sanitize_surrogates(persist_user_message)
+
+    # Reset and bind explicit skill-edit intent for this exact turn. Only a
+    # trusted top-level interactive request can stage a proposal; background,
+    # cron, API, and subagent turns are forced false.
+    bind_explicit_skill_write_request(
+        user_message,
+        origin=write_origin,
+        platform=getattr(agent, "platform", ""),
+        parent_session_id=getattr(agent, "_parent_session_id", "") or "",
+    )
 
     # Store stream callback for _interruptible_api_call to pick up.
     agent._stream_callback = stream_callback

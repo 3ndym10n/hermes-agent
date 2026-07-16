@@ -967,37 +967,43 @@ def _snapshot_before_skill_write(action: str, name: str) -> None:
         )
 
 
+def _load_write_approval():
+    """Load the mandatory skill approval boundary (test seam, fail closed)."""
+    from tools import write_approval
+    return write_approval
+
+
 def _apply_skill_write_gate(action, name, **payload_kwargs):
-    """Evaluate the skill write gate. Returns a JSON tool-result string when the
-    write should NOT proceed (blocked or staged), or None to perform the real
-    write. Bypassed during approved-pending replay.
+    """Block ordinary writes and stage explicit user requests for approval.
+
+    Returns a JSON tool-result string when the write should not proceed, or
+    ``None`` only for an explicit curator/approved context. Approved-pending
+    replay bypasses this gate separately.
     """
     if action not in {"create", "edit", "patch", "delete", "write_file", "remove_file"}:
         return None
     if _skill_gate_bypass.get():
         return None
 
-    # Skill-write protection: only explicit curator/self-improvement flows may
-    # mutate ~/.hermes/skills/. A normal conversational/operator/cron run (or a
-    # reflective/planning answer) that reaches here is the exact bug this guards
-    # against — it must fail closed, not silently patch a skill a cron will
-    # later read. See docs/skill-write-protection-v0.md.
-    from tools.skill_provenance import skill_writes_allowed
-    if not skill_writes_allowed():
+    from tools.skill_provenance import (
+        explicit_skill_write_requested,
+        skill_writes_allowed,
+    )
+    explicit_request = explicit_skill_write_requested()
+    allowed_context = skill_writes_allowed()
+    if not explicit_request and not allowed_context:
         return tool_error(_SKILL_WRITE_BLOCKED_MSG.format(action=action, name=name), success=False)
 
+    # Approval support is a safety dependency. If it cannot load, no skill
+    # mutation may proceed and no staged proposal may be falsely reported.
     try:
-        from tools import write_approval as wa
+        wa = _load_write_approval()
     except Exception:
-        return None  # fail open
+        return tool_error(
+            "Skill write blocked: the approval gate is unavailable. No file was changed.",
+            success=False,
+        )
 
-    decision = wa.evaluate_gate(wa.SKILLS)
-    if decision.allow:
-        return None
-    if decision.blocked:
-        return tool_error(decision.message, success=False)
-
-    # stage — record the full skill_manage kwargs so approval can replay it.
     payload = {"action": action, "name": name}
     payload.update({k: v for k, v in payload_kwargs.items() if v is not None})
     gist = wa.skill_gist(
@@ -1007,7 +1013,48 @@ def _apply_skill_write_gate(action, name, **payload_kwargs):
         old_string=payload_kwargs.get("old_string") or "",
         new_string=payload_kwargs.get("new_string") or "",
     )
-    record = wa.stage_write(wa.SKILLS, payload, summary=gist, origin=wa.current_origin())
+
+    # A top-level explicit request is intent, not approval. Always stage the
+    # proposed change, even when skills.write_approval is disabled globally.
+    if explicit_request and not allowed_context:
+        try:
+            record = wa.stage_write(
+                wa.SKILLS, payload, summary=gist, origin=wa.current_origin()
+            )
+        except Exception:
+            return tool_error(
+                "Skill write blocked: the proposal could not be staged for approval. No file was changed.",
+                success=False,
+            )
+        return json.dumps(
+            {
+                "success": True,
+                "staged": True,
+                "pending_id": record["id"],
+                "gist": gist,
+                "message": (
+                    "Staged for bounded approval. Not yet saved — preview the diff "
+                    "and approve it through the existing skills approval flow."
+                ),
+            },
+            ensure_ascii=False,
+        )
+
+    decision = wa.evaluate_gate(wa.SKILLS)
+    if decision.allow:
+        return None
+    if decision.blocked:
+        return tool_error(decision.message, success=False)
+
+    try:
+        record = wa.stage_write(
+            wa.SKILLS, payload, summary=gist, origin=wa.current_origin()
+        )
+    except Exception:
+        return tool_error(
+            "Skill write blocked: the proposal could not be staged for approval. No file was changed.",
+            success=False,
+        )
     return json.dumps(
         {"success": True, "staged": True, "pending_id": record["id"],
          "gist": gist, "message": decision.message},

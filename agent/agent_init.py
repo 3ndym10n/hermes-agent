@@ -1210,13 +1210,9 @@ def init_agent(
     from agent.memory_manager import inject_memory_provider_tools as _inject_memory_provider_tools
     _inject_memory_provider_tools(agent)
 
-    # Skills config: nudge interval for skill creation reminders
-    agent._skill_nudge_interval = 10
-    try:
-        skills_config = _agent_cfg.get("skills", {})
-        agent._skill_nudge_interval = int(skills_config.get("creation_nudge_interval", 10))
-    except Exception:
-        pass
+    # Automatic post-turn skill mutation is disabled. Skill changes must begin
+    # with an explicit top-level request and pass the staged approval flow.
+    agent._skill_nudge_interval = 0
 
     # Tool-use enforcement config: "auto" (default — matches hardcoded
     # model list), true (always), false (never), or list of substrings.

@@ -258,29 +258,12 @@ def run_codex_app_server_turn(
     if turn.projected_messages:
         messages.extend(turn.projected_messages)
 
-    # Counter ticks for the agent-improvement loop.
-    # _turns_since_memory and _user_turn_count are ALREADY incremented
-    # in the run_conversation() pre-loop block (lines ~11793-11817) so we
-    # do NOT touch them here — that would double-count.
-    # Only _iters_since_skill needs explicit increment, since the
-    # chat_completions loop bumps it per tool iteration (line ~12110)
-    # and that loop is bypassed on this path.
-    agent._iters_since_skill = (
-        getattr(agent, "_iters_since_skill", 0) + turn.tool_iterations
-    )
     usage_result = _record_codex_app_server_usage(agent, turn)
     api_calls = 1
 
-    # Now check the skill nudge AFTER iters were incremented — same
-    # pattern the chat_completions path uses (line ~15432).
+    # Automatic post-turn skill reviews are intentionally disabled. Memory
+    # review remains independent and may still run on its existing cadence.
     should_review_skills = False
-    if (
-        agent._skill_nudge_interval > 0
-        and agent._iters_since_skill >= agent._skill_nudge_interval
-        and "skill_manage" in agent.valid_tool_names
-    ):
-        should_review_skills = True
-        agent._iters_since_skill = 0
 
     # External memory provider sync (mirrors line ~15439). Skipped on
     # interrupt/error to avoid feeding partial transcripts to memory.

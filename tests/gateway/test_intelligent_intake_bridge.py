@@ -1,3 +1,4 @@
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -36,6 +37,43 @@ def test_explicit_pasted_forwarded_and_transcript_inputs_route():
     )
     assert transcript.input_kind == "transcript"
     assert ib.parse_intelligent_intake("ordinary conversation") is None
+
+
+@pytest.mark.parametrize(
+    "fixture_name",
+    [
+        "unauthorized_research_reference_paste.txt",
+        "unauthorized_research_reference_followup.txt",
+    ],
+)
+def test_exact_incident_reference_dumps_route_to_bounded_intake_not_open_research(
+    fixture_name,
+):
+    fixture = Path(__file__).parents[1] / "fixtures/gateway" / fixture_name
+    pasted = fixture.read_text(encoding="utf-8")
+    intake = ib.parse_intelligent_intake(pasted)
+    assert intake == ib.IntelligentIntake(pasted, "pasted_text")
+    assert ib.is_passive_reference_content(pasted) is True
+
+
+def test_explicit_research_and_long_task_instructions_do_not_become_passive_intake():
+    reference = "Mem0 graph memory notes https://example.com/source " + ("detail " * 200)
+    assert ib.parse_intelligent_intake("Research this: " + reference) is None
+    assert ib.parse_intelligent_intake(reference + "\nResearch this.") is None
+    embedded = (
+        reference
+        + "\nPlease research this and compare it with our current approach.\n"
+        + ("more supplied detail " * 100)
+    )
+    assert ib.parse_intelligent_intake(embedded) is None
+    bare_embedded = (
+        reference
+        + "\nResearch this and compare it with our current approach.\n"
+        + ("more supplied detail " * 100)
+    )
+    assert ib.parse_intelligent_intake(bare_embedded) is None
+    task = "TASK\nImplement the approved routing fix.\n" + ("constraint " * 200)
+    assert ib.parse_intelligent_intake(task) is None
 
 
 def test_event_metadata_routes_forwarded_posts_and_transcripts():

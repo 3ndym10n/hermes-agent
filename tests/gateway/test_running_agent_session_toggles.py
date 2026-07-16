@@ -193,6 +193,8 @@ async def test_btw_dispatches_mid_run():
 @pytest.mark.asyncio
 async def test_intelligent_bare_url_dispatches_at_gateway_boundary():
     runner = _make_runner()
+    runner._running_agents.clear()
+    runner._running_agents_ts.clear()
     runner.handle_intelligent_intake = AsyncMock(return_value="intelligent receipt")
 
     result = await runner._handle_message(
@@ -206,8 +208,49 @@ async def test_intelligent_bare_url_dispatches_at_gateway_boundary():
 
 
 @pytest.mark.asyncio
+async def test_passive_reference_dispatches_to_intelligent_intake_without_agent_tools():
+    runner = _make_runner()
+    runner._running_agents.clear()
+    runner._running_agents_ts.clear()
+    runner.handle_intelligent_intake = AsyncMock(return_value="reference assessment")
+    pasted = (
+        "Mem0 graph memory and semantic triplets. Source: https://example.com/mem0\n"
+        + "Reference excerpt about retrieval, provenance, and graph edges. " * 40
+    )
+
+    result = await runner._handle_message(_make_event(pasted))
+
+    runner.handle_intelligent_intake.assert_awaited_once()
+    intake = runner.handle_intelligent_intake.await_args.args[1]
+    assert intake.input_kind == "pasted_text"
+    assert result == "reference assessment"
+
+
+@pytest.mark.asyncio
+async def test_active_task_queues_intelligent_intake_instead_of_dispatching_it():
+    runner = _make_runner()
+    runner.handle_intelligent_intake = AsyncMock(
+        side_effect=AssertionError("active intake must wait for the next turn")
+    )
+    runner._handle_active_session_busy_message = AsyncMock(return_value=True)
+
+    result = await runner._handle_message(
+        _make_event("https://x.com/i/status/2076300807189024873")
+    )
+
+    assert result == ""
+    runner.handle_intelligent_intake.assert_not_awaited()
+    runner._handle_active_session_busy_message.assert_awaited_once()
+    assert runner._handle_active_session_busy_message.await_args.kwargs == {
+        "force_queue": True
+    }
+
+
+@pytest.mark.asyncio
 async def test_intelligent_forwarded_post_dispatches_at_gateway_boundary():
     runner = _make_runner()
+    runner._running_agents.clear()
+    runner._running_agents_ts.clear()
     runner.handle_intelligent_intake = AsyncMock(return_value="forwarded receipt")
     event = _make_event("Forwarded operating playbook")
     event.raw_message = SimpleNamespace(forward_origin=object())
@@ -334,6 +377,8 @@ async def test_intelligent_outcome_dispatches_at_gateway_boundary():
 @pytest.mark.parametrize("kind", ["forwarded", "transcript"])
 async def test_forwarded_or_transcribed_controls_do_not_authorize_mutation(kind):
     runner = _make_runner()
+    runner._running_agents.clear()
+    runner._running_agents_ts.clear()
     runner.handle_intelligent_review = AsyncMock(
         side_effect=AssertionError("forwarded control must not mutate")
     )
