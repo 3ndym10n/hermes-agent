@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -911,3 +912,71 @@ def test_response_usage_client_validates_provenance_and_no_promotion():
             ),
         )
     assert promoted.value.code == "BRIDGE_RESPONSE_INVALID"
+
+
+def test_review_research_requested_validates_durable_job_descriptor():
+    def response_for(payload):
+        body = json.dumps(payload).encode("utf-8")
+
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self):
+                return body
+
+        return Response()
+
+    def result_payload(**job):
+        payload = {
+            "requested_action": "review_intelligent_knowledge",
+            "status": "research_requested",
+            "action": "request_explicit_research",
+            "item_id": "ki_" + "a" * 24,
+            "review_id": "inote-399",
+            "paid_api_used": False,
+            "research_performed": False,
+            "mutation_performed": True,
+        }
+        if job:
+            payload["research_job"] = job
+        return payload
+
+    command = ib.IntelligentReviewCommand(
+        "inote-399", "request_explicit_research", "",
+        origin={"platform": "telegram", "chat_id": "1", "chat_type": "dm"},
+    )
+    packet = ib.build_intelligent_review_request(command)
+    assert packet["context"]["origin"] == {
+        "platform": "telegram", "chat_id": "1", "chat_type": "dm",
+    }
+
+    good = ib.request_intelligent_review(
+        base_url="http://bridge", token="secret", command=command,
+        urlopen=lambda *_a, **_k: response_for(result_payload(
+            job_id="inote-399", status="queued", created=True,
+            mode="grok_oauth_pilot", requested_provider="xai-oauth:grok-4.5",
+            paid_api_used=False,
+        )),
+    )
+    assert good["research_job"]["status"] == "queued"
+
+    with pytest.raises(ib.IntakeBridgeError):
+        ib.request_intelligent_review(
+            base_url="http://bridge", token="secret", command=command,
+            urlopen=lambda *_a, **_k: response_for(result_payload(
+                job_id="inote-399", status="queued", created=True,
+                paid_api_used=True,
+            )),
+        )
+    with pytest.raises(ib.IntakeBridgeError):
+        ib.request_intelligent_review(
+            base_url="http://bridge", token="secret", command=command,
+            urlopen=lambda *_a, **_k: response_for(result_payload(
+                job_id="inote-777", status="queued", created=True,
+                paid_api_used=False,
+            )),
+        )

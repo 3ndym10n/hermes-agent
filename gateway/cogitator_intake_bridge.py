@@ -286,6 +286,8 @@ class IntelligentReviewCommand:
     action: str = ""
     payload: str = ""
     error: str = ""
+    # Telegram delivery route for the async research job (Research action only).
+    origin: Optional[Mapping[str, Any]] = None
 
 
 @dataclass(frozen=True)
@@ -465,6 +467,11 @@ def build_intelligent_review_request(
             "review_id": command.review_id,
             "action": command.action,
             "payload": command.payload,
+            **(
+                {"origin": dict(command.origin)}
+                if command.action == "request_explicit_research" and command.origin
+                else {}
+            ),
         },
     }
 
@@ -902,6 +909,21 @@ def request_intelligent_review(
     elif status == "research_requested":
         if result.get("review_id") != command.review_id:
             raise IntakeBridgeError("BRIDGE_RESPONSE_INVALID")
+        job = result.get("research_job")
+        if job is not None:
+            # Fail closed on the durable-job descriptor: it may never report a
+            # paid API, and an active job must be bound to this review item.
+            if (
+                not isinstance(job, Mapping)
+                or job.get("paid_api_used") is not False
+                or str(job.get("status") or "")
+                not in {"queued", "duplicate", "complete", "error"}
+            ):
+                raise IntakeBridgeError("BRIDGE_RESPONSE_INVALID")
+            if job.get("status") != "error" and str(
+                job.get("job_id") or ""
+            ) != command.review_id:
+                raise IntakeBridgeError("BRIDGE_RESPONSE_INVALID")
     elif status == "candidate_created" and not re.fullmatch(
         r"inote-[1-9][0-9]*", str(result.get("candidate_review_id") or "")
     ):
@@ -1216,7 +1238,47 @@ def render_intelligent_review_message(response: Mapping[str, Any]) -> str:
                 "PAID API: no",
             ]
         )
+    job = response.get("research_job")
+    if status == "research_requested" and isinstance(job, Mapping):
+        job_status = str(job.get("status") or "")
+        if job_status in {"queued", "duplicate"}:
+            return "\n".join(
+                [
+                    "\U0001f50e Research queued",
+                    f"Job: {job.get('job_id')}",
+                    "Provider: Grok OAuth",
+                    "Paid API: no",
+                ]
+                + (
+                    ["(An identical job was already active — no duplicate run.)"]
+                    if job_status == "duplicate"
+                    else []
+                )
+            )
+        if job_status == "complete":
+            return "\n".join(
+                [
+                    "\U0001f50e Research already completed for this item.",
+                    f"Job: {job.get('job_id')}",
+                    str(job.get("message") or "Reply refresh to see the result."),
+                    "Paid API: no",
+                ]
+            )
+        return "\n".join(
+            [
+                "Research was requested, but the durable research job was NOT "
+                "queued.",
+                f"Reason: {job.get('reason') or 'unknown'}.",
+                "The item stays in Needs research; tap Research again to retry.",
+                "PAID API: no",
+            ]
+        )
     lines = [f"Knowledge review: {status.replace('_', ' ')}."]
+    if status == "research_requested":
+        lines.append(
+            "No durable research job was queued (research jobs are disabled or "
+            "no delivery route was available)."
+        )
     if response.get("promoted_path"):
         lines.append(f"Promoted Markdown: {response['promoted_path']}")
     if response.get("candidate_review_id"):

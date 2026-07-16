@@ -140,6 +140,13 @@ class TestBuildRequest:
         with pytest.raises(ResearchBridgeError):
             validate_research_response(_ok_response(mode="default"))
 
+    def test_origin_rides_in_the_context_when_supplied(self):
+        origin = {"platform": "telegram", "chat_id": "1", "chat_type": "dm"}
+        p = build_research_request(item_id="inote-399", origin=origin)
+        assert p["context"]["origin"] == origin
+        p = build_research_request(item_id="inote-399")
+        assert "origin" not in p["context"]
+
 
 class TestTransport:
     def test_posts_with_bearer_and_returns_validated(self):
@@ -290,3 +297,58 @@ def test_unverified_provider_receipt_is_not_rendered_as_free_grok():
     )
     assert "provider: other:unknown" not in msg
     assert "paid API: no" not in msg
+
+
+def _job_response(**job_overrides):
+    job = {
+        "job_id": "inote-399", "status": "queued", "created": True,
+        "mode": GROK_RESEARCH_MODE,
+        "requested_provider": "xai-oauth:grok-4.5",
+        "paid_api_used": False,
+        "message": "Research job started: inote-399.",
+    }
+    job.update(job_overrides)
+    return {
+        "status": "ok",
+        "requested_action": "research_decision_item",
+        "item_id": "inote-399",
+        "mode": GROK_RESEARCH_MODE,
+        "research_status": job["status"],
+        "research_job": job,
+        "message": job["message"],
+        "mutation_performed": job.get("created", False),
+        "research_performed": False,
+        "promotion_performed": False,
+    }
+
+
+class TestDurableJobResponses:
+    def test_queued_job_response_is_valid_without_receipt(self):
+        result = validate_research_response(_job_response())
+        assert result["research_job"]["status"] == "queued"
+
+    def test_paid_job_descriptor_fails_closed(self):
+        with pytest.raises(ResearchBridgeError):
+            validate_research_response(_job_response(paid_api_used=True))
+
+    def test_wrong_requested_provider_fails_closed(self):
+        with pytest.raises(ResearchBridgeError):
+            validate_research_response(
+                _job_response(requested_provider="openrouter:gpt")
+            )
+
+    def test_queued_render_promises_only_a_queued_job(self):
+        message = render_research_message(_job_response())
+        assert "Research queued" in message
+        assert "Job: inote-399" in message
+        assert "Provider: Grok OAuth" in message
+        assert "Paid API: no" in message
+        # It never claims Grok already ran.
+        assert "xai-oauth:grok-4.5" not in message
+
+    def test_duplicate_render_reports_the_existing_job(self):
+        message = render_research_message(
+            _job_response(status="duplicate", created=False)
+        )
+        assert "already active" in message
+        assert "Job: inote-399" in message
