@@ -30,6 +30,9 @@ TOKEN_ENV = "COGITATOR_BRIDGE_TOKEN"
 _REQUESTED_ACTION = "research_decision_item"
 _USER_INTENT = "Research a Decision Inbox item by number (Virgil cockpit reply)."
 _REQUEST_TIMEOUT_SECONDS = 45  # bounded research run (≤3 sources)
+GROK_RESEARCH_MODE = "grok_oauth_pilot"
+GROK_PROVIDER_PATH = "xai-oauth:grok-4.5"
+GROK_MODEL = "grok-4.5"
 
 # Response-level keys that would indicate promotion/approval execution. Any
 # present (or promotion_performed not exactly False) → reject, fail closed.
@@ -60,7 +63,11 @@ def build_research_request(*, item_id: str, expected_snapshot_id: str = "") -> d
     ``expected_snapshot_id`` pins the batch it was shown under so a stale number
     is rejected on Cogitator's side. ``confirm`` is always True — Cal replying
     ``research <n>`` inside the cockpit is the explicit confirmation."""
-    context: dict[str, Any] = {"item_id": str(item_id), "confirm": True}
+    context: dict[str, Any] = {
+        "item_id": str(item_id),
+        "confirm": True,
+        "mode": GROK_RESEARCH_MODE,
+    }
     if str(expected_snapshot_id or "").strip():
         context["expected_snapshot_id"] = str(expected_snapshot_id).strip()
     return {
@@ -106,6 +113,22 @@ def _post_bridge(
         raise ResearchBridgeError("BRIDGE_RESPONSE_INVALID", type(exc).__name__)
 
 
+def _grok_receipt(response: Mapping) -> dict[str, Any] | None:
+    diagnostics = response.get("research_diagnostics")
+    if not isinstance(diagnostics, Mapping):
+        return None
+    receipt = diagnostics.get("grok_oauth")
+    if not isinstance(receipt, Mapping):
+        return None
+    if (
+        receipt.get("provider_path") != GROK_PROVIDER_PATH
+        or receipt.get("model") != GROK_MODEL
+        or receipt.get("paid_api_used") is not False
+    ):
+        return None
+    return dict(receipt)
+
+
 def validate_research_response(response: Any) -> dict[str, Any]:
     """Validate a ``research_decision_item`` response. Fails closed.
 
@@ -121,6 +144,11 @@ def validate_research_response(response: Any) -> dict[str, Any]:
         raise ResearchBridgeError("BRIDGE_STATUS_NOT_OK", f"status={status!r}")
     if response.get("requested_action") != _REQUESTED_ACTION:
         raise ResearchBridgeError("BRIDGE_ACTION_MISMATCH", f"action={response.get('requested_action')!r}")
+    if status == "ok":
+        if response.get("mode") != GROK_RESEARCH_MODE:
+            raise ResearchBridgeError("BRIDGE_RESPONSE_INVALID", "research mode mismatch")
+        if _grok_receipt(response) is None:
+            raise ResearchBridgeError("BRIDGE_RESPONSE_INVALID", "research provider receipt mismatch")
     if response.get("promotion_performed") not in (False, None):
         raise ResearchBridgeError("BRIDGE_PROMOTION_REPORTED", f"promotion_performed={response.get('promotion_performed')!r}")
     stateful = [f for f in _FORBIDDEN_RESPONSE_FIELDS if f in response]
@@ -203,12 +231,17 @@ def render_research_message(response: Mapping[str, Any]) -> str:
     lines += _bullets("missing evidence", response.get("missing_evidence"))
     lines.append(f"- risk if wrong: {response.get('risk_if_wrong') or '(unspecified)'}")
     lines += _bullets("sources checked", response.get("sources_checked"))
+    receipt = _grok_receipt(response)
+    if receipt is not None:
+        lines.append(f"- provider: {receipt['provider_path']}")
+        lines.append("- paid API: no")
     lines += ["", "Reply refresh to see the updated inbox. No promotion happens automatically."]
     return "\n".join(lines)
 
 
 __all__ = [
     "ResearchBridgeError",
+    "GROK_RESEARCH_MODE",
     "TOKEN_ENV",
     "BRIDGE_PATH",
     "build_research_request",
