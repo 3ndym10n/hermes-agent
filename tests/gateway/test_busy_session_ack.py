@@ -266,6 +266,33 @@ class TestBusySessionAck:
         adapter._send_with_retry.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_passive_reference_queues_without_interrupting_or_steering_active_task(self):
+        """Additive reference material must wait for the current task."""
+        runner, _sentinel = _make_runner()
+        runner._busy_input_mode = "steer"
+        adapter = _make_adapter()
+        pasted = (
+            "Mem0 graph-memory reference. Source: https://example.com/mem0\n"
+            + "Semantic triplets, graph edges, retrieval, and provenance notes. " * 40
+        )
+        event = _make_event(text=pasted)
+        sk = build_session_key(event.source)
+        runner.adapters[event.source.platform] = adapter
+
+        agent = MagicMock()
+        agent.steer = MagicMock(return_value=True)
+        runner._running_agents[sk] = agent
+
+        with patch("gateway.run.merge_pending_message_event") as mock_merge:
+            await runner._handle_active_session_busy_message(event, sk)
+
+        agent.steer.assert_not_called()
+        agent.interrupt.assert_not_called()
+        mock_merge.assert_called_once()
+        content = adapter._send_with_retry.call_args.kwargs.get("content", "")
+        assert "Queued for the next turn" in content
+
+    @pytest.mark.asyncio
     async def test_steer_mode_calls_agent_steer_no_interrupt_no_queue(self):
         """busy_input_mode='steer' injects via agent.steer() and skips queueing."""
         runner, sentinel = _make_runner()

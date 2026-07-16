@@ -1,0 +1,57 @@
+Key-value store — for fast access to metadata, user/session/agent states, and summaries.  
+ youtube.com 
+ It operates at multi-level scopes: User (cross-session personalization), Session (short-term context), and Agent (task-specific state).  
+ github.com 
+ 
+Key PipelinesExtraction Phase (updated 2026 algorithm):Processes message pairs (user + assistant) with conversation summary and recent history. 
+Single LLM call for single-pass ADD-only extraction — extracts salient facts/entities without separate UPDATE/DELETE steps. 
+Agent-generated facts (e.g., confirmations) are treated as first-class. 
+Entities are extracted, embedded, and linked for better retrieval.  
+ mem0.ai 
+ Update/Retrieval Phase:Multi-signal retrieval: Runs semantic similarity, BM25 keyword matching, and entity matching in parallel, then fuses scores. 
+Temporal reasoning ranks memories by recency/relevance for current/past/future queries. 
+Intelligent filtering, consolidation, and decay prevent bloat while prioritizing high-value memories.  
+ mem0.ai 
+ Evolution and PerformanceBase Mem0 — Focuses on extraction/consolidation/retrieval of salient info. 
+Mem0g — Adds graph representations for richer relational structures. 
+Benchmarks (2026 updates) show strong results on LoCoMo, LongMemEval, and BEAM, with ~90%+ token/latency savings vs. full-context approaches and better accuracy than many baselines (including OpenAI memory).  
+ arxiv.org 
+ Mem0 integrates easily via SDKs (Python, TypeScript), supports various LLMs/embeddings, and works with tools like LangGraph, Redis, or AWS services. It shines in personalization, customer support, and long-running agents but is primarily a memory orchestration layer rather than a full agent runtime.  
+ aws.amazon.com 
+ 
+For comparison to systems like Raft (which emphasizes per-agent long-running sessions in a shared workspace), Mem0 is more of a pluggable backend for any agent framework, focusing on extraction and hybrid storage/retrieval. Check the GitHub (mem0ai/mem0) or docs.mem0.ai for implementation details. 
+ 5 web pages 
+ Explore Mem0g graph capabilities 
+ 
+Compare with Vector DBs 
+ Explore Mem0g graph capabilities 
+ Thought for 3s 
+ Mem0g (the graph-enhanced variant of Mem0) extends the base Mem0 architecture with a directed labeled knowledge graph to model complex relationships and enable advanced relational reasoning.  
+ arxiv.org 
+ 
+Graph StructureMemories are stored as a graph G = (V, E, L):Nodes (V): Entities (people, places, concepts, events, objects) with type labels (e.g., Person, City), semantic embeddings, metadata (e.g., timestamps), and attributes. 
+Edges (E): Directed, labeled relationships as triplets (source → relation → destination), e.g., "Alice" —lives_in→ "San Francisco" or "User" —prefers→ "Vegan diet". 
+Labels (L): Semantic types for nodes to support typed queries and reasoning.  
+ memo.d.foundation 
+ This structure captures not just isolated facts but interconnected knowledge, supporting multi-hop traversal (e.g., "Who owns the dog that had the checkup?").Extraction and Update ProcessEntity extraction — LLM identifies key entities from message pairs + context. 
+Relationship generation — LLM creates triplets from conversational context, including implicit links. 
+Integration & conflict resolution — New nodes/edges are added via semantic similarity search. An LLM-based update resolver detects conflicts, marks outdated relationships (for temporal reasoning) rather than deleting, and maintains consistency. 
+Entity linking (current open-source) — Built-in parallel entity collection in the vector store (no external graph DB required in recent versions).  
+ docs.mem0.ai 
+ Retrieval CapabilitiesMem0g uses a dual retrieval strategy:Entity-centric — Identify query entities, then traverse incoming/outgoing edges to build a relevant subgraph.
+Semantic triplet — Embed the full query and match against encoded relationship triplets for broader conceptual matches. 
+ 
+This enables sophisticated queries involving relationships, temporality, and inference across memories.  
+ arxiv.org 
+ 
+Benefits and Trade-offsStrengths: Better handling of relational/multi-hop/temporal questions; richer context for agents (e.g., preferences, ownership, events); ~2% overall benchmark gains (e.g., on LOCOMO) over base Mem0 in some evaluations.  
+ arxiv.org 
+ Trade-offs: Higher compute/token cost in early versions (roughly 2x in some tests); graph features were historically Pro-tier or required external stores (e.g., Neo4j), but current open-source uses native built-in entity linking for lighter-weight graph-like boosts.  
+ codepointer.substack.com 
+ In practice, Mem0g shines for applications needing structured knowledge (personalization, healthcare, complex agent workflows) beyond pure vector similarity. The base Mem0 remains vector-first for simplicity and speed, with graph capabilities as an enhancement layer. For hands-on details, see the Mem0 docs, GitHub, or the original paper (arXiv:2504.19413). 
+ 5 web pages 
+ Explore multi-hop traversal techniques 
+ 
+Investigate Neo4j integration options 
+ Think Harder 
+ Auto

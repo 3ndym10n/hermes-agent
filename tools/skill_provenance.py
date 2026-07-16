@@ -33,6 +33,8 @@ Usage:
 
 import contextlib
 import contextvars
+import os
+import re
 from pathlib import Path
 
 
@@ -49,6 +51,38 @@ _writes_allowed: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "skill_writes_allowed",
     default=False,
 )
+
+# Set once at the start of every top-level interactive turn. This is intent,
+# not permission: an explicit request may only stage a proposed skill change
+# for later approval. Raw file/terminal writes never consult this signal.
+_explicit_skill_write_request: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "explicit_skill_write_request",
+    default=False,
+)
+
+_SKILL_TARGET_RE = r"(?:skill(?:s)?|SKILL\.md)"
+_SKILL_MUTATION_RE = (
+    r"(?:improve|change|update|edit|modify|create|write|rewrite|patch|remove|"
+    r"delete|restore|revert)"
+)
+_EXPLICIT_SKILL_WRITE_RE = re.compile(
+    rf"^\s*(?:(?:please|can you|could you|would you|i (?:want|need) you to)\s+)?"
+    rf"(?:{_SKILL_MUTATION_RE}\b[^\n]{{0,160}}\b{_SKILL_TARGET_RE}\b|"
+    rf"{_SKILL_TARGET_RE}\b[^\n]{{0,160}}\b{_SKILL_MUTATION_RE}\b)",
+    re.IGNORECASE,
+)
+_NEGATED_SKILL_WRITE_RE = re.compile(
+    rf"\b(?:do not|don't|never|must not|without)\b[^\n]{{0,120}}"
+    rf"(?:{_SKILL_MUTATION_RE}\b[^\n]{{0,120}}\b{_SKILL_TARGET_RE}\b|"
+    rf"{_SKILL_TARGET_RE}\b[^\n]{{0,120}}\b{_SKILL_MUTATION_RE}\b)",
+    re.IGNORECASE,
+)
+_INTERACTIVE_GATEWAY_PLATFORMS = frozenset({
+    "telegram", "discord", "whatsapp", "whatsapp_cloud", "slack", "signal",
+    "mattermost", "matrix", "homeassistant", "email", "sms", "dingtalk",
+    "feishu", "wecom", "wecom_callback", "weixin", "bluebubbles", "qqbot",
+    "yuanbao",
+})
 
 # The sentinel value the background review fork uses; mirrors
 # run_agent.py's AIAgent._memory_write_origin override in
@@ -108,16 +142,57 @@ def allow_skill_writes():
 
 
 def skill_writes_allowed() -> bool:
-    """True iff the current context is an explicit curator/self-improvement
-    flow allowed to write skill files.
+    """True only inside an explicit curator or approved replay context.
 
-    Allowed: the background self-improvement review fork
-    (``is_background_review()``), and any context wrapped in
-    ``allow_skill_writes()`` (the curator pass). Everything else — foreground
-    conversational/operator runs, cron jobs, reflective/planning answers,
-    subagents — is denied.
+    Background review, ordinary foreground turns, cron jobs, and subagents are
+    denied. User intent is deliberately separate: it can stage a proposal for
+    approval through ``skill_manage`` but cannot authorize a direct write.
     """
-    return _writes_allowed.get() or is_background_review()
+    return _writes_allowed.get()
+
+
+def explicit_skill_write_requested() -> bool:
+    """Whether this trusted top-level turn explicitly requested a skill edit."""
+    return _explicit_skill_write_request.get()
+
+
+def is_explicit_skill_write_request(message: str) -> bool:
+    """Recognize a direct request to mutate a skill, excluding prohibitions."""
+    text = str(message or "").strip()
+    if not text or _NEGATED_SKILL_WRITE_RE.search(text):
+        return False
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    while lines and lines[0].startswith(("@", "/")):
+        lines.pop(0)
+    candidate = lines[0] if lines else ""
+    return bool(_EXPLICIT_SKILL_WRITE_RE.search(candidate))
+
+
+def bind_explicit_skill_write_request(
+    message: str,
+    *,
+    origin: str,
+    platform: str,
+    parent_session_id: str = "",
+) -> bool:
+    """Overwrite per-turn skill-write intent and return the bound value.
+
+    Only a top-level interactive user turn can bind intent. Background,
+    subagent, cron, batch, webhook, and API turns always reset it to false.
+    """
+    platform_value = getattr(platform, "value", platform)
+    surface = str(platform_value or "").strip().lower()
+    interactive = surface in _INTERACTIVE_GATEWAY_PLATFORMS
+    if os.environ.get("HERMES_INTERACTIVE") == "1":
+        interactive = interactive or surface in {"", "cli", "tui", "acp", "local"}
+    allowed = bool(
+        origin != BACKGROUND_REVIEW
+        and not parent_session_id
+        and interactive
+        and is_explicit_skill_write_request(message)
+    )
+    _explicit_skill_write_request.set(allowed)
+    return allowed
 
 
 def skills_root() -> Path:

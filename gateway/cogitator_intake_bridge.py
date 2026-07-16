@@ -144,6 +144,44 @@ class IntelligentIntake:
 
 
 _BARE_SUPPORTED_URL_RE = re.compile(r"^https?://[^\s]+$", re.IGNORECASE)
+_PASSIVE_REFERENCE_MIN_CHARS = 600
+_PASSIVE_REFERENCE_SOURCE_RE = re.compile(
+    r"(?:https?://|(?:github|youtube|substack|arxiv|mem0)\.(?:com|ai|org)|"
+    r"@\w{2,}|\b(?:quote|excerpt|sources?|web pages?)\b)",
+    re.IGNORECASE,
+)
+_DIRECT_REQUEST_START_RE = re.compile(
+    r"^\s*(?:(?:please|can you|could you|would you|i (?:want|need) you to)\s+)?"
+    r"(?:research|investigate|compare|review|analy[sz]e|audit|implement|install|"
+    r"fix|build|create|update|edit|modify|change|show|explain|summari[sz]e|"
+    r"find|look up|check|run|open|clone|write|draft)\b",
+    re.IGNORECASE,
+)
+_DIRECT_REQUEST_LINE_RE = re.compile(
+    r"^\s*(?:(?:please|can you|could you|would you|i (?:want|need) you to)\s+"
+    r"(?:research|investigate|compare|review|analy[sz]e|audit|implement|install|"
+    r"fix|build|create|update|edit|modify|change|show|explain|summari[sz]e|"
+    r"find|look up|check|run|open|clone|write|draft)\b|"
+    r"(?:research|investigate|compare|review|analy[sz]e)\s+"
+    r"(?:this|it|the above|these notes|this (?:post|article|excerpt))\b)",
+    re.IGNORECASE | re.MULTILINE,
+)
+_DIRECT_REQUEST_TAIL_RE = re.compile(
+    r"(?:\b(?:please|can you|could you|would you|i (?:want|need) you to)\s+"
+    r"(?:research|investigate|compare|review|analy[sz]e|audit|implement|install|"
+    r"fix|build|create|update|edit|modify|change|show|explain|summari[sz]e|"
+    r"find|look up|check|run|open|clone|write|draft)\b|"
+    r"(?:research|investigate|compare|review|analy[sz]e)\s+"
+    r"(?:this|it|the above|these notes|this (?:post|article|excerpt)))"
+    r"[^\n]{0,80}[.!?]?\s*$",
+    re.IGNORECASE,
+)
+_DIRECTIVE_HEADING_RE = re.compile(
+    r"^(?:task|request|required(?:\s+behaviou?r)?|instructions?|process|"
+    r"expected|acceptance|tests?|fix|build|implement|audit|review|research|"
+    r"do not|don't|stop)\b",
+    re.IGNORECASE,
+)
 _OAUTH_ASSESSMENT_PROVIDERS = frozenset({
     "openai-codex",
     "xai-oauth",
@@ -151,6 +189,33 @@ _OAUTH_ASSESSMENT_PROVIDERS = frozenset({
     "minimax-oauth",
     "google-gemini-cli",
 })
+
+
+def is_passive_reference_content(text: str) -> bool:
+    """Recognize substantial pasted reference material with no direct request.
+
+    This is intentionally conservative. It exists to keep article excerpts,
+    search-result dumps, and research notes on the deterministic intake path
+    instead of letting topical words implicitly authorize browsing or tools.
+    """
+    raw = str(text or "").strip()
+    if len(raw) < _PASSIVE_REFERENCE_MIN_CHARS:
+        return False
+    if _BARE_SUPPORTED_URL_RE.fullmatch(raw):
+        return False
+
+    lines = [line.strip() for line in raw.splitlines() if line.strip()]
+    first = lines[0] if lines else raw
+    if _DIRECT_REQUEST_START_RE.search(first[:300]):
+        return False
+    if any(_DIRECTIVE_HEADING_RE.search(line[:120]) for line in lines[:8]):
+        return False
+    if _DIRECT_REQUEST_LINE_RE.search(raw):
+        return False
+    if _DIRECT_REQUEST_TAIL_RE.search(raw[-600:]):
+        return False
+
+    return bool(_PASSIVE_REFERENCE_SOURCE_RE.search(raw)) or len(raw) >= 1800
 
 
 def parse_intelligent_intake(
@@ -177,6 +242,8 @@ def parse_intelligent_intake(
         return IntelligentIntake(raw, "forwarded_post")
     if _BARE_SUPPORTED_URL_RE.fullmatch(raw):
         return IntelligentIntake(raw, "bare_url")
+    if is_passive_reference_content(raw):
+        return IntelligentIntake(raw, "pasted_text")
     return None
 
 

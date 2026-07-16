@@ -3946,7 +3946,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         self._enqueue_fifo(session_key, event, adapter)
 
-    async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str) -> bool:
+    async def _handle_active_session_busy_message(
+        self,
+        event: MessageEvent,
+        session_key: str,
+        *,
+        force_queue: bool = False,
+    ) -> bool:
         # --- Authorization gate (#17775) ---
         # The cold path (_handle_message) checks _is_user_authorized before
         # creating a session.  The busy path must enforce the same check;
@@ -3998,12 +4004,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         running_agent = self._running_agents.get(session_key)
 
-        effective_mode = self._busy_input_mode
+        effective_mode = "queue" if force_queue else self._busy_input_mode
+        passive_reference = False
+        if event.message_type == MessageType.TEXT:
+            try:
+                from gateway.cogitator_intake_bridge import is_passive_reference_content
+                passive_reference = is_passive_reference_content(event.text or "")
+            except Exception:
+                passive_reference = False
+        if passive_reference:
+            # Informational context is additive by default. Preserve it for the
+            # next turn instead of interrupting or steering the active task.
+            effective_mode = "queue"
+
         busy_text_mode = getattr(self, "_busy_text_mode", "interrupt")
         if (
             event.message_type == MessageType.TEXT
             and busy_text_mode == "queue"
             and effective_mode != "steer"
+            and not force_queue
         ):
             return False
 
@@ -7100,6 +7119,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "No research or promotion was performed."
             )
         if _intelligent_intake is not None:
+            if _quick_key in self._running_agents:
+                logger.info(
+                    "Gateway queued intelligent intake behind active task "
+                    "(session=%s, kind=%s)",
+                    _quick_key, _intelligent_intake.input_kind,
+                )
+                await self._handle_active_session_busy_message(
+                    event, _quick_key, force_queue=True
+                )
+                return ""
             logger.info(
                 "Gateway routed intelligent intake (session=%s, kind=%s)",
                 _quick_key, _intelligent_intake.input_kind,

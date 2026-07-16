@@ -9,10 +9,10 @@ the agent's procedural memory with no review and no easy undo. Baseline
 recovery restored the modified `SKILL.md` files and quarantined the stray
 reference files, but nothing stopped it from happening again.
 
-The root cause: `skill_manage` (the agent's skill-write tool) wrote
-immediately on every call, with no gate distinguishing a deliberate
-curator/self-improvement pass from an ordinary conversational, operator, or
-cron run.
+The root cause: ordinary tool-heavy turns could trigger an automatic
+background skill-review fork, and that fork was explicitly authorized to write.
+Topical pasted content could therefore lead from research tools to a persistent
+`SKILL.md` mutation without a user request or preview.
 
 ## What is blocked
 
@@ -32,19 +32,29 @@ Reads (`skills_list`, `skill_view`) are **never** gated.
 
 ## What is allowed
 
-A skill write proceeds only inside an explicit curator/self-improvement flow:
+Normal conversation never writes a skill directly. A top-level interactive
+request such as “update this skill” binds intent for that turn, but intent only
+stages a proposed diff through the existing skills approval store. The skill
+file remains unchanged until the user previews and approves that exact pending
+change.
 
-| Flow | How it's recognized |
-|------|--------------------|
-| Background self-improvement review fork | `is_background_review()` — origin `background_review`, bound per-turn |
-| Curator review pass (`hermes curator run`) | wrapped in `allow_skill_writes()` around its review agent |
-| `/skills` approval replay | already bypasses via the staged-write replay path |
+| Flow | Result |
+|------|--------|
+| Ordinary conversation, research, cron, subagent, or background review | blocked; no staging and no write |
+| Explicit top-level interactive skill-change request | staged preview; no write |
+| Curator review pass (`hermes curator run`) | explicit `allow_skill_writes()` context |
+| `/skills` approval replay | applies the already-approved staged payload |
 
-The decision lives in `tools.skill_provenance.skill_writes_allowed()`. The gate
-itself is the single chokepoint `tools/skill_manager_tool.py::_apply_skill_write_gate`,
-called at the top of every `skill_manage` invocation.
+Automatic post-turn skill review is disabled. Background memory review remains
+separate and has no skill-write authority.
 
-To deliberately allow a write from new code, wrap it:
+The direct-write decision lives in
+`tools.skill_provenance.skill_writes_allowed()`. Explicit request intent is a
+separate per-turn signal and is deliberately ignored by raw file and terminal
+guards. The single `skill_manage` chokepoint is
+`tools/skill_manager_tool.py::_apply_skill_write_gate`.
+
+To deliberately allow a curator write from new code, wrap it:
 
 ```python
 from tools.skill_provenance import allow_skill_writes

@@ -1,0 +1,47 @@
+Quote 
+ stdrc 
+ @istdrc 
+ 
+· 
+18h 
+ 1:09 
+ Hi, I'm RC. I built Kimi CLI at Moonshot last year, and back in 2015, bots that lived in group chats. For the past four months, I've been building Raft in public.
+
+Today I'm launching Raft 1.0.
+
+Right now, working with agents means juggling terminals, sessions, and skills. The 
+ Thought for 6s 
+ @istdrc 
+ announces Raft 1.0, a platform that organises AI agents into team-like collaboration within a shared messaging workspace, allowing persistent agents with individual memory and contexts to handle tasks in parallel while humans direct strategy. 
+The founder highlights internal usage with over 100 named agents and 10 humans running 99% of operations at Raft, alongside 20,000+ external builders adopting an average of four agents per human for similar agent-native workflows. 
+Raft 1.0 introduces features such as external agent integration, agent-created channels, joint servers, and message search, positioning multi-agent teams as superior to single large models for complex, ongoing work through natural handoffs and peer reviews. 
+ Explain Raft's memory architecture 
+ 
+Compare with AutoGen or CrewAI 
+ Explain Raft's memory architecture 
+ Thought for 5s 
+ Raft's memory architecture revolves around long-running, persistent agent sessions as the core unit, treating each agent as a continuous "teammate" rather than a stateless prompt-response tool.  
+ raft.build 
+ 
+Per-agent long sessions: Each agent operates as a persistent process with its own dedicated memory store. This retains codebase knowledge, user preferences, past conversations, task history, and learned context across days or weeks. When an agent "wakes up" or picks up a new task, it resumes exactly where it left off without re-onboarding or losing state.  
+ raft.build 
+ Shared workspace context via channels/threads: Agents access collective memory through Raft's messaging-style interface (channels, DMs, threads, @mentions 
+). They can read channel history, reference work from other agents or humans, hand off tasks, and pull in relevant notes (e.g., one agent referencing another's user-research from a different channel). This enables emergent team behaviours without central scripting.  
+ @istdrc 
+ Local execution and privacy focus: Agents run on the user's hardware via a lightweight daemon, keeping sensitive data (code, preferences) under user control. Memory compounds naturally through repeated interactions in shared spaces, leading to specialization (e.g., one agent excels at triage) and collective intelligence over time.  
+ raft.build 
+ This design contrasts with single-context "big agent" approaches by distributing memory across specialized, independent long sessions that collaborate via the shared workspace. Details on low-level storage (e.g., vector embeddings or graphs) are not publicly detailed, but the emphasis is on persistence, identity, and seamless inter-agent communication for real-world team productivity. For the latest, check Raft's docs or app at raft.build. 
+ 1 post 
+ 2 web pages 
+ Explore Raft's vector storage methods 
+ 
+Investigate Mem0's memory architecture 
+ 
+Simplify Raft's memory explanation 
+ Investigate Mem0's memory architecture 
+ Thought for 10s 
+ Mem0 (mem-zero) is an open-source universal memory layer for AI agents and apps, designed to provide persistent, scalable long-term memory beyond LLM context windows. It enables agents to remember user preferences, facts, interactions, and relationships across sessions while reducing token usage and latency.  
+ github.com 
+ 
+Core ArchitectureMem0 uses a hybrid storage approach combining:Vector database — for semantic similarity search. 
+Graph database (in enhanced Mem0g variant) — for modeling entities as nodes and relationships as edges, supporting complex relational reasoning (e.g., multi-hop queries).

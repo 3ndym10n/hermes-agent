@@ -377,13 +377,9 @@ def finalize_turn(
     # Clear stream callback so it doesn't leak into future calls
     agent._stream_callback = None
 
-    # Check skill trigger NOW — based on how many tool iterations THIS turn used.
+    # Automatic post-turn skill reviews are intentionally disabled. Skill
+    # changes require an explicit top-level request and staged approval.
     _should_review_skills = False
-    if (agent._skill_nudge_interval > 0
-            and agent._iters_since_skill >= agent._skill_nudge_interval
-            and "skill_manage" in agent.valid_tool_names):
-        _should_review_skills = True
-        agent._iters_since_skill = 0
 
     # External memory provider: sync the completed turn + queue next prefetch.
     agent._sync_external_memory_for_turn(
