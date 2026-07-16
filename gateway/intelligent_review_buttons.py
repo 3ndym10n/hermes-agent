@@ -169,23 +169,91 @@ def review_action_for(action: str) -> str:
     return _REVIEW_ACTION.get(action, "")
 
 
-def recommended_action(
-    *, disposition: str, content_type: str, final_state: str
-) -> str:
-    """Pick the one recommended button to emphasize."""
-    disposition = str(disposition or "").strip().lower()
-    content_type = str(content_type or "").strip().lower()
+def _recommendation(assessment: dict, final_state: str) -> tuple[str, str, str]:
+    decision = (assessment or {}).get("decision") or {}
+    understanding = (assessment or {}).get("understanding") or {}
+    judgment = (assessment or {}).get("judgment") or {}
+    comparison = (assessment or {}).get("memory_comparison") or {}
+    disposition = str(decision.get("recommended_disposition") or "").strip().lower()
+    content_type = str(understanding.get("content_type") or "").strip().lower()
+    evidence_quality = str(judgment.get("evidence_quality") or "").strip().lower()
     if final_state == "partial_assessment":
-        return PENDING
-    if disposition in {"promotion_candidate", "create_playbook_candidate"}:
-        return APPROVE
-    if disposition in {"research_later", "request_explicit_research"}:
-        return RESEARCH
+        return (
+            PENDING,
+            "LEAVE PENDING",
+            "Leaves the item unapproved for later review. It does not promote or implement anything.",
+        )
+    if (
+        str(comparison.get("duplication_status") or "").strip().lower()
+        == "contradiction"
+        or comparison.get("contradictions")
+    ):
+        return (
+            DETAILS,
+            "REVIEW CONTRADICTION",
+            "Shows the conflicting knowledge before Cal decides.",
+        )
+    if disposition in {"research_later", "request_explicit_research"} or (
+        content_type in {"factual_claim", "verified_fact_candidate"}
+        and evidence_quality in {"weak", "unknown"}
+    ):
+        return (
+            RESEARCH,
+            "RESEARCH BEFORE APPROVAL",
+            "Creates an explicit research request. It must not silently start paid research.",
+        )
     if disposition in {"ignore", "archive"} or content_type == "noise":
-        return ARCHIVE
-    if disposition in {"escalate_to_cal"}:
-        return PENDING
-    return APPROVE
+        return (
+            ARCHIVE,
+            "ARCHIVE",
+            "Removes the item from normal review and retrieval without deleting the source.",
+        )
+    if disposition == "escalate_to_cal":
+        return (
+            PENDING,
+            "LEAVE PENDING",
+            "Leaves the item unapproved for later review. It does not promote or implement anything.",
+        )
+    if content_type in {
+        "operating_playbook",
+        "marketing_playbook",
+        "sales_playbook",
+        "personal_preference_or_method",
+        "principle",
+    }:
+        return (
+            APPROVE,
+            "APPROVE AS OPERATING PLAYBOOK",
+            "Treats the bounded method as approved operating guidance. It does not start implementation or validate every factual claim in the source.",
+        )
+    if content_type == "risk_or_warning":
+        return (
+            APPROVE,
+            "APPROVE AS SAFETY WARNING",
+            "Adds the risk and prevention rule to approved safety context. It does not authorize implementation.",
+        )
+    if content_type in {"technical_insight", "tool_or_system_idea"}:
+        return (
+            APPROVE,
+            "APPROVE AS TECHNICAL INSIGHT",
+            "Makes the pattern retrievable as technical guidance. It does not authorize architecture changes or implementation.",
+        )
+    if content_type in {"hypothesis", "business_opportunity", "experiment_idea"}:
+        return (
+            APPROVE,
+            "APPROVE AS BUSINESS HYPOTHESIS",
+            "Preserves it as a labelled hypothesis, not verified fact. It does not authorize implementation.",
+        )
+    return (
+        APPROVE,
+        "APPROVE AS REFERENCE CONTEXT",
+        "Makes this item retrievable for future relevant work. It does not install or implement anything or verify unproven factual claims.",
+    )
+
+
+def recommended_action(*, assessment: dict, final_state: str) -> str:
+    """Pick the one recommended button to emphasize."""
+    return _recommendation(assessment, final_state)[0]
 
 
 def _clip(value, limit: int = 200) -> str:
@@ -193,14 +261,18 @@ def _clip(value, limit: int = 200) -> str:
     return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
 
 
-def build_review_footer(assessment: dict, review_id: str) -> str:
+def build_review_footer(
+    assessment: dict, review_id: str, *, final_state: str = ""
+) -> str:
     decision = (assessment or {}).get("decision") or {}
-    disposition = str(decision.get("recommended_disposition") or "unknown")
+    action, label, effect = _recommendation(assessment, final_state)
     why = _clip(decision.get("why_it_matters") or "—")
     return "\n".join(
         [
             "—",
-            f"RECOMMENDED DECISION: {disposition.replace('_', ' ')}",
+            f"RECOMMENDED DECISION: {label}",
+            f"ACTION: Tap {_LABELS[action]}",
+            f"EFFECT: {effect}",
             f"WHY: {why}",
             f"REVIEW ID: {review_id}",
         ]

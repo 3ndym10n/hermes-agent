@@ -96,19 +96,31 @@ def test_details_and_pending_are_repeatable():
 
 def test_partial_and_recommendation_layout():
     assert irb.recommended_action(
-        disposition="save_as_context", content_type="reference_material",
+        assessment={
+            "decision": {"recommended_disposition": "save_as_context"},
+            "understanding": {"content_type": "reference_material"},
+        },
         final_state="partial_assessment",
     ) == irb.PENDING
     assert irb.recommended_action(
-        disposition="promotion_candidate", content_type="operating_playbook",
+        assessment={
+            "decision": {"recommended_disposition": "promotion_candidate"},
+            "understanding": {"content_type": "operating_playbook"},
+        },
         final_state="complete_assessment",
     ) == irb.APPROVE
     assert irb.recommended_action(
-        disposition="research_later", content_type="factual_claim",
+        assessment={
+            "decision": {"recommended_disposition": "research_later"},
+            "understanding": {"content_type": "factual_claim"},
+        },
         final_state="complete_assessment",
     ) == irb.RESEARCH
     assert irb.recommended_action(
-        disposition="ignore", content_type="noise",
+        assessment={
+            "decision": {"recommended_disposition": "ignore"},
+            "understanding": {"content_type": "noise"},
+        },
         final_state="complete_assessment",
     ) == irb.ARCHIVE
     layout = irb.button_layout(irb.RESEARCH)
@@ -117,14 +129,173 @@ def test_partial_and_recommendation_layout():
     assert any(lbl.startswith("⭐") and "Research" in lbl for lbl in labels)
 
 
-def test_footer_and_saved_to_strip():
+@pytest.mark.parametrize(
+    (
+        "assessment",
+        "final_state",
+        "expected_action",
+        "expected_button",
+        "expected_label",
+        "expected_effect",
+    ),
+    [
+        (
+            {
+                "decision": {"recommended_disposition": "save_as_context"},
+                "understanding": {"content_type": "reference_material"},
+                "judgment": {"evidence_quality": "moderate"},
+            },
+            "complete_assessment",
+            irb.APPROVE,
+            "✅ Approve",
+            "APPROVE AS REFERENCE CONTEXT",
+            "Makes this item retrievable for future relevant work. It does not "
+            "install or implement anything or verify unproven factual claims.",
+        ),
+        (
+            {
+                "decision": {"recommended_disposition": "create_playbook_candidate"},
+                "understanding": {"content_type": "operating_playbook"},
+            },
+            "complete_assessment",
+            irb.APPROVE,
+            "✅ Approve",
+            "APPROVE AS OPERATING PLAYBOOK",
+            "Treats the bounded method as approved operating guidance. It does "
+            "not start implementation or validate every factual claim in the source.",
+        ),
+        (
+            {
+                "decision": {"recommended_disposition": "promotion_candidate"},
+                "understanding": {"content_type": "risk_or_warning"},
+            },
+            "complete_assessment",
+            irb.APPROVE,
+            "✅ Approve",
+            "APPROVE AS SAFETY WARNING",
+            "Adds the risk and prevention rule to approved safety context. It "
+            "does not authorize implementation.",
+        ),
+        (
+            {
+                "decision": {"recommended_disposition": "promotion_candidate"},
+                "understanding": {"content_type": "technical_insight"},
+            },
+            "complete_assessment",
+            irb.APPROVE,
+            "✅ Approve",
+            "APPROVE AS TECHNICAL INSIGHT",
+            "Makes the pattern retrievable as technical guidance. It does not "
+            "authorize architecture changes or implementation.",
+        ),
+        (
+            {
+                "decision": {"recommended_disposition": "test_as_hypothesis"},
+                "understanding": {"content_type": "hypothesis"},
+            },
+            "complete_assessment",
+            irb.APPROVE,
+            "✅ Approve",
+            "APPROVE AS BUSINESS HYPOTHESIS",
+            "Preserves it as a labelled hypothesis, not verified fact. It does "
+            "not authorize implementation.",
+        ),
+        (
+            {
+                "decision": {"recommended_disposition": "save_as_context"},
+                "understanding": {"content_type": "factual_claim"},
+                "judgment": {"evidence_quality": "weak"},
+            },
+            "complete_assessment",
+            irb.RESEARCH,
+            "🔎 Research",
+            "RESEARCH BEFORE APPROVAL",
+            "Creates an explicit research request. It must not silently start "
+            "paid research.",
+        ),
+        (
+            {
+                "decision": {"recommended_disposition": "save_as_context"},
+                "understanding": {"content_type": "reference_material"},
+            },
+            "partial_assessment",
+            irb.PENDING,
+            "⏸ Leave Pending",
+            "LEAVE PENDING",
+            "Leaves the item unapproved for later review. It does not promote "
+            "or implement anything.",
+        ),
+        (
+            {
+                "decision": {"recommended_disposition": "save_as_context"},
+                "understanding": {"content_type": "reference_material"},
+                "memory_comparison": {
+                    "duplication_status": "contradiction",
+                    "contradictions": [
+                        "Conflicts with approved operating guidance."
+                    ],
+                },
+            },
+            "complete_assessment",
+            irb.DETAILS,
+            "📄 Details",
+            "REVIEW CONTRADICTION",
+            "Shows the conflicting knowledge before Cal decides.",
+        ),
+        (
+            {
+                "decision": {"recommended_disposition": "archive"},
+                "understanding": {"content_type": "reference_material"},
+                "judgment": {"value_level": "low"},
+            },
+            "complete_assessment",
+            irb.ARCHIVE,
+            "🗄 Archive",
+            "ARCHIVE",
+            "Removes the item from normal review and retrieval without deleting "
+            "the source.",
+        ),
+    ],
+)
+def test_explicit_recommendation_footer(
+    assessment,
+    final_state,
+    expected_action,
+    expected_button,
+    expected_label,
+    expected_effect,
+):
+    assessment = {
+        **assessment,
+        "decision": {
+            **assessment["decision"],
+            "why_it_matters": "Specific reason.",
+        },
+    }
     footer = irb.build_review_footer(
-        {"decision": {"recommended_disposition": "promotion_candidate",
-                      "why_it_matters": "cost lever"}},
-        "inote-5",
+        assessment, "inote-5", final_state=final_state
     )
-    assert "RECOMMENDED DECISION:" in footer and "WHY:" in footer
-    assert "REVIEW ID: inote-5" in footer
+    action = irb.recommended_action(
+        assessment=assessment, final_state=final_state
+    )
+    assert action == expected_action
+    assert footer.splitlines()[-5:] == [
+        f"RECOMMENDED DECISION: {expected_label}",
+        f"ACTION: Tap {expected_button}",
+        f"EFFECT: {expected_effect}",
+        "WHY: Specific reason.",
+        "REVIEW ID: inote-5",
+    ]
+    starred = [
+        label
+        for row in irb.button_layout(action)
+        for label, _button_action in row
+        if label.startswith("⭐ ")
+    ]
+    assert starred == [f"⭐ {expected_button}"]
+
+
+def test_saved_to_strip():
     assert irb.strip_saved_to(
         "VALUE: HIGH\nSAVED TO: storage/notes/ki.md\nREVIEW ID: inote-5"
     ) == "VALUE: HIGH\nREVIEW ID: inote-5"
