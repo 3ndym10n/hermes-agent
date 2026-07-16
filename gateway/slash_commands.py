@@ -2398,7 +2398,7 @@ class GatewaySlashCommandsMixin:
                     reasoning_result=repaired,
                     repair_attempt=True,
                 )
-            return render_intelligent_intake_message(finalized)
+            return await self._deliver_intelligent_assessment(event, finalized)
         except IntakeBridgeError as exc:
             logger.warning(
                 "[intelligent_intake] bridge error code=%s", exc.code
@@ -2416,6 +2416,161 @@ class GatewaySlashCommandsMixin:
                 "or promotion was performed."
             )
 
+
+    @property
+    def _intelligent_button_store(self):
+        store = getattr(self, "_isb_button_store", None)
+        if store is None:
+            from gateway.intelligent_review_buttons import ReviewButtonStore
+
+            store = ReviewButtonStore()
+            setattr(self, "_isb_button_store", store)
+        return store
+
+    @staticmethod
+    def _intelligent_message_metadata(event) -> dict:
+        meta: dict = {}
+        thread_id = getattr(getattr(event, "source", None), "thread_id", None)
+        if thread_id is not None:
+            meta["thread_id"] = str(thread_id)
+        return meta
+
+    async def _deliver_intelligent_assessment(self, event, finalized) -> str:
+        """Send the saved assessment with inline review buttons; plain fallback.
+
+        Buttons are a pure UX enhancement: any failure falls back to the exact
+        existing text message so intake never breaks. Only a successfully saved
+        candidate (status ok, with review + item IDs and a Telegram inline-
+        keyboard sender) gets buttons.
+        """
+        from gateway.cogitator_intake_bridge import (
+            render_intelligent_intake_message,
+        )
+
+        if not isinstance(finalized, dict) or finalized.get("status") != "ok":
+            return render_intelligent_intake_message(finalized)
+        try:
+            from gateway import intelligent_review_buttons as irb
+
+            assessment = finalized.get("assessment") or {}
+            review_id = str(finalized.get("review_id") or "")
+            item_id = str(finalized.get("item_id") or "")
+            source = getattr(event, "source", None)
+            adapter = (
+                self.adapters.get(source.platform)
+                if source and getattr(self, "adapters", None)
+                else None
+            )
+            sender = getattr(adapter, "send_intelligent_review_message", None)
+            if not (review_id and item_id and source and callable(sender)):
+                return render_intelligent_intake_message(finalized)
+
+            base_message = irb.strip_saved_to(
+                str(finalized.get("telegram_message") or "")
+            )
+            footer = irb.build_review_footer(assessment, review_id)
+            text = f"{base_message}\n{footer}" if base_message else footer
+            recommended = irb.recommended_action(
+                disposition=(assessment.get("decision") or {}).get(
+                    "recommended_disposition"
+                ),
+                content_type=(assessment.get("understanding") or {}).get(
+                    "content_type"
+                ),
+                final_state=str(finalized.get("final_state") or ""),
+            )
+            layout = irb.button_layout(recommended)
+            store = self._intelligent_button_store
+            tokens = store.mint_group(
+                review_id=review_id,
+                item_id=item_id,
+                chat_id=str(source.chat_id),
+                user_id=str(getattr(source, "user_id", "") or ""),
+                actions=irb.BUTTON_ACTIONS,
+            )
+            button_rows = [
+                [(label, tokens[action]) for label, action in row]
+                for row in layout
+            ]
+            result = await sender(
+                chat_id=str(source.chat_id),
+                text=text,
+                button_rows=button_rows,
+                metadata=self._intelligent_message_metadata(event),
+            )
+            message_id = getattr(result, "message_id", None)
+            if message_id:
+                store.bind_message(list(tokens.values()), str(message_id))
+            if getattr(result, "success", False):
+                return ""  # already delivered with buttons
+        except Exception:
+            logger.exception(
+                "[intelligent_buttons] delivery failed; plain-text fallback"
+            )
+        return render_intelligent_intake_message(finalized)
+
+    async def handle_intelligent_button_action(self, entry) -> dict:
+        """Execute one bounded, deterministic review action from a click.
+
+        No model, provider, or paid research is ever invoked. Approve / archive
+        / research delegate to the already-merged Cogitator review bridge;
+        details is the deterministic saved-assessment view; pending mutates
+        nothing. Returns {text, remove_buttons, status}.
+        """
+        from gateway import intelligent_review_buttons as irb
+        from gateway.cogitator_intake_bridge import (
+            TOKEN_ENV,
+            IntelligentReviewCommand,
+            render_intelligent_review_message,
+            request_intelligent_review,
+        )
+
+        action = entry.action
+        if action == irb.PENDING:
+            return {
+                "text": "⏸ Left pending — no change was made. The buttons stay "
+                "active for a later decision.",
+                "remove_buttons": False,
+                "status": "pending",
+            }
+
+        enabled, base_url, _local = self._intake_config()
+        token = str(os.environ.get(TOKEN_ENV, "") or "").strip()
+        if not enabled or not base_url or not token:
+            return {
+                "text": "Knowledge review is unavailable: the intake bridge is "
+                "not configured.",
+                "remove_buttons": False,
+                "status": "blocked",
+            }
+
+        command = IntelligentReviewCommand(
+            entry.review_id,
+            irb.review_action_for(action),
+            "assessment" if action == irb.DETAILS else "",
+        )
+        result = await asyncio.to_thread(
+            request_intelligent_review,
+            base_url=base_url,
+            token=token,
+            command=command,
+        )
+        # Hard safety net: a button click must never incur paid or research spend.
+        if result.get("paid_api_used") not in (False, None) or result.get(
+            "research_performed"
+        ) not in (False, None):
+            raise RuntimeError(
+                "intelligent button click must never incur paid or research spend"
+            )
+        remove = irb.is_terminal(action) and result.get("status") in {
+            "applied",
+            "already_applied",
+        }
+        return {
+            "text": render_intelligent_review_message(result),
+            "remove_buttons": remove,
+            "status": str(result.get("status") or ""),
+        }
 
     @staticmethod
     def _persist_intelligent_reasoning_failure_receipt(

@@ -3207,6 +3207,114 @@ class TelegramAdapter(BasePlatformAdapter):
             logger.warning("[%s] send_update_prompt failed: %s", self.name, e)
             return SendResult(success=False, error=str(e))
 
+    async def send_intelligent_review_message(
+        self, *, chat_id: str, text: str, button_rows, metadata=None,
+    ) -> SendResult:
+        """Send one ISB assessment message with inline review buttons.
+
+        ``button_rows`` is a list of rows; each row a list of ``(label, token)``.
+        Only the opaque token rides in ``callback_data`` (``isb:<token>``) — never
+        a review ID, action word, path, secret, or source text.
+        """
+        if not self._bot:
+            return SendResult(success=False, error="Not connected")
+        try:
+            keyboard = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(str(label), callback_data=f"isb:{tok}")
+                    for label, tok in row
+                ]
+                for row in button_rows
+            ])
+            formatted = self.format_message(text)
+            thread_id = self._metadata_thread_id(metadata)
+            reply_to_id = self._reply_to_message_id_for_send(
+                None, metadata, reply_to_mode=self._reply_to_mode
+            )
+            msg = await self._send_message_with_thread_fallback(
+                chat_id=int(chat_id),
+                text=formatted,
+                parse_mode=ParseMode.MARKDOWN_V2,
+                reply_markup=keyboard,
+                reply_to_message_id=reply_to_id,
+                **self._thread_kwargs_for_send(
+                    chat_id,
+                    thread_id,
+                    metadata,
+                    reply_to_message_id=reply_to_id,
+                    reply_to_mode=self._reply_to_mode,
+                ),
+                **self._link_preview_kwargs(),
+            )
+            return SendResult(success=True, message_id=str(msg.message_id))
+        except Exception as e:
+            logger.warning(
+                "[%s] send_intelligent_review_message failed: %s", self.name, e
+            )
+            return SendResult(success=False, error=str(e))
+
+    async def _handle_intelligent_review_callback(
+        self, query, data, *, query_chat_id, query_chat_type,
+        query_thread_id, query_user_name,
+    ) -> None:
+        """Validate + execute one ISB review-button click. Deterministic only."""
+        token = data.split(":", 1)[1] if ":" in data else ""
+        runner = getattr(
+            getattr(self, "_message_handler", None), "__self__", None
+        )
+        store = getattr(runner, "_intelligent_button_store", None) if runner else None
+        action_fn = getattr(runner, "handle_intelligent_button_action", None)
+        if store is None or not callable(action_fn):
+            await query.answer(text="Review buttons are unavailable.")
+            return
+        caller_id = str(getattr(query.from_user, "id", ""))
+        if not self._is_callback_user_authorized(
+            caller_id,
+            chat_id=query_chat_id,
+            chat_type=str(query_chat_type) if query_chat_type is not None else None,
+            thread_id=str(query_thread_id) if query_thread_id is not None else None,
+            user_name=query_user_name,
+        ):
+            await query.answer(text="⛔ You are not authorized to review knowledge.")
+            return
+        state, entry = store.validate(token, user_id=caller_id)
+        if state != "ok":
+            await query.answer(text={
+                "not_found": "These review buttons have expired.",
+                "expired": "These review buttons have expired.",
+                "already_handled": "Already handled.",
+                "wrong_user": "⛔ You are not authorized to review knowledge.",
+            }.get(state, "Review buttons are unavailable."))
+            return
+        # Ack immediately so Telegram stops the spinner, then execute the action.
+        await query.answer()
+        store.consume(entry)
+        try:
+            result = await action_fn(entry)
+        except Exception:
+            logger.exception("[intelligent_buttons] action failed")
+            try:
+                await self.send(str(query_chat_id), "Review action failed safely.")
+            except Exception:
+                pass
+            return
+        text = str((result or {}).get("text") or "").strip()
+        if (result or {}).get("remove_buttons"):
+            try:
+                await query.edit_message_text(
+                    text=self.format_message(text or "Done."),
+                    parse_mode=ParseMode.MARKDOWN_V2,
+                    reply_markup=None,
+                )
+                return
+            except Exception:
+                pass  # fall through to a follow-up message
+        if text:
+            try:
+                await self.send(str(query_chat_id), text)
+            except Exception:
+                pass
+
     async def send_exec_approval(
         self, chat_id: str, command: str, session_key: str,
         description: str = "dangerous command",
@@ -3898,6 +4006,18 @@ class TelegramAdapter(BasePlatformAdapter):
         # --- Gmail-triage callbacks (gt:verb:arg) ---
         if data.startswith("gt:"):
             await self._handle_gmail_triage_callback(
+                query,
+                data,
+                query_chat_id=query_chat_id,
+                query_chat_type=query_chat_type,
+                query_thread_id=query_thread_id,
+                query_user_name=query_user_name,
+            )
+            return
+
+        # --- Intelligent Second Brain review-button callbacks (isb:<token>) ---
+        if data.startswith("isb:"):
+            await self._handle_intelligent_review_callback(
                 query,
                 data,
                 query_chat_id=query_chat_id,
