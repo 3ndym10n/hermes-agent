@@ -3289,8 +3289,19 @@ class TelegramAdapter(BasePlatformAdapter):
         # Ack immediately so Telegram stops the spinner, then execute the action.
         await query.answer()
         store.consume(entry)
+        # Async-research delivery route for the Research action: the durable
+        # job's completion is pushed back to the chat the button lives in.
+        raw_type = str(query_chat_type or "private").strip().lower()
+        origin = {
+            "platform": "telegram",
+            "chat_id": str(query_chat_id),
+            "chat_type": ("dm" if raw_type == "private"
+                          else "channel" if raw_type == "channel" else "group"),
+        }
+        if query_thread_id is not None:
+            origin["thread_id"] = str(query_thread_id)
         try:
-            result = await action_fn(entry)
+            result = await action_fn(entry, origin=origin)
         except Exception:
             logger.exception("[intelligent_buttons] action failed")
             try:

@@ -1346,6 +1346,7 @@ class GatewaySlashCommandsMixin:
             response = request_research_decision_item(
                 base_url=base_url, token=token,
                 item_id=research_item_id, expected_snapshot_id=research_snapshot,
+                origin=self._intake_origin(event),
             )
         except ResearchBridgeError as exc:
             logger.warning("[decision_inbox] research bridge error code=%s", exc.code)
@@ -2507,13 +2508,16 @@ class GatewaySlashCommandsMixin:
             )
         return render_intelligent_intake_message(finalized)
 
-    async def handle_intelligent_button_action(self, entry) -> dict:
+    async def handle_intelligent_button_action(self, entry, origin=None) -> dict:
         """Execute one bounded, deterministic review action from a click.
 
-        No model, provider, or paid research is ever invoked. Approve / archive
-        / research delegate to the already-merged Cogitator review bridge;
-        details is the deterministic saved-assessment view; pending mutates
-        nothing. Returns {text, remove_buttons, status}.
+        No model, provider, or paid research is ever invoked here. Approve /
+        archive / research delegate to the already-merged Cogitator review
+        bridge; details is the deterministic saved-assessment view; pending
+        mutates nothing. For the Research action, ``origin`` (the Telegram
+        route of the chat the button lives in) rides along so Cogitator can
+        queue ONE durable async Grok OAuth research job and deliver its result
+        back asynchronously. Returns {text, remove_buttons, status}.
         """
         from gateway import intelligent_review_buttons as irb
         from gateway.cogitator_intake_bridge import (
@@ -2546,6 +2550,7 @@ class GatewaySlashCommandsMixin:
             entry.review_id,
             irb.review_action_for(action),
             "assessment" if action == irb.DETAILS else "",
+            origin=dict(origin) if action == irb.RESEARCH and origin else None,
         )
         result = await asyncio.to_thread(
             request_intelligent_review,

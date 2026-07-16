@@ -369,10 +369,82 @@ async def test_details_uses_only_the_deterministic_view(bridge_calls):
 
 @pytest.mark.asyncio
 async def test_research_creates_only_an_explicit_request(bridge_calls):
-    res = await _runner_instance().handle_intelligent_button_action(_entry(irb.RESEARCH))
+    origin = {"platform": "telegram", "chat_id": "1", "chat_type": "dm"}
+    res = await _runner_instance().handle_intelligent_button_action(
+        _entry(irb.RESEARCH), origin=origin
+    )
     assert [c.action for c in bridge_calls] == ["request_explicit_research"]
+    # The delivery route rides on the research command (and only there).
+    assert bridge_calls[0].origin == origin
     assert res["status"] == "research_requested"
     assert res["remove_buttons"] is False
+
+
+@pytest.mark.asyncio
+async def test_non_research_actions_never_carry_origin(bridge_calls):
+    origin = {"platform": "telegram", "chat_id": "1", "chat_type": "dm"}
+    await _runner_instance().handle_intelligent_button_action(
+        _entry(irb.ARCHIVE), origin=origin
+    )
+    assert bridge_calls[0].action == "archive"
+    assert bridge_calls[0].origin is None
+
+
+@pytest.mark.asyncio
+async def test_research_button_renders_queued_durable_job(monkeypatch):
+    def fake(*, base_url, token, command):
+        assert command.origin == {
+            "platform": "telegram", "chat_id": "1", "chat_type": "dm",
+        }
+        return {
+            "requested_action": "review_intelligent_knowledge",
+            "status": "research_requested",
+            "action": "request_explicit_research",
+            "item_id": "ki_" + "a" * 24, "review_id": "inote-5",
+            "paid_api_used": False, "research_performed": False,
+            "research_job": {
+                "job_id": "inote-5", "status": "queued", "created": True,
+                "mode": "grok_oauth_pilot",
+                "requested_provider": "xai-oauth:grok-4.5",
+                "paid_api_used": False,
+            },
+        }
+
+    monkeypatch.setattr(bridge, "request_intelligent_review", fake)
+    monkeypatch.setenv("COGITATOR_BRIDGE_TOKEN", "tok")
+    res = await _runner_instance().handle_intelligent_button_action(
+        _entry(irb.RESEARCH),
+        origin={"platform": "telegram", "chat_id": "1", "chat_type": "dm"},
+    )
+    assert "Research queued" in res["text"]
+    assert "Job: inote-5" in res["text"]
+    assert "Provider: Grok OAuth" in res["text"]
+    assert "Paid API: no" in res["text"]
+
+
+@pytest.mark.asyncio
+async def test_research_job_not_queued_is_reported_honestly(monkeypatch):
+    def fake(*, base_url, token, command):
+        return {
+            "requested_action": "review_intelligent_knowledge",
+            "status": "research_requested",
+            "action": "request_explicit_research",
+            "item_id": "ki_" + "a" * 24, "review_id": "inote-5",
+            "paid_api_used": False, "research_performed": False,
+            "research_job": {
+                "status": "error", "created": False,
+                "reason": "feed unavailable", "paid_api_used": False,
+            },
+        }
+
+    monkeypatch.setattr(bridge, "request_intelligent_review", fake)
+    monkeypatch.setenv("COGITATOR_BRIDGE_TOKEN", "tok")
+    res = await _runner_instance().handle_intelligent_button_action(
+        _entry(irb.RESEARCH),
+        origin={"platform": "telegram", "chat_id": "1", "chat_type": "dm"},
+    )
+    assert "NOT queued" in res["text"]
+    assert "feed unavailable" in res["text"]
 
 
 @pytest.mark.asyncio
@@ -427,8 +499,10 @@ class _Runner:
     def _is_user_authorized(self, source):
         return self.authorized
 
-    async def handle_intelligent_button_action(self, entry):
+    async def handle_intelligent_button_action(self, entry, origin=None):
         self.actions.append(entry.action)
+        self.origins = getattr(self, "origins", [])
+        self.origins.append(origin)
         terminal = entry.action in {irb.APPROVE, irb.ARCHIVE}
         return {
             "text": "✅ Approved" if terminal else "ok",
@@ -470,6 +544,10 @@ async def test_callback_approve_once_edits_and_removes_buttons():
     q = await _click(adapter, store, toks["approve"])
     q.answer.assert_awaited()  # spinner cleared immediately
     assert runner.actions == ["approve"]
+    # The callback site supplies the strict delivery route for async research.
+    assert runner.origins == [
+        {"platform": "telegram", "chat_id": "1", "chat_type": "dm"}
+    ]
     q.edit_message_text.assert_awaited()  # message updated after action
     assert q.edit_message_text.call_args.kwargs["reply_markup"] is None  # stale buttons removed
 

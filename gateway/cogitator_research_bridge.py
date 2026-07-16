@@ -56,13 +56,20 @@ class ResearchBridgeError(Exception):
         self.detail = detail
 
 
-def build_research_request(*, item_id: str, expected_snapshot_id: str = "") -> dict[str, Any]:
+def build_research_request(
+    *,
+    item_id: str,
+    expected_snapshot_id: str = "",
+    origin: Optional[Mapping[str, Any]] = None,
+) -> dict[str, Any]:
     """Build the draft-only ``research_decision_item`` bridge packet.
 
     ``item_id`` is the Decision Inbox display number (or a stable candidate id);
     ``expected_snapshot_id`` pins the batch it was shown under so a stale number
     is rejected on Cogitator's side. ``confirm`` is always True — Cal replying
-    ``research <n>`` inside the cockpit is the explicit confirmation."""
+    ``research <n>`` inside the cockpit is the explicit confirmation. ``origin``
+    (the Telegram route of the cockpit chat) makes Cogitator queue one durable
+    async job and push the verdict back instead of running inline."""
     context: dict[str, Any] = {
         "item_id": str(item_id),
         "confirm": True,
@@ -70,6 +77,8 @@ def build_research_request(*, item_id: str, expected_snapshot_id: str = "") -> d
     }
     if str(expected_snapshot_id or "").strip():
         context["expected_snapshot_id"] = str(expected_snapshot_id).strip()
+    if origin:
+        context["origin"] = dict(origin)
     return {
         "source_agent": "hermes",
         "requested_action": _REQUESTED_ACTION,
@@ -147,7 +156,23 @@ def validate_research_response(response: Any) -> dict[str, Any]:
     if status == "ok":
         if response.get("mode") != GROK_RESEARCH_MODE:
             raise ResearchBridgeError("BRIDGE_RESPONSE_INVALID", "research mode mismatch")
-        if _grok_receipt(response) is None:
+        job = response.get("research_job")
+        if isinstance(job, Mapping):
+            # Durable async job descriptor: nothing ran yet, so no provider
+            # receipt exists — but the job must be unpaid and Grok-scoped.
+            if (
+                job.get("paid_api_used") is not False
+                or str(job.get("status") or "")
+                not in {"queued", "duplicate", "complete"}
+                or (
+                    str(job.get("status") or "") != "complete"
+                    and job.get("requested_provider") != GROK_PROVIDER_PATH
+                )
+            ):
+                raise ResearchBridgeError(
+                    "BRIDGE_RESPONSE_INVALID", "research job descriptor invalid"
+                )
+        elif _grok_receipt(response) is None:
             raise ResearchBridgeError("BRIDGE_RESPONSE_INVALID", "research provider receipt mismatch")
     if response.get("promotion_performed") not in (False, None):
         raise ResearchBridgeError("BRIDGE_PROMOTION_REPORTED", f"promotion_performed={response.get('promotion_performed')!r}")
@@ -163,6 +188,7 @@ def request_research_decision_item(
     token: str,
     item_id: str,
     expected_snapshot_id: str = "",
+    origin: Optional[Mapping[str, Any]] = None,
     urlopen: Optional[Callable[..., Any]] = None,
 ) -> dict[str, Any]:
     """Build the request, POST it, and validate the reply. Fails closed."""
@@ -172,7 +198,9 @@ def request_research_decision_item(
         raise ResearchBridgeError("BRIDGE_TOKEN_MISSING", "token missing")
     if not str(item_id or "").strip():
         raise ResearchBridgeError("NO_ITEM", "no item_id supplied")
-    packet = build_research_request(item_id=item_id, expected_snapshot_id=expected_snapshot_id)
+    packet = build_research_request(
+        item_id=item_id, expected_snapshot_id=expected_snapshot_id, origin=origin
+    )
     response = _post_bridge(packet, base_url=base_url.strip(), token=token.strip(), urlopen=urlopen)
     return validate_research_response(response)
 
@@ -206,6 +234,28 @@ def render_research_message(response: Mapping[str, Any]) -> str:
         if code in ("stale_snapshot", "item_not_found", "snapshot_required"):
             return f"{msg}\nReply refresh (or run /decision_batch) and try again."
         return msg
+
+    job = response.get("research_job")
+    if isinstance(job, Mapping):
+        job_status = str(job.get("status") or "")
+        lines = [
+            "\U0001f50e Research queued",
+            f"Job: {job.get('job_id')}",
+            "Provider: Grok OAuth",
+            "Paid API: no",
+        ]
+        if job_status == "duplicate":
+            lines.append("(An identical job was already active — no duplicate run.)")
+        elif job_status == "complete":
+            lines = [
+                "\U0001f50e Research already completed for this item.",
+                f"Job: {job.get('job_id')}",
+                str(job.get("message") or "Reply refresh to see the result."),
+                "Paid API: no",
+            ]
+        else:
+            lines.append("The result will arrive here when the job completes.")
+        return "\n".join(lines)
 
     title = str(response.get("title") or "the selected item").strip()
     header = f"Research started for:\n{title}"
