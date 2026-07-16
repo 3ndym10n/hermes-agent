@@ -2468,16 +2468,14 @@ class GatewaySlashCommandsMixin:
             base_message = irb.strip_saved_to(
                 str(finalized.get("telegram_message") or "")
             )
-            footer = irb.build_review_footer(assessment, review_id)
+            final_state = str(finalized.get("final_state") or "")
+            footer = irb.build_review_footer(
+                assessment, review_id, final_state=final_state
+            )
             text = f"{base_message}\n{footer}" if base_message else footer
             recommended = irb.recommended_action(
-                disposition=(assessment.get("decision") or {}).get(
-                    "recommended_disposition"
-                ),
-                content_type=(assessment.get("understanding") or {}).get(
-                    "content_type"
-                ),
-                final_state=str(finalized.get("final_state") or ""),
+                assessment=assessment,
+                final_state=final_state,
             )
             layout = irb.button_layout(recommended)
             store = self._intelligent_button_store
