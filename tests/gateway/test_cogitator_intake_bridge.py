@@ -14,6 +14,7 @@ from gateway.slash_commands import GatewaySlashCommandsMixin
 
 # --- parser -----------------------------------------------------------------
 
+
 def test_parse_no_lens_intake():
     cmd = ib.parse_intake_message("intake\nSome messy pasted material.\nMore lines.")
     assert cmd is not None and cmd.error == ""
@@ -74,7 +75,8 @@ def test_parse_research_verb():
     assert cmd is not None and cmd.error == "" and cmd.research_number == 2
     assert cmd.packet_path == ""
     cmd = ib.parse_intake_message(
-        "intake research storage/intake/packets/2026-07-03_12-00-00-intake-packet.md 3")
+        "intake research storage/intake/packets/2026-07-03_12-00-00-intake-packet.md 3"
+    )
     assert cmd is not None and cmd.research_number == 3
     assert cmd.packet_path.endswith("-packet.md")
     cmd = ib.parse_intake_message("intake research two")
@@ -85,6 +87,7 @@ def test_parse_research_verb():
 
 # --- request/response validation ---------------------------------------------
 
+
 def _ok_response(**overrides):
     resp = {
         "status": "ok",
@@ -94,8 +97,12 @@ def _ok_response(**overrides):
         "packet_path": "storage/intake/packets/2026-07-03_12-00-00-intake-packet.md",
         "detected_domains": ["business_validation", "marketing_presale"],
         "counts": {
-            "high_value_ideas": 1, "claims_to_verify": 2, "opportunities": 1,
-            "playbook_candidates": 1, "retrieval_candidates": 1, "ignored": 3,
+            "high_value_ideas": 1,
+            "claims_to_verify": 2,
+            "opportunities": 1,
+            "playbook_candidates": 1,
+            "retrieval_candidates": 1,
+            "ignored": 3,
         },
         "top_outputs": ["opportunity: run a preorder test"],
         "next_action": "Run the smallest preorder test.",
@@ -135,7 +142,10 @@ def test_request_timeout_covers_synchronous_auto_research():
     # surfaced BRIDGE_UNREACHABLE on healthy requests. Guard the floor.
     fake = _FakeHTTP(_ok_response())
     ib.request_intake_review(
-        base_url="https://cog.example", token="tkn", raw_text="body", urlopen=fake,
+        base_url="https://cog.example",
+        token="tkn",
+        raw_text="body",
+        urlopen=fake,
     )
     assert fake.timeout == ib._REQUEST_TIMEOUT_SECONDS
     assert fake.timeout >= 120
@@ -144,8 +154,11 @@ def test_request_timeout_covers_synchronous_auto_research():
 def test_request_maps_lens_to_context_label():
     fake = _FakeHTTP(_ok_response())
     out = ib.request_intake_review(
-        base_url="https://cog.example", token="tkn",
-        raw_text="body", context_label="gpu-store", urlopen=fake,
+        base_url="https://cog.example",
+        token="tkn",
+        raw_text="body",
+        context_label="gpu-store",
+        urlopen=fake,
     )
     sent = json.loads(fake.request.data.decode("utf-8"))
     assert sent["requested_action"] == "intake_review_packet"
@@ -157,7 +170,10 @@ def test_request_maps_lens_to_context_label():
 def test_request_no_lens_omits_context_label():
     fake = _FakeHTTP(_ok_response())
     ib.request_intake_review(
-        base_url="https://cog.example", token="tkn", raw_text="body", urlopen=fake,
+        base_url="https://cog.example",
+        token="tkn",
+        raw_text="body",
+        urlopen=fake,
     )
     sent = json.loads(fake.request.data.decode("utf-8"))
     assert "context_label" not in sent["context"]
@@ -195,7 +211,8 @@ def test_render_summary():
 
 def test_render_rejected():
     out = ib.render_intake_message({
-        "status": "rejected", "requested_action": "intake_review_packet",
+        "status": "rejected",
+        "requested_action": "intake_review_packet",
         "message": "raw_text is required",
     })
     assert "Intake rejected" in out and "raw_text is required" in out
@@ -216,22 +233,28 @@ _AUTO_RESEARCH_OK = {
 def test_auto_research_response_accepted_only_with_result():
     # research_performed=True is legitimate ONLY alongside an auto_research block
     ok = ib.validate_intake_response(
-        _ok_response(research_performed=True, auto_research=dict(_AUTO_RESEARCH_OK)))
+        _ok_response(research_performed=True, auto_research=dict(_AUTO_RESEARCH_OK))
+    )
     assert ok["auto_research"]["verdict"] == "verified_enough"
     with pytest.raises(ib.IntakeBridgeError) as exc:
         ib.validate_intake_response(_ok_response(research_performed=True))
     assert exc.value.code == "BRIDGE_STATEFUL_RESPONSE"
     with pytest.raises(ib.IntakeBridgeError):
         ib.validate_intake_response(
-            _ok_response(research_performed=True, auto_research="yes"))
+            _ok_response(research_performed=True, auto_research="yes")
+        )
     with pytest.raises(ib.IntakeBridgeError):  # promotion stays forbidden regardless
         ib.validate_intake_response(
-            _ok_response(promotion_performed=True, auto_research=dict(_AUTO_RESEARCH_OK)))
+            _ok_response(
+                promotion_performed=True, auto_research=dict(_AUTO_RESEARCH_OK)
+            )
+        )
 
 
 def test_render_summary_shows_auto_research_verdict():
     out = ib.render_intake_message(
-        _ok_response(research_performed=True, auto_research=dict(_AUTO_RESEARCH_OK)))
+        _ok_response(research_performed=True, auto_research=dict(_AUTO_RESEARCH_OK))
+    )
     assert "✅ Auto-research (claim 1): verified_enough" in out
     assert "AI dynamic pricing lifts margins by 25%" in out
     assert "engine: adaptive" in out
@@ -239,43 +262,69 @@ def test_render_summary_shows_auto_research_verdict():
 
 
 def test_render_summary_shows_auto_research_failure_softly():
-    out = ib.render_intake_message(_ok_response(
-        auto_research={"status": "failed", "reason": "auto-research error: RuntimeError"}))
+    out = ib.render_intake_message(
+        _ok_response(
+            auto_research={
+                "status": "failed",
+                "reason": "auto-research error: RuntimeError",
+            }
+        )
+    )
     assert "Auto-research failed" in out
     assert "intake itself succeeded" in out
 
 
 def test_render_summary_shows_queued_auto_research_job():
     # async delivery (Cogitator #1008): job receipt, never the failure branch
-    out = ib.render_intake_message(_ok_response(auto_research={
-        "status": "queued", "claim_number": 1,
-        "claim": "AI dynamic pricing lifts margins by 25%.",
-        "job_id": "2026-07-10_12-00-00-intake-claim-1",
-        "message": "Research job started.",
-    }))
+    out = ib.render_intake_message(
+        _ok_response(
+            auto_research={
+                "status": "queued",
+                "claim_number": 1,
+                "claim": "AI dynamic pricing lifts margins by 25%.",
+                "job_id": "2026-07-10_12-00-00-intake-claim-1",
+                "message": "Research job started.",
+            }
+        )
+    )
     assert "job started — 2026-07-10_12-00-00-intake-claim-1" in out
     assert "result will arrive here" in out
     assert "Auto-research failed" not in out
 
 
 def test_render_summary_shows_duplicate_auto_research_job():
-    out = ib.render_intake_message(_ok_response(auto_research={
-        "status": "duplicate", "claim_number": 1, "claim": "c",
-        "job_id": "stem-claim-1", "message": "already running",
-    }))
+    out = ib.render_intake_message(
+        _ok_response(
+            auto_research={
+                "status": "duplicate",
+                "claim_number": 1,
+                "claim": "c",
+                "job_id": "stem-claim-1",
+                "message": "already running",
+            }
+        )
+    )
     assert "job already running — stem-claim-1" in out
     assert "Auto-research failed" not in out
 
 
 def test_queued_auto_research_response_requires_a_valid_job_shape():
     with pytest.raises(ib.IntakeBridgeError) as exc:
-        ib.validate_intake_response(_ok_response(auto_research={
-            "status": "queued", "claim_number": 0, "claim": "c", "job_id": "",
-        }))
+        ib.validate_intake_response(
+            _ok_response(
+                auto_research={
+                    "status": "queued",
+                    "claim_number": 0,
+                    "claim": "c",
+                    "job_id": "",
+                }
+            )
+        )
     assert exc.value.code == "BRIDGE_RESPONSE_INVALID"
 
 
 # --- mixin handler dispatch ----------------------------------------------------
+
 
 def _handler_with_config(enabled, base_url, local_dir=""):
     mixin = GatewaySlashCommandsMixin()
@@ -284,14 +333,17 @@ def _handler_with_config(enabled, base_url, local_dir=""):
 
 
 def test_save_local_copies_writes_only_present_markdown(tmp_path):
-    saved = ib.save_local_copies({
-        "packet_path": "storage/intake/packets/2026-07-07_10-00-00-intake-packet.md",
-        "packet_markdown": "# Intake Review Packet\ncontent",
-        "note_path": "storage/research_notes/x.md",
-        "note_markdown": "",  # empty → skipped
-        "bundle_path": "../../evil.md",  # traversal → basename only
-        "bundle_markdown": "sources",
-    }, str(tmp_path))
+    saved = ib.save_local_copies(
+        {
+            "packet_path": "storage/intake/packets/2026-07-07_10-00-00-intake-packet.md",
+            "packet_markdown": "# Intake Review Packet\ncontent",
+            "note_path": "storage/research_notes/x.md",
+            "note_markdown": "",  # empty → skipped
+            "bundle_path": "../../evil.md",  # traversal → basename only
+            "bundle_markdown": "sources",
+        },
+        str(tmp_path),
+    )
     assert sorted(p.replace(str(tmp_path), "") for p in saved) == [
         "/intake/extracted/evil.md",
         "/intake/packets/2026-07-07_10-00-00-intake-packet.md",
@@ -318,16 +370,24 @@ def _run(coro):
 
 
 def test_handler_missing_body_returns_help_without_network(monkeypatch):
-    monkeypatch.setattr(ib, "request_intake_review",
-                        lambda **k: (_ for _ in ()).throw(AssertionError("should not POST")))
+    monkeypatch.setattr(
+        ib,
+        "request_intake_review",
+        lambda **k: (_ for _ in ()).throw(AssertionError("should not POST")),
+    )
     mixin = _handler_with_config(True, "https://cog.example")
-    out = _run(mixin.handle_intake_message(_Ev(), ib.IntakeCommand(error="missing_body")))
+    out = _run(
+        mixin.handle_intake_message(_Ev(), ib.IntakeCommand(error="missing_body"))
+    )
     assert "intake" in out and "verbatim" in out
 
 
 def test_handler_disabled_gate_no_network(monkeypatch):
-    monkeypatch.setattr(ib, "request_intake_review",
-                        lambda **k: (_ for _ in ()).throw(AssertionError("should not POST")))
+    monkeypatch.setattr(
+        ib,
+        "request_intake_review",
+        lambda **k: (_ for _ in ()).throw(AssertionError("should not POST")),
+    )
     mixin = _handler_with_config(False, "https://cog.example")
     out = _run(mixin.handle_intake_message(_Ev(), ib.IntakeCommand(raw_text="body")))
     assert "disabled" in out.lower()
@@ -351,8 +411,11 @@ def test_handler_enabled_path_calls_bridge_and_stores_context(monkeypatch):
     monkeypatch.setenv(ib.TOKEN_ENV, "tkn")
     mixin = _handler_with_config(True, "https://cog.example")
     ev = _Ev()
-    out = _run(mixin.handle_intake_message(
-        ev, ib.IntakeCommand(raw_text="messy dump", lens="gpu-store")))
+    out = _run(
+        mixin.handle_intake_message(
+            ev, ib.IntakeCommand(raw_text="messy dump", lens="gpu-store")
+        )
+    )
     assert calls == {
         "base_url": "https://cog.example",
         "raw_text": "messy dump",
@@ -381,8 +444,14 @@ def _ok_link_response(**overrides):
         "packet_path": "storage/intake/packets/2026-07-03_13-00-00-intake-packet.md",
         "source_status_counts": {"fetched_full": 1, "needs_full_source": 1},
         "mined_sources": 1,
-        "counts": {"high_value_ideas": 0, "claims_to_verify": 1, "opportunities": 0,
-                   "playbook_candidates": 1, "retrieval_candidates": 0, "ignored": 2},
+        "counts": {
+            "high_value_ideas": 0,
+            "claims_to_verify": 1,
+            "opportunities": 0,
+            "playbook_candidates": 1,
+            "retrieval_candidates": 0,
+            "ignored": 2,
+        },
         "top_outputs": ["playbook candidate: Example Tool"],
         "next_action": "Verify the claim.",
         "detected_domains": ["agent_building"],
@@ -397,21 +466,25 @@ def _ok_link_response(**overrides):
 def test_link_request_maps_urls_and_validates():
     fake = _FakeHTTP(_ok_link_response())
     out = ib.request_source_access_intake(
-        base_url="https://cog.example", token="tkn",
+        base_url="https://cog.example",
+        token="tkn",
         urls=["https://github.com/example/tool", "https://x.com/a/status/1"],
         urlopen=fake,
     )
     sent = json.loads(fake.request.data.decode("utf-8"))
     assert sent["requested_action"] == "source_access_intake_packet"
     assert sent["context"]["urls"] == [
-        "https://github.com/example/tool", "https://x.com/a/status/1"]
+        "https://github.com/example/tool",
+        "https://x.com/a/status/1",
+    ]
     assert out["mined_sources"] == 1
 
 
 def test_link_request_rejects_too_many():
     with pytest.raises(ib.IntakeBridgeError) as exc:
         ib.request_source_access_intake(
-            base_url="https://cog.example", token="tkn",
+            base_url="https://cog.example",
+            token="tkn",
             urls=[f"https://e.example/{i}" for i in range(26)],
         )
     assert exc.value.code == "TOO_MANY_LINKS"
@@ -419,8 +492,10 @@ def test_link_request_rejects_too_many():
 
 def test_link_response_promotion_fails_closed():
     with pytest.raises(ib.IntakeBridgeError):
-        ib._validate_response(_ok_link_response(promotion_performed=True),
-                              expected_action="source_access_intake_packet")
+        ib._validate_response(
+            _ok_link_response(promotion_performed=True),
+            expected_action="source_access_intake_packet",
+        )
 
 
 def test_render_link_intake_message_shows_honest_statuses():
@@ -434,16 +509,25 @@ def test_render_link_intake_message_shows_honest_statuses():
 
 
 def test_render_link_intake_message_shows_auto_research_verdict():
-    out = ib.render_link_intake_message(_ok_link_response(
-        research_performed=True, auto_research=dict(_AUTO_RESEARCH_OK)))
+    out = ib.render_link_intake_message(
+        _ok_link_response(
+            research_performed=True, auto_research=dict(_AUTO_RESEARCH_OK)
+        )
+    )
     assert "Auto-research (claim 1): verified_enough" in out
     assert "engine: adaptive" in out
     assert "storage/research_notes/intake-research-x.md" in out
 
 
 def test_render_link_intake_message_shows_auto_research_failure_softly():
-    out = ib.render_link_intake_message(_ok_link_response(
-        auto_research={"status": "failed", "reason": "auto-research error: RuntimeError"}))
+    out = ib.render_link_intake_message(
+        _ok_link_response(
+            auto_research={
+                "status": "failed",
+                "reason": "auto-research error: RuntimeError",
+            }
+        )
+    )
     assert "Auto-research failed" in out
     assert "intake itself succeeded" in out
 
@@ -456,24 +540,43 @@ def test_handler_url_only_body_routes_to_source_access(monkeypatch):
         return _ok_link_response()
 
     monkeypatch.setattr(ib, "request_source_access_intake", fake_link_request)
-    monkeypatch.setattr(ib, "request_intake_review",
-                        lambda **k: (_ for _ in ()).throw(AssertionError("wrong route")))
+    monkeypatch.setattr(
+        ib,
+        "request_intake_review",
+        lambda **k: (_ for _ in ()).throw(AssertionError("wrong route")),
+    )
     monkeypatch.setenv(ib.TOKEN_ENV, "tkn")
     mixin = _handler_with_config(True, "https://cog.example")
-    out = _run(mixin.handle_intake_message(
-        _Ev(), ib.IntakeCommand(raw_text="https://github.com/example/tool\nhttps://x.com/a/status/1")))
-    assert calls["urls"] == ["https://github.com/example/tool", "https://x.com/a/status/1"]
+    out = _run(
+        mixin.handle_intake_message(
+            _Ev(),
+            ib.IntakeCommand(
+                raw_text="https://github.com/example/tool\nhttps://x.com/a/status/1"
+            ),
+        )
+    )
+    assert calls["urls"] == [
+        "https://github.com/example/tool",
+        "https://x.com/a/status/1",
+    ]
     assert "Link intake complete" in out
 
 
 def test_handler_mixed_body_routes_to_text_intake(monkeypatch):
-    monkeypatch.setattr(ib, "request_source_access_intake",
-                        lambda **k: (_ for _ in ()).throw(AssertionError("wrong route")))
+    monkeypatch.setattr(
+        ib,
+        "request_source_access_intake",
+        lambda **k: (_ for _ in ()).throw(AssertionError("wrong route")),
+    )
     monkeypatch.setattr(ib, "request_intake_review", lambda **k: _ok_response())
     monkeypatch.setenv(ib.TOKEN_ENV, "tkn")
     mixin = _handler_with_config(True, "https://cog.example")
-    out = _run(mixin.handle_intake_message(
-        _Ev(), ib.IntakeCommand(raw_text="notes about https://github.com/example/tool")))
+    out = _run(
+        mixin.handle_intake_message(
+            _Ev(),
+            ib.IntakeCommand(raw_text="notes about https://github.com/example/tool"),
+        )
+    )
     assert "Intake packet created" in out
 
 
@@ -499,12 +602,20 @@ def _ok_research_response(**overrides):
         "verdict": "needs_more_evidence",
         "evidence_quality": "none",
         "sources_used": [
-            {"url": "https://x.com/v/status/1", "stance": "failed",
-             "evidence_type": "none", "note": "status=needs_full_source"},
+            {
+                "url": "https://x.com/v/status/1",
+                "stance": "failed",
+                "evidence_type": "none",
+                "note": "status=needs_full_source",
+            },
         ],
         "missing_evidence": ["https://x.com/v/status/1 — full source unavailable"],
         "recommended_action": "Verify manually before relying on the claim.",
         "note_path": "storage/research_notes/ai-dynamic-pricing_x-claim-1.md",
+        "mode": ib.GROK_RESEARCH_MODE,
+        "provider_path": "xai-oauth:grok-4.5",
+        "provider_model": "grok-4.5",
+        "paid_api_used": False,
         "mutation_performed": True,
         "research_performed": True,
         "promotion_performed": False,
@@ -515,7 +626,9 @@ def _ok_research_response(**overrides):
 
 def test_research_response_promotion_fails_closed():
     with pytest.raises(ib.IntakeBridgeError):
-        ib.validate_intake_research_response(_ok_research_response(promotion_performed=True))
+        ib.validate_intake_research_response(
+            _ok_research_response(promotion_performed=True)
+        )
     # research_performed=True is expected and allowed here
     assert ib.validate_intake_research_response(_ok_research_response())["verdict"]
 
@@ -526,16 +639,25 @@ def test_render_research_message():
     assert "AI dynamic pricing" in out
     assert "Sources consulted:" in out
     assert "Research note: storage/research_notes/" in out
+    assert "Provider: xai-oauth:grok-4.5" in out
+    assert "Paid API: no" in out
 
 
 def test_render_research_message_job_receipt():
     # async job-start shape (Cogitator #1008) renders as a receipt, not verdict
     out = ib.render_intake_research_message({
-        "status": "ok", "requested_action": "research_intake_item",
-        "research_job": {"status": "queued", "job_id": "stem-claim-2",
-                         "claim": "the claim text", "claim_number": 2},
+        "status": "ok",
+        "requested_action": "research_intake_item",
+        "research_job": {
+            "status": "queued",
+            "job_id": "stem-claim-2",
+            "claim": "the claim text",
+            "claim_number": 2,
+            "mode": ib.GROK_RESEARCH_MODE,
+        },
         "message": "Research job started: stem-claim-2.",
-        "research_performed": False, "promotion_performed": False,
+        "research_performed": False,
+        "promotion_performed": False,
     })
     assert "Research job started: stem-claim-2" in out
     assert "the claim text" in out
@@ -546,19 +668,29 @@ def test_render_research_message_job_receipt():
 def test_research_job_response_requires_a_valid_job_shape():
     with pytest.raises(ib.IntakeBridgeError) as exc:
         ib.validate_intake_research_response({
-            "status": "ok", "requested_action": "research_intake_item",
-            "research_job": {"status": "queued", "job_id": "job-1",
-                             "claim": "", "claim_number": 1},
-            "research_performed": False, "promotion_performed": False,
+            "status": "ok",
+            "requested_action": "research_intake_item",
+            "research_job": {
+                "status": "queued",
+                "job_id": "job-1",
+                "claim": "",
+                "claim_number": 1,
+            },
+            "research_performed": False,
+            "promotion_performed": False,
         })
     assert exc.value.code == "BRIDGE_RESPONSE_INVALID"
 
 
 def test_render_intake_message_lists_research_targets():
-    out = ib.render_intake_message(_ok_response(research_targets=[
-        {"n": 1, "claim": "AI dynamic pricing lifts margins by 25%"},
-        {"n": 2, "claim": "Chatbots handle 70-90% of queries"},
-    ]))
+    out = ib.render_intake_message(
+        _ok_response(
+            research_targets=[
+                {"n": 1, "claim": "AI dynamic pricing lifts margins by 25%"},
+                {"n": 2, "claim": "Chatbots handle 70-90% of queries"},
+            ]
+        )
+    )
     assert "intake research <n>" in out
     assert "1. AI dynamic pricing" in out
 
@@ -596,37 +728,64 @@ def test_handler_research_explicit_path(monkeypatch):
     monkeypatch.setattr(ib, "request_intake_research", fake_research)
     monkeypatch.setenv(ib.TOKEN_ENV, "tkn")
     mixin = _handler_with_config(True, "https://cog.example")
-    out = _run(mixin.handle_intake_message(_Ev(), ib.IntakeCommand(
-        research_number=3, packet_path="storage/intake/packets/x-packet.md")))
-    assert calls == {"packet_path": "storage/intake/packets/x-packet.md", "item_number": 3}
+    out = _run(
+        mixin.handle_intake_message(
+            _Ev(),
+            ib.IntakeCommand(
+                research_number=3, packet_path="storage/intake/packets/x-packet.md"
+            ),
+        )
+    )
+    assert calls == {
+        "packet_path": "storage/intake/packets/x-packet.md",
+        "item_number": 3,
+    }
     assert "Research verdict" in out
 
 
 def test_text_link_and_manual_research_persist_origin_but_never_render_it():
     origin = {
-        "platform": "telegram", "chat_id": "-100987654321",
-        "chat_type": "group", "thread_id": "456", "message_id": "789",
+        "platform": "telegram",
+        "chat_id": "-100987654321",
+        "chat_type": "group",
+        "thread_id": "456",
+        "message_id": "789",
     }
     text_http = _FakeHTTP(_ok_response())
     text_result = ib.request_intake_review(
-        base_url="https://cog.example", token="tkn", raw_text="body",
-        origin=origin, urlopen=text_http)
+        base_url="https://cog.example",
+        token="tkn",
+        raw_text="body",
+        origin=origin,
+        urlopen=text_http,
+    )
     link_http = _FakeHTTP(_ok_link_response())
     link_result = ib.request_source_access_intake(
-        base_url="https://cog.example", token="tkn",
-        urls=["https://docs.example/gpu"], origin=origin, urlopen=link_http)
+        base_url="https://cog.example",
+        token="tkn",
+        urls=["https://docs.example/gpu"],
+        origin=origin,
+        urlopen=link_http,
+    )
     research_http = _FakeHTTP(_ok_research_response())
     research_result = ib.request_intake_research(
-        base_url="https://cog.example", token="tkn",
-        packet_path="storage/intake/packets/x-packet.md", item_number=1,
-        origin=origin, urlopen=research_http)
+        base_url="https://cog.example",
+        token="tkn",
+        packet_path="storage/intake/packets/x-packet.md",
+        item_number=1,
+        origin=origin,
+        urlopen=research_http,
+    )
 
     payloads = [
         json.loads(fake.request.data.decode("utf-8"))
         for fake in (text_http, link_http, research_http)
     ]
     assert [payload["context"]["origin"] for payload in payloads] == [
-        origin, origin, origin]
+        origin,
+        origin,
+        origin,
+    ]
     rendered = "\n".join((
         ib.render_intake_message(text_result),
         ib.render_link_intake_message(link_result),
@@ -637,5 +796,63 @@ def test_text_link_and_manual_research_persist_origin_but_never_render_it():
 
     with pytest.raises(ib.IntakeBridgeError):
         ib.request_intake_review(
-            base_url="https://cog.example", token="tkn", raw_text="body",
-            origin={**origin, "token": "must-not-pass"}, urlopen=text_http)
+            base_url="https://cog.example",
+            token="tkn",
+            raw_text="body",
+            origin={**origin, "token": "must-not-pass"},
+            urlopen=text_http,
+        )
+
+
+def test_intake_research_request_pins_grok_oauth_mode():
+    packet = ib.build_intake_research_request(
+        packet_path="storage/intake/packets/x-packet.md", item_number=2
+    )
+    assert packet["context"]["mode"] == ib.GROK_RESEARCH_MODE
+
+
+def test_sync_explicit_research_rejects_wrong_provider_receipt():
+    with pytest.raises(ib.IntakeBridgeError):
+        ib.validate_intake_research_response(
+            _ok_research_response(provider_path="hermes:openai-codex:oauth")
+        )
+
+
+def test_auto_and_explicit_async_receipts_validate_only_their_own_modes():
+    automatic = ib.validate_intake_response(
+        _ok_response(
+            auto_research={
+                "status": "queued",
+                "job_id": "stem-claim-1",
+                "claim": "automatic claim",
+                "claim_number": 1,
+                "mode": "default",
+            }
+        )
+    )
+    assert automatic["auto_research"]["mode"] == "default"
+
+    explicit = ib.validate_intake_research_response({
+        "status": "ok",
+        "requested_action": "research_intake_item",
+        "research_job": {
+            "status": "queued",
+            "job_id": "stem-claim-1-grok-oauth-pilot",
+            "claim": "explicit claim",
+            "claim_number": 1,
+            "mode": ib.GROK_RESEARCH_MODE,
+        },
+        "research_performed": False,
+        "promotion_performed": False,
+    })
+    assert explicit["research_job"]["mode"] == ib.GROK_RESEARCH_MODE
+
+    with pytest.raises(ib.IntakeBridgeError):
+        ib.validate_intake_response(
+            _ok_response(
+                auto_research={
+                    **automatic["auto_research"],
+                    "mode": ib.GROK_RESEARCH_MODE,
+                }
+            )
+        )

@@ -14,6 +14,7 @@ import pytest
 
 from gateway.cogitator_research_bridge import (
     BRIDGE_PATH,
+    GROK_RESEARCH_MODE,
     ResearchBridgeError,
     build_research_request,
     render_research_message,
@@ -42,6 +43,14 @@ def _ok_response(**overrides):
         "sources_checked": ["https://docs.example/x"],
         "mutation_performed": False,
         "promotion_performed": False,
+        "mode": GROK_RESEARCH_MODE,
+        "research_diagnostics": {
+            "grok_oauth": {
+                "provider_path": "xai-oauth:grok-4.5",
+                "model": "grok-4.5",
+                "paid_api_used": False,
+            }
+        },
     }
     base.update(overrides)
     return base
@@ -114,20 +123,32 @@ class TestBuildRequest:
         assert p["source_agent"] == "hermes"
         assert p["requested_action"] == "research_decision_item"
         assert p["approval_status"] == "draft_only"
-        assert p["context"] == {"item_id": "2", "confirm": True, "expected_snapshot_id": "abc"}
+        assert p["context"] == {
+            "item_id": "2",
+            "confirm": True,
+            "mode": GROK_RESEARCH_MODE,
+            "expected_snapshot_id": "abc",
+        }
 
     def test_snapshot_omitted_when_empty(self):
         p = build_research_request(item_id="2")
         assert "expected_snapshot_id" not in p["context"]
         assert p["context"]["confirm"] is True
+        assert p["context"]["mode"] == GROK_RESEARCH_MODE
+
+    def test_default_or_unknown_mode_is_not_accepted_as_pilot_result(self):
+        with pytest.raises(ResearchBridgeError):
+            validate_research_response(_ok_response(mode="default"))
 
 
 class TestTransport:
     def test_posts_with_bearer_and_returns_validated(self):
         captured = {}
         out = request_research_decision_item(
-            base_url="https://cog.example", token="secret-token",
-            item_id="2", expected_snapshot_id="abc",
+            base_url="https://cog.example",
+            token="secret-token",
+            item_id="2",
+            expected_snapshot_id="abc",
             urlopen=_fake_urlopen(_ok_response(), captured),
         )
         assert out["status"] == "ok"
@@ -146,12 +167,57 @@ class TestTransport:
 
 class TestValidate:
     def test_rejected_and_disabled_are_valid_outcomes(self):
-        assert validate_research_response(
-            {"status": "rejected", "requested_action": "research_decision_item",
-             "reason_code": "stale_snapshot", "promotion_performed": False})["status"] == "rejected"
-        assert validate_research_response(
-            {"status": "disabled", "requested_action": "research_decision_item",
-             "promotion_performed": False})["status"] == "disabled"
+        assert (
+            validate_research_response({
+                "status": "rejected",
+                "requested_action": "research_decision_item",
+                "reason_code": "stale_snapshot",
+                "promotion_performed": False,
+            })["status"]
+            == "rejected"
+        )
+        assert (
+            validate_research_response({
+                "status": "disabled",
+                "requested_action": "research_decision_item",
+                "promotion_performed": False,
+            })["status"]
+            == "disabled"
+        )
+
+    @pytest.mark.parametrize(
+        "diagnostics",
+        [
+            {},
+            {"grok_oauth": {}},
+            {
+                "grok_oauth": {
+                    "provider_path": "xai-oauth:grok-other",
+                    "model": "grok-4.5",
+                    "paid_api_used": False,
+                }
+            },
+            {
+                "grok_oauth": {
+                    "provider_path": "xai-oauth:grok-4.5",
+                    "model": "grok-other",
+                    "paid_api_used": False,
+                }
+            },
+            {
+                "grok_oauth": {
+                    "provider_path": "xai-oauth:grok-4.5",
+                    "model": "grok-4.5",
+                    "paid_api_used": True,
+                }
+            },
+        ],
+    )
+    def test_missing_or_wrong_provider_receipt_rejected(self, diagnostics):
+        with pytest.raises(ResearchBridgeError):
+            validate_research_response(
+                _ok_response(research_diagnostics=diagnostics)
+            )
 
     def test_promotion_reported_rejected(self):
         with pytest.raises(ResearchBridgeError):
@@ -176,21 +242,51 @@ class TestRender:
         assert "secret-token" not in msg  # never leak a token
 
     def test_failed_research_stays_needs_research(self):
-        msg = render_research_message(_ok_response(
-            research_status="failed", failure_reason="provider unavailable"))
+        failure = _ok_response(
+            research_status="failed", failure_reason="provider unavailable"
+        )
+        validated = validate_research_response(failure)
+        assert validated["mode"] == GROK_RESEARCH_MODE
+        msg = render_research_message(validated)
         assert "could not complete" in msg
         assert "Needs research" in msg
 
     def test_stale_rejection_points_to_refresh(self):
         msg = render_research_message({
-            "status": "rejected", "requested_action": "research_decision_item",
+            "status": "rejected",
+            "requested_action": "research_decision_item",
             "reason_code": "stale_snapshot",
             "message": "The decision inbox changed since this number was shown.",
-            "promotion_performed": False})
+            "promotion_performed": False,
+        })
         assert "refresh" in msg.lower()
 
     def test_disabled_message(self):
         msg = render_research_message({
-            "status": "disabled", "requested_action": "research_decision_item",
-            "promotion_performed": False})
+            "status": "disabled",
+            "requested_action": "research_decision_item",
+            "promotion_performed": False,
+        })
         assert "disabled" in msg.lower()
+
+
+def test_explicit_research_renders_discovered_grok_provider_model():
+    msg = render_research_message(validate_research_response(_ok_response()))
+    assert "provider: xai-oauth:grok-4.5" in msg
+    assert "paid API: no" in msg
+
+
+def test_unverified_provider_receipt_is_not_rendered_as_free_grok():
+    msg = render_research_message(
+        _ok_response(
+            research_diagnostics={
+                "grok_oauth": {
+                    "provider_path": "other:unknown",
+                    "model": "unknown",
+                    "paid_api_used": True,
+                }
+            }
+        )
+    )
+    assert "provider: other:unknown" not in msg
+    assert "paid API: no" not in msg

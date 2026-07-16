@@ -14,6 +14,9 @@ Surface
   auth against ``HERMES_RESEARCH_BRIDGE_TOKEN`` (constant-time compare,
   fail-closed 503 when the token is unset) → ``XAIWebSearchProvider.search``
   → ``{"status": "ok", "provider": "xai", "urls": [...]}``.
+* ``POST /research_discover`` — explicit ``grok_oauth_pilot`` jobs only.
+  Grok OAuth returns bounded candidate leads; Cogitator re-fetches and verifies
+  every retained source before it can become evidence.
 * ``POST /research_gather`` ``{"query": str, "max_sources": int}`` — same
   auth; runs GPT Researcher *discovery only* in its isolated pinned venv
   (``~/.hermes/gptr-venv``, see ``gateway/gptr-requirements.lock``) as a
@@ -59,6 +62,10 @@ MAX_RESULTS_CAP = 10
 DEFAULT_MAX_RESULTS = 5
 MAX_BODY_BYTES = 16 * 1024
 MAX_NOTE_BODY_BYTES = 256 * 1024
+GROK_RESEARCH_MODE = "grok_oauth_pilot"
+GROK_MAX_CLAIM_CHARS = 4000
+GROK_MAX_QUESTIONS = 8
+GROK_MAX_QUESTION_CHARS = 600
 
 # /research_gather bounds — one GPT Researcher discovery subprocess per request.
 GATHER_MAX_SOURCES_CAP = 20
@@ -73,6 +80,7 @@ _ERR_NOT_CONFIGURED = "bridge token not configured"
 _ERR_UNAUTHORIZED = "unauthorized"
 _ERR_BAD_REQUEST = "invalid request"
 _ERR_PROVIDER = "search provider failed"
+_ERR_DISCOVER = "discovery provider failed"
 _ERR_STORE = "local note store failed"
 _ERR_GATHER = "gather provider failed"
 
@@ -102,6 +110,12 @@ def _default_search(query: str, limit: int) -> dict:
     from plugins.web.xai.provider import XAIWebSearchProvider
 
     return XAIWebSearchProvider().search(query, limit=limit)
+
+
+def _default_discover(**kwargs) -> dict:
+    from gateway.grok_research_worker import discover
+
+    return discover(**kwargs)
 
 
 def _extract_urls(result: Any, cap: int) -> list[str]:
@@ -166,6 +180,142 @@ def handle_research_search(
         return 502, {"status": "error", "error": _ERR_PROVIDER}
     return 200, {"status": "ok", "provider": "xai",
                  "urls": _extract_urls(result, max_results)}
+
+
+def handle_research_discover(
+    body: bytes,
+    auth_header: str,
+    *,
+    token: str,
+    discover: Callable[..., dict] = _default_discover,
+) -> tuple[int, dict]:
+    """Explicit OAuth-only Grok discovery; Cogitator verifies every lead."""
+    if not token:
+        return 503, {"status": "error", "error": _ERR_NOT_CONFIGURED}
+    presented = auth_header.removeprefix("Bearer ").strip() if auth_header.startswith("Bearer ") else ""
+    if not presented or not hmac.compare_digest(presented, token):
+        return 401, {"status": "error", "error": _ERR_UNAUTHORIZED}
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except Exception:
+        return 400, {"status": "error", "error": _ERR_BAD_REQUEST}
+    if not isinstance(payload, dict) or payload.get("mode") != GROK_RESEARCH_MODE:
+        return 400, {"status": "error", "error": _ERR_BAD_REQUEST}
+    claim = str(payload.get("claim") or "").strip()
+    questions = payload.get("questions") or []
+    if (
+        not claim
+        or len(claim) > GROK_MAX_CLAIM_CHARS
+        or not isinstance(questions, list)
+        or len(questions) > GROK_MAX_QUESTIONS
+        or any(
+            not isinstance(question, str)
+            or not question.strip()
+            or len(question) > GROK_MAX_QUESTION_CHARS
+            for question in questions
+        )
+    ):
+        return 400, {"status": "error", "error": _ERR_BAD_REQUEST}
+    try:
+        max_sources = int(payload.get("max_sources", MAX_RESULTS_CAP))
+    except (TypeError, ValueError):
+        max_sources = MAX_RESULTS_CAP
+    max_sources = max(1, min(max_sources, MAX_RESULTS_CAP))
+    try:
+        result = discover(claim=claim, questions=questions, max_sources=max_sources)
+    except Exception:
+        logger.warning("research_discover provider raised", exc_info=True)
+        return 502, {"status": "error", "error": _ERR_DISCOVER}
+    if not (isinstance(result, dict) and result.get("status") == "ok"):
+        allowed_failures = {
+            "invalid_or_sensitive_brief", "oauth_unavailable", "oauth_required",
+            "provider_unavailable", "provider_http_error", "provider_error_response",
+            "invalid_provider_response", "invalid_structured_response",
+        }
+        failure = str(result.get("failure_category") or "") if isinstance(result, dict) else ""
+        response = {"status": "error", "error": _ERR_DISCOVER}
+        if failure in allowed_failures:
+            response["failure_category"] = failure
+        return 502, response
+    if (
+        result.get("provider") != "xai-oauth"
+        or result.get("model") != "grok-4.5"
+        or result.get("provider_path") != "xai-oauth:grok-4.5"
+        or result.get("paid_api_used") is not False
+        or not isinstance(result.get("sources"), list)
+        or not isinstance(result.get("contradictions"), list)
+    ):
+        return 502, {"status": "error", "error": _ERR_DISCOVER}
+
+    sources = []
+    for row in result["sources"]:
+        if not isinstance(row, dict):
+            return 502, {"status": "error", "error": _ERR_DISCOVER}
+        url = str(row.get("url") or "").strip()
+        stance = str(row.get("stance") or "")
+        if not url.startswith(("http://", "https://")) or stance not in {
+            "supporting", "contradicting", "background", "unknown",
+        }:
+            return 502, {"status": "error", "error": _ERR_DISCOVER}
+        sources.append({
+            "url": url,
+            "title": str(row.get("title") or "")[:200],
+            "claim": str(row.get("claim") or "")[:600],
+            "quotation": str(row.get("quotation") or "")[:400],
+            "stance": stance,
+        })
+        if len(sources) >= max_sources:
+            break
+    contradictions = []
+    for row in result["contradictions"]:
+        if not isinstance(row, dict) or not isinstance(
+            row.get("source_urls") or [], list
+        ):
+            return 502, {"status": "error", "error": _ERR_DISCOVER}
+        contradictions.append({
+            "claim": str(row.get("claim") or "")[:600],
+            "source_urls": [
+                str(url)[:2000]
+                for url in (row.get("source_urls") or [])[:MAX_RESULTS_CAP]
+                if str(url).startswith(("http://", "https://"))
+            ],
+        })
+        if len(contradictions) >= MAX_RESULTS_CAP:
+            break
+
+    def number(value: object) -> int:
+        try:
+            return max(0, int(value or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    usage = result.get("usage") if isinstance(result.get("usage"), dict) else {}
+    quota = result.get("quota") if isinstance(result.get("quota"), dict) else {}
+    passes = number(result.get("passes"))
+    if passes not in {1, 2}:
+        return 502, {"status": "error", "error": _ERR_DISCOVER}
+    return 200, {
+        "status": "ok",
+        "mode": GROK_RESEARCH_MODE,
+        "provider": "xai-oauth",
+        "model": "grok-4.5",
+        "provider_path": "xai-oauth:grok-4.5",
+        "sources": sources,
+        "contradictions": contradictions,
+        "discovered_count": len(sources),
+        "passes": passes,
+        "latency_ms": number(result.get("latency_ms")),
+        "usage": {
+            key: number(usage.get(key))
+            for key in ("input_tokens", "output_tokens", "total_tokens")
+        },
+        "quota": {
+            str(key)[:100]: str(value)[:80]
+            for key, value in quota.items()
+            if str(key).startswith("x-ratelimit-")
+        },
+        "paid_api_used": False,
+    }
 
 
 def _default_gather(query: str, max_sources: int) -> dict:
@@ -333,7 +483,9 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_json(404, {"status": "error", "error": "not found"})
 
     def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
-        if self.path not in {"/research_search", "/research_note", "/research_gather"}:
+        if self.path not in {
+            "/research_search", "/research_discover", "/research_note", "/research_gather",
+        }:
             self._send_json(404, {"status": "error", "error": "not found"})
             return
         try:
@@ -355,6 +507,13 @@ class _Handler(BaseHTTPRequestHandler):
                 self.headers.get("Authorization") or "",
                 token=self.server.bridge_token,  # type: ignore[attr-defined]
                 search=self.server.bridge_search,  # type: ignore[attr-defined]
+            )
+        elif self.path == "/research_discover":
+            status, response = handle_research_discover(
+                body,
+                self.headers.get("Authorization") or "",
+                token=self.server.bridge_token,  # type: ignore[attr-defined]
+                discover=self.server.bridge_discover,  # type: ignore[attr-defined]
             )
         elif self.path == "/research_gather":
             status, response = handle_research_gather(
@@ -385,12 +544,14 @@ def make_server(
     search: Callable[[str, int], dict] = _default_search,
     local_dir: str | None = None,
     gather: Callable[[str, int], dict] = _default_gather,
+    discover: Callable[..., dict] = _default_discover,
 ) -> ThreadingHTTPServer:
     """Build the bound server (port 0 for an ephemeral test port)."""
     server = ThreadingHTTPServer((BIND_HOST, port), _Handler)
     server.bridge_token = _load_token() if token is None else token  # type: ignore[attr-defined]
     server.bridge_search = search  # type: ignore[attr-defined]
     server.bridge_gather = gather  # type: ignore[attr-defined]
+    server.bridge_discover = discover  # type: ignore[attr-defined]
     server.bridge_local_dir = (  # type: ignore[attr-defined]
         _load_local_dir() if local_dir is None else local_dir
     )

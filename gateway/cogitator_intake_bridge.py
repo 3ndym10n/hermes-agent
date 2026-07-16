@@ -28,6 +28,7 @@ BRIDGE_PATH = "/api/cogitator_bridge"
 TOKEN_ENV = "COGITATOR_BRIDGE_TOKEN"
 
 _REQUESTED_ACTION = "intake_review_packet"
+GROK_RESEARCH_MODE = "grok_oauth_pilot"
 _USER_INTENT = "Turn one raw Telegram dump into a reviewable intake packet (Virgil intake)."
 # Link intake runs auto-research synchronously on the Cogitator side; a live
 # fetched_full+auto-research round trip measured 90.7s, so 45s surfaced
@@ -1535,7 +1536,7 @@ def _validate_response(response: Any, *, expected_action: str) -> dict[str, Any]
         raise IntakeBridgeError("BRIDGE_STATEFUL_RESPONSE", f"research_performed={researched!r}")
     auto = response.get("auto_research")
     if isinstance(auto, Mapping) and auto.get("status") in {"queued", "duplicate"}:
-        _validate_research_job(auto)
+        _validate_research_job(auto, expected_mode="default")
     stateful = [f for f in _FORBIDDEN_RESPONSE_FIELDS if f in response]
     if stateful:
         raise IntakeBridgeError("BRIDGE_STATEFUL_RESPONSE", f"fields={stateful}")
@@ -1576,7 +1577,11 @@ def build_intake_research_request(
     *, packet_path: str, item_number: int, dry_run: bool = False, origin=None
 ) -> dict[str, Any]:
     """Build the draft-only ``research_intake_item`` bridge packet."""
-    context: dict[str, Any] = {"packet_path": str(packet_path), "item_number": int(item_number)}
+    context: dict[str, Any] = {
+        "packet_path": str(packet_path),
+        "item_number": int(item_number),
+        "mode": GROK_RESEARCH_MODE,
+    }
     if origin is not None:
         context["origin"] = _delivery_origin(origin)
     if dry_run:
@@ -1612,13 +1617,26 @@ def validate_intake_research_response(response: Any) -> dict[str, Any]:
             raise IntakeBridgeError(
                 "BRIDGE_STATEFUL_RESPONSE",
                 f"research_performed={response.get('research_performed')!r}")
+    elif status == "ok":
+        if response.get("mode") != GROK_RESEARCH_MODE:
+            raise IntakeBridgeError("BRIDGE_RESPONSE_INVALID", "research mode mismatch")
+        if response.get("research_performed") is True and (
+            response.get("provider_path") != "xai-oauth:grok-4.5"
+            or response.get("provider_model") != "grok-4.5"
+            or response.get("paid_api_used") is not False
+        ):
+            raise IntakeBridgeError(
+                "BRIDGE_RESPONSE_INVALID", "research provider receipt mismatch"
+            )
     stateful = [f for f in _FORBIDDEN_RESPONSE_FIELDS if f in response]
     if stateful:
         raise IntakeBridgeError("BRIDGE_STATEFUL_RESPONSE", f"fields={stateful}")
     return dict(response)
 
 
-def _validate_research_job(job: Any) -> None:
+def _validate_research_job(
+    job: Any, *, expected_mode: str = GROK_RESEARCH_MODE
+) -> None:
     """Validate the bounded async receipt before Hermes tells Cal it started."""
     if not isinstance(job, Mapping):
         raise IntakeBridgeError("BRIDGE_RESPONSE_INVALID", "research job is not an object")
@@ -1627,6 +1645,8 @@ def _validate_research_job(job: Any) -> None:
     job_id = job.get("job_id")
     claim = job.get("claim")
     claim_number = job.get("claim_number")
+    if job.get("mode") != expected_mode:
+        raise IntakeBridgeError("BRIDGE_RESPONSE_INVALID", "research mode mismatch")
     if not isinstance(job_id, str) or not job_id.strip() or len(job_id) > 200:
         raise IntakeBridgeError("BRIDGE_RESPONSE_INVALID", "invalid research job id")
     if not isinstance(claim, str) or not claim.strip():
@@ -1793,6 +1813,9 @@ def render_intake_research_message(response: Mapping[str, Any]) -> str:
         lines += ["", f"Recommended action: {response['recommended_action']}"]
     if response.get("note_path"):
         lines.append(f"Research note: {response['note_path']}")
+    if response.get("provider_path"):
+        lines.append(f"Provider: {response['provider_path']}")
+        lines.append("Paid API: no")
     return "\n".join(lines)
 
 
