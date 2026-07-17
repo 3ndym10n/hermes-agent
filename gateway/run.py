@@ -12935,9 +12935,43 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             and source.chat_type == "dm" and source.thread_id else None)
                 metadata = _mark_notify_metadata(
                     _thread_metadata_for_source(source, reply_to))
-                result = await adapter._send_with_retry(
-                    chat_id=source.chat_id, content=delivery["message"],
-                    reply_to=reply_to, metadata=metadata, max_retries=2)
+                repo_match = re.fullmatch(
+                    r"(inote-\d+)-repository-review-v1",
+                    str(delivery.get("job_id") or ""),
+                )
+                review_sender = getattr(adapter, "send_intelligent_review_message", None)
+                if repo_match and callable(review_sender):
+                    from gateway import intelligent_review_buttons as irb
+
+                    review_id = repo_match.group(1)
+                    recommended = irb.repository_recommended_action(delivery["message"])
+                    layout = irb.repository_button_layout(recommended)
+                    tokens = self._intelligent_button_store.mint_group(
+                        review_id=review_id,
+                        item_id="",
+                        chat_id=str(source.chat_id),
+                        user_id=str(source.user_id or source.chat_id),
+                        actions=irb.REPOSITORY_ACTIONS,
+                        artifact_kind="repository_review_v1",
+                        artifact_text=delivery["message"],
+                    )
+                    button_rows = [
+                        [(label, tokens[action]) for label, action in row]
+                        for row in layout
+                    ]
+                    result = await review_sender(
+                        chat_id=source.chat_id,
+                        text=delivery["message"],
+                        button_rows=button_rows,
+                        metadata=metadata,
+                    )
+                    if getattr(result, "message_id", None):
+                        self._intelligent_button_store.bind_message(
+                            list(tokens.values()), str(result.message_id))
+                else:
+                    result = await adapter._send_with_retry(
+                        chat_id=source.chat_id, content=delivery["message"],
+                        reply_to=reply_to, metadata=metadata, max_retries=2)
                 if getattr(result, "success", False):
                     await asyncio.to_thread(
                         ack_research_delivery, base_url=base_url, token=token,

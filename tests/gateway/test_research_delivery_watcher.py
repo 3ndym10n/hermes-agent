@@ -5,6 +5,7 @@ import pytest
 
 import gateway.cogitator_intake_bridge as intake_bridge
 import gateway.run as run_module
+from gateway import intelligent_review_buttons as irb
 from gateway.config import Platform
 from gateway.platforms.base import SendResult
 from gateway.run import GatewayRunner
@@ -86,7 +87,94 @@ def test_research_delivery_failure_categories_are_sanitized():
             "failed", "unauthorized")
     assert GatewayRunner._research_delivery_failure(
         SendResult(success=False, error="Timed out")) == (
-            "failed", "timeout_unknown")
+        "failed", "timeout_unknown")
+
+
+@pytest.mark.asyncio
+async def test_repository_result_uses_existing_human_review_controls(monkeypatch):
+    delivery = {
+        "job_id": "inote-403-repository-review-v1",
+        "message": "review\nRECOMMENDED DECISION: CREATE BOUNDED TEST",
+        "origin": {
+            "platform": "telegram", "chat_id": "123", "chat_type": "dm",
+            "user_id": "123",
+        },
+        "lease_token": "c" * 32, "version": 1, "attempts": 1,
+    }
+    claims = [delivery]
+    acks = []
+    runner = object.__new__(GatewayRunner)
+    runner._running = True
+    runner._intake_config = lambda: (True, "https://cogitator.example", "")
+    runner._isb_button_store = irb.ReviewButtonStore()
+
+    def claim(**_kwargs):
+        return claims.pop(0) if claims else None
+
+    def ack(**kwargs):
+        acks.append(kwargs)
+        if kwargs["outcome"] == "send_started":
+            return {"delivery": {"version": 2}}
+        runner._running = False
+        return {"delivery": {"version": 3}}
+
+    adapter = type("Adapter", (), {})()
+    adapter.send_intelligent_review_message = AsyncMock(
+        return_value=SendResult(success=True, message_id="telegram-2"))
+    adapter._send_with_retry = AsyncMock()
+    runner.adapters = {Platform.TELEGRAM: adapter}
+
+    async def direct_thread(function, *args, **kwargs):
+        return function(*args, **kwargs)
+
+    async def no_sleep(_seconds):
+        return None
+
+    monkeypatch.setenv(intake_bridge.TOKEN_ENV, "configured")
+    monkeypatch.setattr(intake_bridge, "claim_research_delivery", claim)
+    monkeypatch.setattr(intake_bridge, "ack_research_delivery", ack)
+    monkeypatch.setattr(run_module.asyncio, "sleep", no_sleep)
+    monkeypatch.setattr(run_module.asyncio, "to_thread", direct_thread)
+
+    await runner._research_delivery_watcher(interval=0)
+
+    adapter._send_with_retry.assert_not_awaited()
+    sent = adapter.send_intelligent_review_message.await_args.kwargs
+    labels = [label for row in sent["button_rows"] for label, _token in row]
+    assert labels == [
+        "✅ Keep Saved Review", "⭐ 📄 Review Details", "✖ Dismiss Buttons",
+    ]
+    assert [item["outcome"] for item in acks] == ["send_started", "delivered"]
+    assert len(runner._intelligent_button_store) == 3
+
+    entries = list(runner._intelligent_button_store._entries.values())
+    assert {entry.artifact_kind for entry in entries} == {"repository_review_v1"}
+    assert {entry.artifact_text for entry in entries} == {delivery["message"]}
+
+
+def test_repository_button_actions_cannot_mutate_original_candidate():
+    for action in irb.REPOSITORY_ACTIONS:
+        assert irb.review_action_for(action) == ""
+
+
+@pytest.mark.asyncio
+async def test_repository_button_handler_is_artifact_local():
+    runner = object.__new__(GatewayRunner)
+    entry = type("Entry", (), {
+        "action": irb.REPOSITORY_DETAILS,
+        "artifact_text": "saved repository review",
+    })()
+    result = await runner.handle_intelligent_button_action(entry)
+    assert result == {
+        "text": "saved repository review",
+        "remove_buttons": False,
+        "status": "details",
+    }
+
+    entry.action = irb.REPOSITORY_SAVE
+    result = await runner.handle_intelligent_button_action(entry)
+    assert result["status"] == "saved"
+    assert "not approved or promoted" in result["text"]
 
 
 
