@@ -2528,6 +2528,26 @@ class GatewaySlashCommandsMixin:
         )
 
         action = entry.action
+        if action == irb.REPOSITORY_SAVE:
+            return {
+                "text": "✅ Repository review remains saved. The original "
+                "intake candidate was not approved or promoted.",
+                "remove_buttons": True,
+                "status": "saved",
+            }
+        if action == irb.REPOSITORY_DETAILS:
+            return {
+                "text": entry.artifact_text,
+                "remove_buttons": False,
+                "status": "details",
+            }
+        if action == irb.REPOSITORY_DISMISS:
+            return {
+                "text": "Repository review remains saved; its buttons were "
+                "dismissed. The original intake candidate was not changed.",
+                "remove_buttons": True,
+                "status": "dismissed",
+            }
         if action == irb.PENDING:
             return {
                 "text": "⏸ Left pending — no change was made. The buttons stay "

@@ -6,8 +6,8 @@ opaque token (``isb:<token>``) — never a review ID, action word, path, secret,
 or source text. Every field the click handler must validate (review ID, action,
 chat, user, message ID, expiry, nonce, consumed) lives here, server-side.
 
-The five buttons map onto already-merged deterministic Cogitator review actions;
-no model, provider, or paid research is ever invoked from a click.
+Ordinary buttons map onto deterministic Cogitator review actions. Repository
+result buttons are artifact-local and never act on the original intake item.
 """
 
 from __future__ import annotations
@@ -24,11 +24,21 @@ PENDING = "pending"
 RESEARCH = "research"
 ARCHIVE = "archive"
 DETAILS = "details"
+REPOSITORY_SAVE = "repository_save"
+REPOSITORY_DETAILS = "repository_details"
+REPOSITORY_DISMISS = "repository_dismiss"
 
 BUTTON_ACTIONS = (APPROVE, PENDING, RESEARCH, ARCHIVE, DETAILS)
+REPOSITORY_ACTIONS = (
+    REPOSITORY_SAVE, REPOSITORY_DETAILS, REPOSITORY_DISMISS,
+)
 # Actions whose token is single-use and, for terminal ones, removes the buttons.
-_TERMINAL_ACTIONS = frozenset({APPROVE, ARCHIVE})
-_CONSUMING_ACTIONS = frozenset({APPROVE, ARCHIVE, RESEARCH})
+_TERMINAL_ACTIONS = frozenset({
+    APPROVE, ARCHIVE, REPOSITORY_SAVE, REPOSITORY_DISMISS,
+})
+_CONSUMING_ACTIONS = frozenset({
+    APPROVE, ARCHIVE, RESEARCH, REPOSITORY_SAVE, REPOSITORY_DISMISS,
+})
 
 _REVIEW_ACTION = {
     APPROVE: "approve",
@@ -61,6 +71,8 @@ class ReviewButtonEntry:
     nonce: str
     expiry: float
     message_id: str = ""
+    artifact_kind: str = ""
+    artifact_text: str = ""
     consumed: bool = False
 
 
@@ -99,6 +111,8 @@ class ReviewButtonStore:
         user_id: str,
         actions,
         ttl_seconds: Optional[int] = None,
+        artifact_kind: str = "",
+        artifact_text: str = "",
     ) -> dict:
         """Mint one opaque token per action; return {action: token}."""
         now = self.clock()
@@ -119,6 +133,8 @@ class ReviewButtonStore:
                 user_id=str(user_id),
                 nonce=secrets.token_hex(8),
                 expiry=expiry,
+                artifact_kind=str(artifact_kind),
+                artifact_text=str(artifact_text),
             )
             self._groups[group_id].add(token)
             tokens[action] = token
@@ -304,4 +320,32 @@ def button_layout(recommended: str) -> list:
             (label(ARCHIVE), ARCHIVE),
             (label(DETAILS), DETAILS),
         ],
+    ]
+
+
+def repository_recommended_action(message: str) -> str:
+    verdict = str(message or "").rsplit("RECOMMENDED DECISION:", 1)[-1].strip().upper()
+    if verdict.startswith(("IGNORE", "DUPLICATE")):
+        return REPOSITORY_DISMISS
+    if verdict.startswith(("CREATE BOUNDED TEST", "DEFER UNTIL TRIGGER")):
+        return REPOSITORY_DETAILS
+    return REPOSITORY_SAVE
+
+
+def repository_button_layout(recommended: str) -> list:
+    """Artifact-local controls; none mutate the original intake candidate."""
+    labels = {
+        REPOSITORY_SAVE: "✅ Keep Saved Review",
+        REPOSITORY_DETAILS: "📄 Review Details",
+        REPOSITORY_DISMISS: "✖ Dismiss Buttons",
+    }
+
+    def label(action: str) -> str:
+        value = labels[action]
+        return f"⭐ {value}" if action == recommended else value
+
+    return [
+        [(label(REPOSITORY_SAVE), REPOSITORY_SAVE),
+         (label(REPOSITORY_DETAILS), REPOSITORY_DETAILS)],
+        [(label(REPOSITORY_DISMISS), REPOSITORY_DISMISS)],
     ]
