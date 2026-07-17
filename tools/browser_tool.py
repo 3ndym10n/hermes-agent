@@ -683,6 +683,39 @@ def _get_browser_engine() -> str:
     return _cached_browser_engine
 
 
+_cached_sandbox_bypass: Optional[str] = None
+
+
+def _get_sandbox_bypass_mode() -> str:
+    """Return ``auto`` (default) or ``never`` for --no-sandbox injection.
+
+    ``browser.sandbox_bypass: never`` in config.yaml disables the automatic
+    ``--no-sandbox`` injection for local Chromium launches.  Use it on hosts
+    where the Chromium sandbox actually works — e.g. Ubuntu 24.04 with an
+    AppArmor profile granting ``userns`` to the Playwright browser binaries —
+    so the sandbox stays enabled.  ``auto`` keeps the historical behaviour
+    (inject when running as root or when AppArmor userns restrictions are
+    detected).  Cached for the process lifetime like ``_get_browser_engine``.
+    """
+    global _cached_sandbox_bypass
+    if _cached_sandbox_bypass is not None:
+        return _cached_sandbox_bypass
+    mode = "auto"
+    try:
+        from hermes_cli.config import read_raw_config
+        val = str(read_raw_config().get("browser", {}).get("sandbox_bypass", "") or "").strip().lower()
+        if val in ("auto", "never"):
+            mode = val
+        elif val:
+            logger.warning(
+                "Unknown browser.sandbox_bypass %r (valid: auto, never); using 'auto'", val
+            )
+    except Exception as e:
+        logger.debug("Could not read browser.sandbox_bypass from config: %s", e)
+    _cached_sandbox_bypass = mode
+    return mode
+
+
 def _should_inject_engine(engine: str) -> bool:
     """Return True when the engine flag should be added to agent-browser commands.
 
@@ -2038,6 +2071,7 @@ def _run_browser_command(
         if (
             "AGENT_BROWSER_ARGS" not in browser_env
             and "AGENT_BROWSER_CHROME_FLAGS" not in browser_env
+            and _get_sandbox_bypass_mode() != "never"
         ):
             _needs_sandbox_bypass = False
             if hasattr(os, "geteuid") and os.geteuid() == 0:
