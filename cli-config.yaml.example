@@ -334,6 +334,14 @@ browser:
   # after this period of no activity between agent loops (default: 120 = 2 minutes)
   inactivity_timeout: 120
 
+  # Controls automatic --no-sandbox injection for local Chromium launches.
+  #   auto  (default): inject when running as root or when AppArmor userns
+  #                    restrictions are detected (Ubuntu 23.10+).
+  #   never:           never inject; use when the Chromium sandbox works on
+  #                    this host (e.g. an AppArmor profile grants userns to
+  #                    the Playwright browser binaries).
+  # sandbox_bypass: auto
+
 # =============================================================================
 # Tool Loop Guardrails
 # =============================================================================
