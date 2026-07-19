@@ -17,7 +17,12 @@ from pathlib import Path
 import pytest
 
 import purchase_executor as pe
+import purchase_merchants
 
+# Tests exercise the real Porkbun adapter (production mode) against a fake
+# browser: the claimed domain is porkbun.com so adapter_for() resolves, and the
+# fake fill_fields records the ordered (selector, value) pairs without a DOM.
+MERCHANT = "porkbun.com"
 
 CLAIM = {
     "status": "ok",
@@ -26,7 +31,7 @@ CLAIM = {
     "proposal_id": "pp_1",
     "state": "claimed",
     "audience": "virgil_website_pilot",
-    "canonical_merchant_domain": "registrar.example",
+    "canonical_merchant_domain": MERCHANT,
     "approved_item": "example.com domain registration",
     "quantity": 1,
     "maximum_total": "22.00",
@@ -48,14 +53,14 @@ CHECKOUT_TEXT = (
     "Total: 22.00 AUD\nPay now"
 )
 CHECKOUT_PAGE = {
-    "url": "https://registrar.example/checkout",
+    "url": f"https://{MERCHANT}/checkout",
     "text": CHECKOUT_TEXT,
     "merchant": "Fake Registrar",
     "has_form": True,
-    "form_action": "https://registrar.example/pay",
+    "form_action": f"https://{MERCHANT}/pay",
 }
 CONFIRM_PAGE = {
-    "url": "https://registrar.example/pay",
+    "url": f"https://{MERCHANT}/pay",
     "text": "Order confirmed. Reference FAKE-123. Thank you for your purchase.",
     "merchant": "Fake Registrar",
     "has_form": False,
@@ -73,28 +78,32 @@ class FakeBrowser:
         self.calls = []
         self.cleaned = []
         self.index = 0
+        self._filled = False
 
     def navigate(self, url, task_id):
         self.calls.append(("navigate", url))
         return {"success": self.nav_success}
 
+    def fill_fields(self, task_id, ordered_fields):
+        if self.on_eval:
+            self.on_eval(self)
+        self.calls.append(("fill", ordered_fields))
+        if self.fill_ok:
+            self._filled = True
+        return {"success": True, "result": {"ok": self.fill_ok}}
+
     def eval_js(self, expression, task_id):
         if self.on_eval:
             self.on_eval(self)
-        if "Object.entries" in expression:
-            self.calls.append(("fill", expression))
-            return {"success": True, "result": {"ok": self.fill_ok}}
-        if "HTMLFormElement.prototype.submit" in expression:
+        if ".click()" in expression:  # submit_expression clicks the submit control
             self.calls.append(("submit", ""))
             if self.submit_ok:
                 self.index = 1
             return {"success": True, "result": {"ok": self.submit_ok}}
         self.calls.append(("probe", ""))
         page = dict(self.pages[self.index])
-        page["filled"] = any(kind == "fill" for kind, _ in self.calls)
+        page["filled"] = self._filled
         return {"success": True, "result": page}
-
-    eval_sensitive = eval_js
 
     def cleanup(self, task_id):
         self.cleaned.append(task_id)
@@ -145,7 +154,7 @@ def run(browser, bridge, tmp_path, *, fake_e2e=False, token="tok\n"):
         browser=browser,
         audit=pe.audit_factory(state),
         state_dir=state,
-        checkout_url_for=lambda claim: "https://registrar.example/checkout",
+        checkout_url_for=lambda claim: "https://porkbun.com/checkout",
         fake_e2e=fake_e2e,
         stdin=io.StringIO(token),
         post_submit_wait=0.2,
@@ -165,7 +174,17 @@ def test_happy_path_completes_once(tmp_path, creds):
     completion = bridge.calls[1][1]
     assert completion["merchant_display_name"] == "Fake Registrar"
     assert completion["final_amount"] == "22.00"
-    assert completion["merchant_domain"] == "registrar.example"
+    assert completion["merchant_domain"] == MERCHANT
+    # Genuine input: fill went through fill_fields with Porkbun's selectors,
+    # in card-field order, carrying the credential values (never el.value).
+    fill_calls = [payload for kind, payload in browser.calls if kind == "fill"]
+    assert len(fill_calls) == 1
+    assert fill_calls[0] == [
+        (purchase_merchants.PORKBUN.selectors[f],
+         {"card_number": "4242424242424242", "card_expiry": "12/29",
+          "card_cvv": "123", "card_name": "Fake Holder"}[f])
+        for f in purchase_merchants.CARD_FIELDS
+    ]
     receipt_path = tmp_path / "state" / completion["receipt"]["restricted_artifact_path"]
     assert receipt_path.is_file()
     assert stat.S_IMODE(receipt_path.stat().st_mode) == 0o600
@@ -298,9 +317,12 @@ def test_no_snapshots_no_model_no_credstore():
     for forbidden in ("browser_snapshot", "browser_vision", "browser_get_images",
                       "/etc/credstore"):
         assert forbidden not in source
-    # Page probes never read input values; .value appears only as fill assignment.
+    # No JavaScript value assignment anywhere: production fill uses genuine
+    # browser input (agent-browser fill via batch), never `element.value = ...`.
     assert ".value" not in pe.PAGE_PROBE_JS
-    assert ".value" not in pe.submit_expression("registrar.example", False)
+    assert ".value" not in pe.submit_expression("button[type='submit']", "porkbun.com", False)
+    assert ".value =" not in source and ".value=" not in source
+    assert "el.value" not in source
 
 
 def test_audit_log_is_redacted_and_private(tmp_path, creds):
@@ -361,20 +383,19 @@ def test_form_action_and_post_fill_origin_are_rejected(tmp_path, creds):
     assert run(browser, bridge, tmp_path) == pe.EXIT_DEFINITIVE_FAILURE
     assert "fill" not in [kind for kind, _ in browser.calls]
 
+    # A redirect to a different registrable domain that happens during fill is
+    # caught by the post-fill origin re-check before any submit.
     redirected = dict(CHECKOUT_PAGE, url="https://evil.example/pay")
-    browser, bridge = FakeBrowser(pages=[CHECKOUT_PAGE, redirected]), FakeBridge()
-    browser.index = 0
+    browser = FakeBrowser(pages=[CHECKOUT_PAGE, CONFIRM_PAGE])
+    bridge = FakeBridge()
+    original_fill = browser.fill_fields
 
-    original_eval = browser.eval_js
-
-    def redirect_after_fill(expression, task_id):
-        result = original_eval(expression, task_id)
-        if "Object.entries" in expression:
-            browser.pages[0] = redirected
+    def redirect_after_fill(task_id, ordered_fields):
+        result = original_fill(task_id, ordered_fields)
+        browser.pages[0] = redirected  # page navigates away post-fill
         return result
 
-    browser.eval_js = redirect_after_fill
-    browser.eval_sensitive = redirect_after_fill
+    browser.fill_fields = redirect_after_fill
     assert run(browser, bridge, tmp_path) == pe.EXIT_DEFINITIVE_FAILURE
     assert "submit" not in [kind for kind, _ in browser.calls]
 
@@ -423,7 +444,7 @@ def test_sigterm_during_claim_audit_cleans_up_and_reports(tmp_path, creds):
         browser=browser,
         audit=audit,
         state_dir=state,
-        checkout_url_for=lambda claim: "https://registrar.example/checkout",
+        checkout_url_for=lambda claim: "https://porkbun.com/checkout",
         fake_e2e=False,
         stdin=io.StringIO("tok\n"),
     )
@@ -637,3 +658,90 @@ def test_private_write_repairs_existing_mode(tmp_path):
     path.chmod(0o644)
     pe._write_private(path, "new")
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+# --- merchant adapter boundary (Phase 1) -------------------------------------
+
+
+def test_unknown_merchant_fails_closed_before_credentials(tmp_path, creds, monkeypatch):
+    def explode():
+        raise AssertionError("credentials must not be read for an unsupported merchant")
+
+    monkeypatch.setattr(pe, "load_payment_fields", explode)
+    browser = FakeBrowser()
+    bridge = FakeBridge(claim=dict(CLAIM, canonical_merchant_domain="namecheap.com"))
+    assert run(browser, bridge, tmp_path) == pe.EXIT_DEFINITIVE_FAILURE
+    assert terminal_calls(bridge)[0][1]["failure_category"] == "merchant_not_supported"
+    # Rejected before navigation, fill, or submit.
+    assert browser.calls == []
+    assert browser.cleaned == ["purchase_pt_test"]
+
+
+def test_adapter_allowlist_is_porkbun_only():
+    assert purchase_merchants.adapter_for("porkbun.com", fake_e2e=False) is purchase_merchants.PORKBUN
+    for bad in ("namecheap.com", "porkbun.com.evil.test", "evil-porkbun.com", ""):
+        assert purchase_merchants.adapter_for(bad, fake_e2e=False) is None
+    assert purchase_merchants.adapter_for("anything", fake_e2e=True) is purchase_merchants.MOCK
+
+
+def test_porkbun_selectors_resolve_against_sanitized_fixture():
+    from html.parser import HTMLParser
+
+    fixture = Path(pe.__file__).parent / "tests" / "fixtures" / "porkbun_checkout_v0.html"
+    html = fixture.read_text()
+
+    class Collector(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.input_names = set()
+            self.has_submit = False
+
+        def handle_starttag(self, tag, attrs):
+            a = dict(attrs)
+            if tag == "input" and a.get("name"):
+                self.input_names.add(a["name"])
+            if tag == "button" and a.get("type") == "submit":
+                self.has_submit = True
+
+    collector = Collector()
+    collector.feed(html)
+    for field in purchase_merchants.CARD_FIELDS:
+        selector = purchase_merchants.PORKBUN.selectors[field]
+        name = selector.split("'")[1]  # input[name='X'] -> X
+        assert name in collector.input_names, f"{field} selector {selector} not in fixture"
+    assert collector.has_submit
+
+
+def test_sanitized_fixture_has_no_secrets():
+    import re as _re
+    fixture = Path(pe.__file__).parent / "tests" / "fixtures" / "porkbun_checkout_v0.html"
+    # Strip HTML comments first: the provenance note legitimately says the words
+    # "cookies/tokens/session" while attesting their absence from the DOM.
+    text = _re.sub(r"<!--.*?-->", "", fixture.read_text(), flags=_re.DOTALL).lower()
+    for forbidden in ("cookie", "token", "password", "session", "authorization", "api_key"):
+        assert forbidden not in text
+    # No value-bearing inputs and no card-shaped digit runs.
+    assert 'value="' not in text
+    assert not _re.search(r"\b(?:\d[ -]?){13,19}\b", text)
+
+
+def test_genuine_input_uses_batch_over_stdin_not_argv_or_value_assignment():
+    source = Path(pe.__file__).read_text()
+    # Fill is delivered as a batch whose commands (incl. the value) ride stdin.
+    assert '"batch"' in source
+    assert "_stdin_text=json.dumps(commands)" in source
+    # And never element.value assignment.
+    assert "el.value" not in source and ".value =" not in source
+
+
+def test_staging_harness_is_fail_loud():
+    import importlib.util
+
+    path = Path(pe.__file__).parent / "scripts" / "purchase_executor_fake_e2e.py"
+    spec = importlib.util.spec_from_file_location("pe_fake_e2e", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    # Any failed invariant aborts non-zero; there is no silent skip / false green.
+    module.require(True, "ok path")
+    with pytest.raises(SystemExit):
+        module.require(False, "expected ledger mutation did not occur")

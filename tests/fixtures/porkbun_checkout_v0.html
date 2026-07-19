@@ -1,0 +1,28 @@
+<!doctype html>
+<!--
+  Sanitized Porkbun checkout fixture for Restricted Purchase Executor tests.
+  SYNTHETIC DOM ONLY. Provenance: hand-authored 2026-07-19 to mirror the
+  field-selector contract in purchase_merchants.PORKBUN. Contains NO cookies,
+  tokens, session data, account data, or payment data. Selectors here are the
+  provisional V0 contract and must be re-verified against the real logged-in
+  checkout at the Cal-supervised live gate.
+-->
+<html lang="en">
+<head><meta charset="utf-8"><title>Porkbun — Checkout</title></head>
+<body>
+  <h1 id="merchant" data-merchant="Porkbun">Porkbun</h1>
+  <section aria-label="order-summary">
+    <p>example.com domain registration</p>
+    <p>Quantity: 1</p>
+    <p>Total: 11.06 USD</p>
+    <p>One-time purchase — no subscription, no auto-renew.</p>
+  </section>
+  <form action="https://porkbun.com/checkout" method="post" aria-label="payment">
+    <label>Card number <input name="cc-number" autocomplete="cc-number"></label>
+    <label>Expiry <input name="cc-exp" autocomplete="cc-exp"></label>
+    <label>CVC <input name="cc-cvc" autocomplete="cc-csc"></label>
+    <label>Name on card <input name="cc-name" autocomplete="cc-name"></label>
+    <button type="submit">Pay now</button>
+  </form>
+</body>
+</html>
