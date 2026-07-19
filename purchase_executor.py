@@ -49,6 +49,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import urlsplit, urlunsplit
 
+import purchase_merchants
+
 BRIDGE_PATH = "/api/cogitator_bridge"
 BRIDGE_TOKEN_ENV = "COGITATOR_BRIDGE_TOKEN"
 CREDENTIAL_FIELDS = ("card_number", "card_expiry", "card_cvv", "card_name")
@@ -143,34 +145,24 @@ def _origin_guard_js(canonical_domain: str, fake_e2e: bool) -> str:
     )
 
 
-def submit_expression(canonical_domain: str, fake_e2e: bool) -> str:
+# Set after a successful genuine-input fill; the post-fill re-probe reads this
+# marker (never the field values) to confirm fill happened and guard double-fill.
+FILLED_MARK_JS = "(document.documentElement.dataset.hermesPurchaseFilled = '1')"
+
+
+def submit_expression(submit_selector: str, canonical_domain: str, fake_e2e: bool) -> str:
+    # Origin-guarded click of the merchant's real submit control. No payment
+    # value is touched here; clicking the button (not form.submit()) triggers
+    # the checkout's real submit handler.
     return (
         "(() => {"
         + _origin_guard_js(canonical_domain, fake_e2e)
         + " const f = document.querySelector('form');"
-        " if (!f || !allowed(location.href) || !allowed(f.action))"
+        f" const b = document.querySelector({json.dumps(submit_selector)});"
+        " if (!f || !b || !allowed(location.href) || !allowed(f.action))"
         " return JSON.stringify({ok: false});"
-        " HTMLFormElement.prototype.submit.call(f);"
+        " b.click();"
         " return JSON.stringify({ok: true}); })()"
-    )
-
-
-def fill_expression(values: dict, canonical_domain: str, fake_e2e: bool) -> str:
-    # ponytail: fixed input[name=...] selector map (mock-merchant contract);
-    # per-merchant selector maps are the upgrade path before any real checkout.
-    return (
-        "(() => { try { %s const f = document.querySelector('form');"
-        " if (!f || !allowed(location.href) || !allowed(f.action))"
-        " return JSON.stringify({ok: false, reason: 'wrong_origin'});"
-        " const v = %s;"
-        " for (const [name, val] of Object.entries(v)) {"
-        " const el = document.querySelector(`input[name='${name}']`);"
-        " if (!el) return JSON.stringify({ok: false, missing: name});"
-        " el.value = val; }"
-        " document.documentElement.dataset.hermesPurchaseFilled = '1';"
-        " return JSON.stringify({ok: true});"
-        " } catch { return JSON.stringify({ok: false}); } })()"
-        % (_origin_guard_js(canonical_domain, fake_e2e), json.dumps(values))
     )
 
 
@@ -233,12 +225,30 @@ def real_browser() -> SimpleNamespace:
         finally:
             os.environ.update(secret_env)
 
+    def fill_fields(task_id, ordered_fields):
+        # Genuine browser text input (Playwright fill via the agent-browser
+        # CLI = Input.insertText under the hood), NOT element.value assignment.
+        # The values ride in the batch JSON delivered over stdin, never argv,
+        # never env; the CLI's stdout echoes selectors + success flags only,
+        # never the inserted values.
+        commands = [["find", "first", sel, "fill", val] for sel, val in ordered_fields]
+        commands.append(["eval", FILLED_MARK_JS])
+        result = _call(
+            bt._run_browser_command,
+            task_id,
+            "batch",
+            ["--json"],
+            _stdin_text=json.dumps(commands),
+        )
+        ok = isinstance(result, list) and bool(result) and all(
+            isinstance(item, dict) and item.get("success") for item in result
+        )
+        return {"success": True, "result": {"ok": ok}}
+
     return SimpleNamespace(
         navigate=lambda url, task_id: _call(bt.browser_navigate, url, task_id=task_id),
         eval_js=lambda exp, task_id: _call(bt._browser_eval, exp, task_id=task_id, stdin=True),
-        eval_sensitive=lambda exp, task_id: _call(
-            bt._browser_eval, exp, task_id=task_id, stdin=True, suppress_output=True
-        ),
+        fill_fields=fill_fields,
         cleanup=lambda task_id: _call(bt.cleanup_browser, task_id),
     )
 
@@ -686,6 +696,15 @@ def run_once(
             if termination["pending"]:
                 raise _Terminated()
             audit("claimed", ticket_id=ticket_id, proposal_id=claim["proposal_id"], task_id=task_id)
+            # Fail closed on an unsupported merchant BEFORE opening credential
+            # files, filling, or submitting. Production allows Porkbun only;
+            # fake/staging uses the loopback mock adapter.
+            adapter = purchase_merchants.adapter_for(
+                claim["canonical_merchant_domain"], fake_e2e=fake_e2e
+            )
+            if adapter is None:
+                audit("merchant_rejected", domain=strip_query(claim["canonical_merchant_domain"]))
+                raise _Stop("definitive", "merchant_not_supported")
             checkout_url = checkout_url_for(claim)
             if not origin_allowed(
                 checkout_url, claim["canonical_merchant_domain"], fake_e2e=fake_e2e
@@ -720,19 +739,22 @@ def run_once(
             audit("revalidated", total=claim["maximum_total"], currency=claim["currency"])
 
             payment_values = load_payment_fields()
-            fill = browser.eval_sensitive(
-                fill_expression(
-                    payment_values, claim["canonical_merchant_domain"], fake_e2e
-                ),
-                task_id,
-            )
-            if not fill.get("success") or not fill.get("result", {}).get("ok"):
-                category = (
-                    "wrong_origin"
-                    if fill.get("result", {}).get("reason") == "wrong_origin"
-                    else "fill_failed"
-                )
-                raise _Stop("definitive", category)
+            # Verify origin immediately before the atomic fill batch. ponytail:
+            # origin is checked once right before the single batch that fills
+            # all fields (the batch can't navigate mid-run); true per-field
+            # re-verification would need CDP-level interleaving — upgrade path.
+            prefill = browser.eval_js(PAGE_PROBE_JS, task_id)
+            if not prefill.get("success") or not page_origin_allowed(
+                prefill["result"], claim["canonical_merchant_domain"], fake_e2e=fake_e2e
+            ):
+                raise _Stop("definitive", "wrong_origin")
+            ordered_fields = [
+                (adapter.selectors[field], payment_values[field])
+                for field in purchase_merchants.CARD_FIELDS
+            ]
+            fill = browser.fill_fields(task_id, ordered_fields)
+            if not fill.get("result", {}).get("ok"):
+                raise _Stop("definitive", "fill_failed")
             audit("filled")
 
             # Post-fill, pre-submit revalidation: text-only re-read, never a
@@ -755,7 +777,10 @@ def run_once(
 
             submitted = True
             submit = browser.eval_js(
-                submit_expression(claim["canonical_merchant_domain"], fake_e2e), task_id
+                submit_expression(
+                    adapter.submit_selector(), claim["canonical_merchant_domain"], fake_e2e
+                ),
+                task_id,
             )
             if not submit.get("success") or not submit.get("result", {}).get("ok"):
                 raise _Stop("uncertain", "submit_outcome_unknown")
