@@ -13,8 +13,16 @@ bad(){ echo "FAIL: $1"; fail=1; }
 [ -f "$STAGING" ] && ok "staging unit installed" || bad "staging unit missing"
 id -u hermes-purchase-executor >/dev/null 2>&1 && ok "executor user exists" || bad "executor user missing"
 
-if systemctl is-enabled hermes-purchase-executor >/dev/null 2>&1; then bad "production unit is ENABLED (must be disabled)"; else ok "production unit disabled"; fi
-if systemctl is-active hermes-purchase-executor >/dev/null 2>&1; then bad "production unit is ACTIVE (must be inactive)"; else ok "production unit inactive"; fi
+# Classify by STATE VALUE, not exit code: our units are "static" (no [Install]
+# section), which is inherently inert — a static unit cannot be enabled to run
+# at boot and only runs when explicitly started. Only genuinely bootable states
+# are a problem here.
+enabled_state="$(systemctl is-enabled hermes-purchase-executor 2>/dev/null || true)"
+case "$enabled_state" in
+  enabled|enabled-runtime|alias|linked|linked-runtime) bad "production unit is bootable ($enabled_state); must be static/disabled";;
+  *) ok "production unit not bootable (${enabled_state:-unknown})";;
+esac
+if systemctl is-active --quiet hermes-purchase-executor; then bad "production unit is ACTIVE (must be inactive)"; else ok "production unit inactive"; fi
 
 if [ -f "$ETC/config.yaml" ]; then
   grep -q "sandbox_bypass: never" "$ETC/config.yaml" && ok "config sandbox_bypass=never" || bad "config sandbox_bypass not never"
