@@ -1,0 +1,10 @@
+# Dedicated NON-SECRET config for the Restricted Purchase Executor unit.
+# Installed to /etc/hermes-purchase-executor/config.yaml. Contains no secrets.
+# The executor's preflight fails closed unless these hold.
+browser:
+  engine: chrome
+  cloud_provider: local
+  sandbox_bypass: never
+  record_sessions: false
+  allow_private_urls: false
+  cdp_url: ''

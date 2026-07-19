@@ -109,6 +109,13 @@ def require(condition: bool, invariant: str) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--cogitator-repo", required=True)
+    parser.add_argument(
+        "--credentials-dir", default="",
+        help="use externally-provided synthetic credentials (e.g. the staging "
+        "unit's systemd $CREDENTIALS_DIRECTORY) instead of generating them; "
+        "proves the systemd credential name-binding. The card fields must be the "
+        "public 4242 test values the mock merchant expects.",
+    )
     args = parser.parse_args()
 
     sys.path.insert(0, str(Path(args.cogitator_repo).resolve()))
@@ -196,17 +203,30 @@ def main() -> int:
     checkout_url = f"http://127.0.0.1:{merchant_server.server_address[1]}/checkout"
 
     # --- synthetic credentials ----------------------------------------------
-    creds = tmp / "creds"
-    creds.mkdir()
-    for field, value in (
-        ("card_number", "4242424242424242"),
-        ("card_expiry", "12/29"),
-        ("card_cvv", "123"),
-        ("card_name", "Fake Holder"),
-    ):
-        path = creds / field
-        path.write_text(value)
-        path.chmod(0o600)
+    # Either use externally-staged synthetic creds (systemd name-binding) or
+    # generate them locally. Card values MUST be the public 4242 test set.
+    expected = {
+        "card_number": "4242424242424242",
+        "card_expiry": "12/29",
+        "card_cvv": "123",
+        "card_name": "Fake Holder",
+    }
+    if args.credentials_dir:
+        creds = Path(args.credentials_dir)
+        for field in expected:
+            require((creds / field).is_file(), f"staged synthetic credential missing: {field}")
+        # The name-binding is what we assert; the card_name value may differ.
+        require(
+            (creds / "card_number").read_text().strip() == expected["card_number"],
+            "staged card_number must be the public 4242 test PAN (no real card in staging)",
+        )
+    else:
+        creds = tmp / "creds"
+        creds.mkdir()
+        for field, value in expected.items():
+            path = creds / field
+            path.write_text(value)
+            path.chmod(0o600)
 
     procs_before = browser_proc_count()
 
