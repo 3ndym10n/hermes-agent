@@ -9,6 +9,9 @@ import json
 import os
 import signal
 import stat
+import subprocess
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 import pytest
@@ -49,6 +52,7 @@ CHECKOUT_PAGE = {
     "text": CHECKOUT_TEXT,
     "merchant": "Fake Registrar",
     "has_form": True,
+    "form_action": "https://registrar.example/pay",
 }
 CONFIRM_PAGE = {
     "url": "https://registrar.example/pay",
@@ -80,23 +84,30 @@ class FakeBrowser:
         if "Object.entries" in expression:
             self.calls.append(("fill", expression))
             return {"success": True, "result": {"ok": self.fill_ok}}
-        if "f.submit()" in expression:
+        if "HTMLFormElement.prototype.submit" in expression:
             self.calls.append(("submit", ""))
             if self.submit_ok:
                 self.index = 1
             return {"success": True, "result": {"ok": self.submit_ok}}
         self.calls.append(("probe", ""))
-        return {"success": True, "result": dict(self.pages[self.index])}
+        page = dict(self.pages[self.index])
+        page["filled"] = any(kind == "fill" for kind, _ in self.calls)
+        return {"success": True, "result": page}
+
+    eval_sensitive = eval_js
 
     def cleanup(self, task_id):
         self.cleaned.append(task_id)
 
 
 class FakeBridge:
-    def __init__(self, claim=None, claim_status=200, terminal_transport_fails=False):
+    def __init__(self, claim=None, claim_status=200, terminal_transport_fails=False,
+                 terminal_status=200, terminal_body=None):
         self.claim = dict(CLAIM if claim is None else claim)
         self.claim_status = claim_status
         self.terminal_transport_fails = terminal_transport_fails
+        self.terminal_status = terminal_status
+        self.terminal_body = terminal_body
         self.calls = []
 
     def __call__(self, action, context, user_intent):
@@ -105,7 +116,10 @@ class FakeBridge:
             return self.claim_status, self.claim
         if self.terminal_transport_fails:
             raise pe.BridgeTransportError("bridge unreachable")
-        return 200, {"status": "ok", "requested_action": action}
+        return self.terminal_status, self.terminal_body if self.terminal_body is not None else {
+            "status": "ok" if self.terminal_status == 200 else "error",
+            "requested_action": action,
+        }
 
 
 @pytest.fixture()
@@ -195,11 +209,26 @@ def test_check_terms_currency_item_quantity_recurrence():
         CHECKOUT_TEXT.replace("example.com domain registration", "other thing"), CLAIM)
     assert "quantity_mismatch" in pe.check_terms(
         CHECKOUT_TEXT.replace("Quantity: 1", "Quantity: 3"), CLAIM)
+    assert "quantity_missing" in pe.check_terms(
+        CHECKOUT_TEXT.replace("Quantity: 1\n", ""), CLAIM)
     assert "unexpected_recurrence" in pe.check_terms(
         CHECKOUT_TEXT + "\nauto-renews yearly", CLAIM)
     monthly = {**CLAIM, "recurrence_authorization": dict(
-        CLAIM["recurrence_authorization"], commitment_type="subscription")}
+        CLAIM["recurrence_authorization"], commitment_type="subscription",
+        billing_interval="monthly", auto_renew=True)}
     assert "recurrence_not_shown" in pe.check_terms(CHECKOUT_TEXT, monthly)
+    recurring_text = (
+        CHECKOUT_TEXT + "\nsubscription\nBilling interval: monthly\nRenewal amount: 22.00\n"
+        "Renewal date: 2027-07-18\nCancellation deadline: 2027-07-01\n"
+        "Contract duration: one purchase\nCancellation terms: "
+        "No recurring commitment authorized.\nAuto-renew"
+    )
+    assert "billing_interval_mismatch" in pe.check_terms(
+        recurring_text.replace("monthly", "yearly"), monthly
+    )
+    assert "renewal_amount_mismatch" in pe.check_terms(
+        recurring_text.replace("Renewal amount: 22.00", "Renewal amount: 50.00"), monthly
+    )
 
 
 def test_captcha_before_submit_is_definitive_failure(tmp_path, creds):
@@ -220,6 +249,13 @@ def test_3ds_after_submit_is_uncertain(tmp_path, creds):
     assert [kind for kind, _ in browser.calls].count("submit") == 1
 
 
+def test_submit_error_is_uncertain_and_not_retried(tmp_path, creds):
+    browser, bridge = FakeBrowser(submit_ok=False), FakeBridge()
+    assert run(browser, bridge, tmp_path) == pe.EXIT_UNCERTAIN
+    assert [kind for kind, _ in browser.calls].count("submit") == 1
+    assert terminal_calls(bridge)[0][1]["failure_category"] == "submit_outcome_unknown"
+
+
 def test_callback_transport_failure_spools_once(tmp_path, creds):
     browser = FakeBrowser()
     bridge = FakeBridge(terminal_transport_fails=True)
@@ -232,6 +268,20 @@ def test_callback_transport_failure_spools_once(tmp_path, creds):
     assert record["requested_action"] == "record_completed_purchase"
     assert "4242424242424242" not in spool.read_text()
     assert browser.cleaned == ["purchase_pt_test"]
+
+
+def test_callback_http_failure_spools_once(tmp_path, creds):
+    browser, bridge = FakeBrowser(), FakeBridge(terminal_status=500)
+    assert run(browser, bridge, tmp_path) == pe.EXIT_SPOOLED
+    assert len(terminal_calls(bridge)) == 1
+    assert (tmp_path / "state" / "spool" / "pt_test.json").is_file()
+
+
+def test_malformed_callback_body_spools_once(tmp_path, creds):
+    browser, bridge = FakeBrowser(), FakeBridge(terminal_body=[])
+    assert run(browser, bridge, tmp_path) == pe.EXIT_SPOOLED
+    assert len(terminal_calls(bridge)) == 1
+    assert (tmp_path / "state" / "spool" / "pt_test.json").is_file()
 
 
 def test_redaction_filter():
@@ -250,11 +300,14 @@ def test_no_snapshots_no_model_no_credstore():
         assert forbidden not in source
     # Page probes never read input values; .value appears only as fill assignment.
     assert ".value" not in pe.PAGE_PROBE_JS
-    assert ".value" not in pe.SUBMIT_JS
+    assert ".value" not in pe.submit_expression("registrar.example", False)
 
 
 def test_audit_log_is_redacted_and_private(tmp_path, creds):
-    confirm = dict(CONFIRM_PAGE, text=CONFIRM_PAGE["text"] + "\ncard 4242 4242 4242 4242")
+    confirm = dict(
+        CONFIRM_PAGE,
+        text=CONFIRM_PAGE["text"] + "\ncard 4242 4242 4242 4242\nFake Holder",
+    )
     browser, bridge = FakeBrowser(pages=[CHECKOUT_PAGE, confirm]), FakeBridge()
     run(browser, bridge, tmp_path)
     audit_file = tmp_path / "state" / "audit.jsonl"
@@ -262,7 +315,22 @@ def test_audit_log_is_redacted_and_private(tmp_path, creds):
     assert "4242424242424242" not in content and "4242 4242" not in content
     assert stat.S_IMODE(audit_file.stat().st_mode) == 0o600
     receipt = (tmp_path / "state" / "restricted" / "purchase_receipts" / "pt_test.txt").read_text()
-    assert "4242 4242" not in receipt and "[REDACTED_PAYMENT_VALUE]" in receipt
+    assert "4242 4242" not in receipt and "Fake Holder" not in receipt
+    assert "[REDACTED_PAYMENT_VALUE]" in receipt
+
+
+def test_payment_values_are_redacted_from_callback_and_spool(tmp_path, creds):
+    cardholder = 'José "Tester" \\ QA'
+    (creds / "card_name").write_text(cardholder)
+    checkout = dict(CHECKOUT_PAGE, merchant=cardholder)
+    browser = FakeBrowser(pages=[checkout, CONFIRM_PAGE])
+    bridge = FakeBridge(terminal_transport_fails=True)
+    assert run(browser, bridge, tmp_path) == pe.EXIT_SPOOLED
+    callback = json.dumps(terminal_calls(bridge)[0][1])
+    spool = (tmp_path / "state" / "spool" / "pt_test.json").read_text()
+    for value in ("4242424242424242", "12/29", "123", cardholder):
+        assert value not in callback
+        assert value not in spool
 
 
 def test_navigation_failure_no_retry(tmp_path, creds):
@@ -271,6 +339,58 @@ def test_navigation_failure_no_retry(tmp_path, creds):
     assert [kind for kind, _ in browser.calls] == ["navigate"]
     assert terminal_calls(bridge)[0][1]["failure_category"] == "navigation_failed"
     assert browser.cleaned == ["purchase_pt_test"]
+
+
+def test_unhandled_exception_reports_once_and_cleans_up(tmp_path, creds):
+    browser, bridge = FakeBrowser(), FakeBridge()
+
+    def explode(url, task_id):
+        raise RuntimeError("synthetic card_name must not be logged")
+
+    browser.navigate = explode
+    assert run(browser, bridge, tmp_path) == pe.EXIT_DEFINITIVE_FAILURE
+    assert terminal_calls(bridge)[0][0] == "record_definitive_failure"
+    assert terminal_calls(bridge)[0][1]["failure_category"] == "executor_error_before_submit"
+    assert browser.cleaned == ["purchase_pt_test"]
+    assert "synthetic card_name" not in (tmp_path / "state" / "audit.jsonl").read_text()
+
+
+def test_form_action_and_post_fill_origin_are_rejected(tmp_path, creds):
+    external_form = dict(CHECKOUT_PAGE, form_action="https://evil.example/pay")
+    browser, bridge = FakeBrowser(pages=[external_form, CONFIRM_PAGE]), FakeBridge()
+    assert run(browser, bridge, tmp_path) == pe.EXIT_DEFINITIVE_FAILURE
+    assert "fill" not in [kind for kind, _ in browser.calls]
+
+    redirected = dict(CHECKOUT_PAGE, url="https://evil.example/pay")
+    browser, bridge = FakeBrowser(pages=[CHECKOUT_PAGE, redirected]), FakeBridge()
+    browser.index = 0
+
+    original_eval = browser.eval_js
+
+    def redirect_after_fill(expression, task_id):
+        result = original_eval(expression, task_id)
+        if "Object.entries" in expression:
+            browser.pages[0] = redirected
+        return result
+
+    browser.eval_js = redirect_after_fill
+    browser.eval_sensitive = redirect_after_fill
+    assert run(browser, bridge, tmp_path) == pe.EXIT_DEFINITIVE_FAILURE
+    assert "submit" not in [kind for kind, _ in browser.calls]
+
+
+def test_prefilled_marker_cannot_bypass_failed_fill(tmp_path, creds):
+    class PrefilledBrowser(FakeBrowser):
+        def eval_js(self, expression, task_id):
+            result = super().eval_js(expression, task_id)
+            if "document.body" in expression:
+                result["result"]["filled"] = True
+            return result
+
+    browser, bridge = PrefilledBrowser(fill_ok=False), FakeBridge()
+    assert run(browser, bridge, tmp_path) == pe.EXIT_DEFINITIVE_FAILURE
+    assert not any(kind in {"fill", "submit"} for kind, _ in browser.calls)
+    assert terminal_calls(bridge)[0][1]["failure_category"] == "invalid_checkout_state"
 
 
 def test_sigterm_before_submit_cleans_up_and_reports(tmp_path, creds):
@@ -284,6 +404,31 @@ def test_sigterm_before_submit_cleans_up_and_reports(tmp_path, creds):
     action, context = terminal_calls(bridge)[0]
     assert action == "record_definitive_failure"
     assert context["failure_category"] == "terminated_before_submit"
+    assert browser.cleaned == ["purchase_pt_test"]
+
+
+def test_sigterm_during_claim_audit_cleans_up_and_reports(tmp_path, creds):
+    browser, bridge = FakeBrowser(), FakeBridge()
+    state = tmp_path / "state"
+    state.mkdir()
+    write_audit = pe.audit_factory(state)
+
+    def audit(phase, **fields):
+        if phase == "claimed":
+            os.kill(os.getpid(), signal.SIGTERM)
+        write_audit(phase, **fields)
+
+    result = pe.run_once(
+        bridge_post=bridge,
+        browser=browser,
+        audit=audit,
+        state_dir=state,
+        checkout_url_for=lambda claim: "https://registrar.example/checkout",
+        fake_e2e=False,
+        stdin=io.StringIO("tok\n"),
+    )
+    assert result == pe.EXIT_DEFINITIVE_FAILURE
+    assert terminal_calls(bridge)[0][1]["failure_category"] == "terminated_before_submit"
     assert browser.cleaned == ["purchase_pt_test"]
 
 
@@ -305,11 +450,143 @@ def test_preflight_rejects_cloud_and_bypass_and_recording(monkeypatch):
     assert any("sandbox_bypass" in problem for problem in problems)
 
 
+def test_preflight_rejects_camofox_lightpanda_and_browser_args(monkeypatch):
+    from tools import browser_tool as bt
+
+    monkeypatch.setattr(bt, "_is_local_mode", lambda: True)
+    monkeypatch.setattr(bt, "_is_camofox_mode", lambda: True)
+    monkeypatch.setattr(bt, "_get_browser_engine", lambda: "lightpanda")
+    monkeypatch.setattr(bt, "_get_sandbox_bypass_mode", lambda: "never")
+    monkeypatch.setenv("AGENT_BROWSER_ARGS", "--no-sandbox")
+    problems = pe.preflight_browser_config()
+    assert any("Camofox" in problem for problem in problems)
+    assert any("Chromium" in problem for problem in problems)
+    assert any("AGENT_BROWSER_ARGS" in problem for problem in problems)
+
+
+def test_sensitive_browser_eval_uses_stdin_and_scrubs_env(monkeypatch):
+    from tools import browser_tool as bt
+    from tools.browser_supervisor import SUPERVISOR_REGISTRY
+
+    seen = {}
+    monkeypatch.setattr(SUPERVISOR_REGISTRY, "get", lambda task_id: None)
+
+    def fake_run(task_id, command, args, **kwargs):
+        seen.update(task_id=task_id, command=command, args=args, kwargs=kwargs)
+        return {"success": True, "data": {"result": '{"ok": true}'}}
+
+    monkeypatch.setattr(bt, "_run_browser_command", fake_run)
+    result = json.loads(
+        bt._browser_eval(
+            "payment-marker", "purchase_x", stdin=True, suppress_output=True
+        )
+    )
+    assert result["result"] == {"ok": True}
+    assert seen["args"] == ["--stdin"]
+    assert seen["kwargs"]["_stdin_text"] == "payment-marker"
+    assert seen["kwargs"]["_suppress_output"] is True
+    assert "payment-marker" not in seen["args"]
+
+    monkeypatch.setenv("CREDENTIALS_DIRECTORY", "/run/credentials/test")
+    monkeypatch.setenv("COGITATOR_BRIDGE_TOKEN", "bridge-secret")
+    monkeypatch.setenv("OPENAI_API_KEY", "model-secret")
+
+    def fake_navigate(url, task_id=None):
+        assert "CREDENTIALS_DIRECTORY" not in os.environ
+        assert "COGITATOR_BRIDGE_TOKEN" not in os.environ
+        assert "OPENAI_API_KEY" not in os.environ
+        return json.dumps({"success": True})
+
+    monkeypatch.setattr(bt, "browser_navigate", fake_navigate)
+    pe.real_browser().navigate("https://registrar.example", "purchase_x")
+    assert os.environ["COGITATOR_BRIDGE_TOKEN"] == "bridge-secret"
+
+
+def test_sensitive_browser_output_is_discarded(tmp_path, monkeypatch, caplog):
+    from tools import browser_tool as bt
+
+    marker = "4111111111111111 Fake Holder 123 12/29"
+    seen = {}
+
+    class FakeProcess:
+        returncode = 1
+
+        def communicate(self, input=None, timeout=None):
+            assert input == marker.encode()
+            return marker.encode(), marker.encode()
+
+        def kill(self):
+            pass
+
+    def fake_popen(args, **kwargs):
+        seen.update(args=args, kwargs=kwargs)
+        return FakeProcess()
+
+    monkeypatch.setattr(bt, "_find_agent_browser", lambda: "/bin/agent-browser")
+    monkeypatch.setattr(bt, "_chromium_installed", lambda: True)
+    monkeypatch.setattr(bt, "_is_local_mode", lambda: True)
+    monkeypatch.setattr(bt, "_get_session_info", lambda task_id: {"session_name": "h_test"})
+    monkeypatch.setattr(bt, "_socket_safe_tmpdir", lambda: str(tmp_path))
+    monkeypatch.setattr(bt, "_write_owner_pid", lambda *args: None)
+    monkeypatch.setattr(bt.subprocess, "Popen", fake_popen)
+    result = bt._run_browser_command(
+        "purchase_x", "eval", ["--stdin"], timeout=1,
+        _engine_override="auto", _stdin_text=marker, _suppress_output=True,
+    )
+    assert result == {"success": False, "error": "Sensitive browser evaluation failed"}
+    assert marker not in " ".join(seen["args"])
+    assert hasattr(seen["kwargs"]["stdout"], "write")
+    assert seen["kwargs"]["stderr"] == subprocess.DEVNULL
+    assert marker not in caplog.text
+
+
+def test_sensitive_browser_result_is_strictly_whitelisted(tmp_path, monkeypatch, caplog):
+    from tools import browser_tool as bt
+
+    marker = "4111111111111111 Fake Holder 123 12/29"
+
+    class FakeProcess:
+        returncode = 0
+
+        def __init__(self, stdout):
+            self.stdout = stdout
+
+        def communicate(self, input=None, timeout=None):
+            payload = {
+                "success": True,
+                "data": {"result": json.dumps({"ok": False, "missing": marker})},
+            }
+            self.stdout.write(json.dumps(payload).encode())
+
+        def kill(self):
+            pass
+
+    def fake_popen(args, **kwargs):
+        return FakeProcess(kwargs["stdout"])
+
+    monkeypatch.setattr(bt, "_find_agent_browser", lambda: "/bin/agent-browser")
+    monkeypatch.setattr(bt, "_chromium_installed", lambda: True)
+    monkeypatch.setattr(bt, "_is_local_mode", lambda: True)
+    monkeypatch.setattr(bt, "_get_session_info", lambda task_id: {"session_name": "h_test"})
+    monkeypatch.setattr(bt, "_socket_safe_tmpdir", lambda: str(tmp_path))
+    monkeypatch.setattr(bt, "_write_owner_pid", lambda *args: None)
+    monkeypatch.setattr(bt.subprocess, "Popen", fake_popen)
+    result = bt._run_browser_command(
+        "purchase_x", "eval", ["--stdin"], timeout=1,
+        _engine_override="auto", _stdin_text=marker, _suppress_output=True,
+    )
+    assert result == {"success": True, "data": {"result": '{"ok": false}'}}
+    assert marker not in json.dumps(result)
+    assert marker not in caplog.text
+
+
 def test_fake_e2e_flag_is_loopback_only():
     assert pe.origin_allowed("http://127.0.0.1:8000/x", "registrar.example", fake_e2e=True)
     assert not pe.origin_allowed("https://registrar.example/x", "registrar.example", fake_e2e=True)
     assert pe.origin_allowed("https://registrar.example/x", "registrar.example", fake_e2e=False)
-    assert pe.origin_allowed("https://www.registrar.example/x", "registrar.example", fake_e2e=False)
+    assert not pe.origin_allowed(
+        "https://www.registrar.example/x", "registrar.example", fake_e2e=False
+    )
     assert not pe.origin_allowed("https://evilregistrar.example/x", "registrar.example", fake_e2e=False)
     with pytest.raises(SystemExit):
         pe.parse_args(["--bridge-url", "http://127.0.0.1:1", "--fake-e2e",
@@ -322,7 +599,41 @@ def test_fake_e2e_flag_is_loopback_only():
                        "--checkout-url", "http://127.0.0.1:9/checkout"])
 
 
+def test_unsafe_checkout_url_is_rejected_before_navigation(tmp_path, creds):
+    browser, bridge = FakeBrowser(), FakeBridge()
+    result = pe.run_once(
+        bridge_post=bridge,
+        browser=browser,
+        audit=pe.audit_factory(tmp_path),
+        state_dir=tmp_path,
+        checkout_url_for=lambda claim: "https://registrar.example@evil.example/checkout",
+        fake_e2e=False,
+        stdin=io.StringIO("tok\n"),
+    )
+    assert result == pe.EXIT_DEFINITIVE_FAILURE
+    assert browser.calls == []
+    assert terminal_calls(bridge)[0][1]["failure_category"] == "wrong_origin"
+
+
+def test_fake_e2e_proxy_blocks_non_loopback():
+    with pe.loopback_browser_proxy() as port:
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({"http": f"http://127.0.0.1:{port}"})
+        )
+        with pytest.raises(urllib.error.HTTPError) as error:
+            opener.open("http://example.com/blocked", timeout=2)
+    assert error.value.code == 403
+
+
 def test_gateway_never_imports_executor():
     gateway_dir = Path(pe.__file__).parent / "gateway"
     for path in gateway_dir.rglob("*.py"):
         assert "purchase_executor" not in path.read_text()
+
+
+def test_private_write_repairs_existing_mode(tmp_path):
+    path = tmp_path / "spool.json"
+    path.write_text("old")
+    path.chmod(0o644)
+    pe._write_private(path, "new")
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
