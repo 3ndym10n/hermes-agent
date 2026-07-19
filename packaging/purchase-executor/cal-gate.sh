@@ -33,14 +33,25 @@ case "${1:-}" in
     echo "no flags enabled. Next: sudo ./cal-gate.sh stage-run"
     ;;
   stage-run)
+    UNIT=hermes-purchase-executor-staging.service
     echo "--- running ONE synthetic loopback staging pass under systemd hardening ---"
-    systemctl start hermes-purchase-executor-staging.service || true
-    echo "--- staging journal (tail) ---"
-    journalctl -u hermes-purchase-executor-staging -n 40 --no-pager || true
-    if journalctl -u hermes-purchase-executor-staging -n 200 --no-pager 2>/dev/null | grep -q '"fake_e2e": "PASS"'; then
+    systemctl start "$UNIT" || true
+    # Authoritative outcome from THIS exact invocation, not a truncated tail.
+    INVOC="$(systemctl show "$UNIT" -p InvocationID --value)"
+    RESULT="$(systemctl show "$UNIT" -p Result --value)"
+    MAINSTATUS="$(systemctl show "$UNIT" -p ExecMainStatus --value)"
+    echo "--- staging journal (this invocation, complete) ---"
+    journalctl "_SYSTEMD_INVOCATION_ID=$INVOC" --no-pager 2>/dev/null | tail -60 || true
+    marker=no
+    if [ -n "$INVOC" ] && journalctl "_SYSTEMD_INVOCATION_ID=$INVOC" --no-pager 2>/dev/null | grep -q '"fake_e2e": "PASS"'; then
+      marker=yes
+    fi
+    echo "--- staging result: Result=$RESULT ExecMainStatus=$MAINSTATUS fake_e2e_marker=$marker ---"
+    if [ "$RESULT" = "success" ] && [ "$MAINSTATUS" = "0" ] && [ "$marker" = "yes" ]; then
       echo "STAGING: PASS"
     else
-      echo "STAGING: did not observe PASS — inspect the journal above." >&2
+      echo "STAGING: FAIL (need Result=success, ExecMainStatus=0, and the fake_e2e PASS marker in this invocation)" >&2
+      staging_failed=1
     fi
     echo "--- production unit still inert? ---"
     # Classify by STATE VALUE, not exit code: a static unit's is-enabled exits 0
@@ -51,6 +62,7 @@ case "${1:-}" in
       *) echo "prod unit not bootable (${prod_state:-unknown}) (good)";;
     esac
     if systemctl is-active --quiet hermes-purchase-executor; then echo "WARN prod ACTIVE"; else echo "prod unit inactive (good)"; fi
+    exit "${staging_failed:-0}"
     ;;
   rollback)
     "$HERE/uninstall.sh" "${2:-}"

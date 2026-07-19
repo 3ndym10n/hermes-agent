@@ -159,6 +159,21 @@ def test_cal_gate_stage_run_classifies_enabled_by_value():
     assert "is-active --quiet" in gate
 
 
+def test_cal_gate_staging_pass_detection_is_invocation_scoped_and_authoritative():
+    gate = (PKG / "cal-gate.sh").read_text()
+    # No truncated tail window (the false negative Cal hit); scope to THIS run.
+    assert "-n 200" not in gate
+    assert "_SYSTEMD_INVOCATION_ID=$INVOC" in gate
+    # Validate the authoritative systemd exit fields, not just a log grep.
+    assert 'RESULT="$(systemctl show' in gate and "Result" in gate
+    assert "ExecMainStatus" in gate
+    assert '[ "$RESULT" = "success" ]' in gate
+    assert '[ "$MAINSTATUS" = "0" ]' in gate
+    # And it must be able to fail the run (non-zero exit) on a genuine failure.
+    assert "staging_failed=1" in gate
+    assert 'exit "${staging_failed:-0}"' in gate
+
+
 def test_install_does_not_disable_static_units():
     # `systemctl disable` errors on static units ("no [Install] section"); the
     # installer must not call it.
