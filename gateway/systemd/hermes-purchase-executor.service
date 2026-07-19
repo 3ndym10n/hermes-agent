@@ -1,0 +1,42 @@
+# Restricted Purchase Executor V0 (Hermes issue #65).
+# NOT installed by any script — Cal installs this manually (sudo) and stages
+# payment credentials with `systemd-creds encrypt` into /etc/credstore.encrypted.
+# The executor is inert without this unit; hermes-gateway never loads these
+# credentials.
+#
+# Run one attempt for one ticket:
+#   printf '%s' "$TICKET_TOKEN" | systemd-run --wait --pipe ...  # or:
+#   systemctl start hermes-purchase-executor  (ticket_token staged as a credential)
+
+[Unit]
+Description=Hermes Restricted Purchase Executor V0 (one-shot, single ticket)
+
+[Service]
+Type=oneshot
+Restart=no
+User=v0id
+Group=v0id
+WorkingDirectory=/home/v0id/.hermes/hermes-agent
+Environment="HOME=/home/v0id"
+Environment="HERMES_HOME=/home/v0id/.hermes"
+EnvironmentFile=/home/v0id/.hermes/.env
+ExecStart=/home/v0id/.hermes/hermes-agent/venv/bin/python -m purchase_executor --bridge-url ${COGITATOR_BRIDGE_URL}
+
+# Payment fields + ticket token: encrypted credentials, visible only to this
+# unit via $CREDENTIALS_DIRECTORY. Never exported to the environment.
+LoadCredentialEncrypted=card_number:/etc/credstore.encrypted/card_number.cred
+LoadCredentialEncrypted=card_expiry:/etc/credstore.encrypted/card_expiry.cred
+LoadCredentialEncrypted=card_cvv:/etc/credstore.encrypted/card_cvv.cred
+LoadCredentialEncrypted=card_name:/etc/credstore.encrypted/card_name.cred
+LoadCredentialEncrypted=ticket_token:/etc/credstore.encrypted/ticket_token.cred
+
+# Hardening
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+# Executor state + hermes browser session state + playwright cache. Narrow
+# further after the first live smoke if the browser proves it needs less.
+ReadWritePaths=/home/v0id/.hermes/purchase_executor /home/v0id/.hermes /home/v0id/.cache
+TimeoutStartSec=300
+TimeoutStopSec=30
