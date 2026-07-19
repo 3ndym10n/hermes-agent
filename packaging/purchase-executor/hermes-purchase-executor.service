@@ -1,19 +1,15 @@
-# Restricted Purchase Executor V0 (Hermes issue #65).
-# NOT installed by any script — Cal installs this manually (sudo) and stages
-# payment credentials with `systemd-creds encrypt` into /etc/credstore.encrypted.
-# Installation also creates the unprivileged `hermes-purchase-executor` user,
-# grants it read/execute ACLs only on this checkout + Playwright Chromium, and
-# writes /etc/hermes-purchase-executor/executor.env containing only:
-#   COGITATOR_BRIDGE_URL=https://<deployed-cogitator-host>
-# /etc/hermes-purchase-executor/config.yaml is a dedicated non-secret Hermes
-# config with browser.engine=chrome, sandbox_bypass=never, cloud disabled, and
-# record_sessions=false. The service must not read the gateway's ~/.env.
-# The executor is inert without this unit; hermes-gateway never loads these
-# credentials.
+# Restricted Purchase Executor V0 — PRODUCTION unit (Hermes issue #65).
 #
-# Run one attempt for one ticket:
-#   printf '%s' "$TICKET_TOKEN" | systemd-run --wait --pipe ...  # or:
-#   systemctl start hermes-purchase-executor  (ticket_token staged as a credential)
+# Installed by packaging/purchase-executor/install.sh (sudo). Inert until Cal
+# stages payment credentials with `systemd-creds encrypt` into
+# /etc/credstore.encrypted and explicitly launches it via launch.sh.
+#
+# Dynamic ticket: the execution ticket is short-lived and per-purchase, so it is
+# NOT a persistent encrypted credential. launch.sh writes it to a root-only
+# tmpfs file under /run that this unit reads with LoadCredential= at start, then
+# shreds it. It never lands on disk, in argv, in the environment, or in logs.
+#
+# hermes-gateway never loads any of these credentials (separate user + unit).
 
 [Unit]
 Description=Hermes Restricted Purchase Executor V0 (one-shot, single ticket)
@@ -30,14 +26,16 @@ Environment="PLAYWRIGHT_BROWSERS_PATH=/home/v0id/.cache/ms-playwright"
 EnvironmentFile=/etc/hermes-purchase-executor/executor.env
 ExecStart=/home/v0id/.hermes/hermes-agent/venv/bin/python -m purchase_executor --bridge-url ${COGITATOR_BRIDGE_URL} --state-dir /var/lib/hermes-purchase-executor
 
-# Payment fields + ticket token: encrypted credentials, visible only to this
-# unit via $CREDENTIALS_DIRECTORY. Never exported to the environment.
+# Persistent payment instrument + bridge token: encrypted at rest, visible only
+# to this unit via $CREDENTIALS_DIRECTORY. Never exported to the environment.
 LoadCredentialEncrypted=card_number:/etc/credstore.encrypted/card_number.cred
 LoadCredentialEncrypted=card_expiry:/etc/credstore.encrypted/card_expiry.cred
 LoadCredentialEncrypted=card_cvv:/etc/credstore.encrypted/card_cvv.cred
 LoadCredentialEncrypted=card_name:/etc/credstore.encrypted/card_name.cred
-LoadCredentialEncrypted=ticket_token:/etc/credstore.encrypted/ticket_token.cred
 LoadCredentialEncrypted=cogitator_bridge_token:/etc/credstore.encrypted/cogitator_bridge_token.cred
+# Dynamic, per-run ticket: root-only tmpfs file written by launch.sh, removed
+# immediately after start. NOT LoadCredentialEncrypted, NOT under /etc.
+LoadCredential=ticket_token:/run/hermes-purchase-executor/ticket_token
 
 # Hardening
 NoNewPrivileges=yes

@@ -1,0 +1,64 @@
+# Restricted Purchase Executor V0 — STAGING unit (synthetic, loopback-only).
+#
+# Runs the self-contained fake-E2E harness under the SAME hardening as the
+# production unit: temp Cogitator SQLite DB, in-process loopback bridge + mock
+# merchant, real local Chromium, synthetic payment credentials only. Networking
+# is restricted to loopback at the systemd layer. Never touches real credentials,
+# the production bridge, or a real merchant. Proves the executor works under the
+# real sandbox before any live run.
+
+[Unit]
+Description=Hermes Purchase Executor V0 — synthetic loopback staging run
+
+[Service]
+Type=oneshot
+Restart=no
+User=hermes-purchase-executor
+Group=hermes-purchase-executor
+WorkingDirectory=/home/v0id/.hermes/hermes-agent
+Environment="HOME=/var/lib/hermes-purchase-executor"
+Environment="HERMES_HOME=/etc/hermes-purchase-executor"
+Environment="PLAYWRIGHT_BROWSERS_PATH=/home/v0id/.cache/ms-playwright"
+ExecStart=/home/v0id/.hermes/hermes-agent/venv/bin/python scripts/purchase_executor_fake_e2e.py --cogitator-repo /home/v0id/Projects/Cogitator_clean --credentials-dir %d
+
+# Synthetic (public 4242 test) payment credentials, staged by
+# stage-synthetic-credentials.sh. Same NAMES as production, proving the
+# systemd credential name-binding without any real card data.
+LoadCredentialEncrypted=card_number:/etc/credstore.encrypted/staging-card_number.cred
+LoadCredentialEncrypted=card_expiry:/etc/credstore.encrypted/staging-card_expiry.cred
+LoadCredentialEncrypted=card_cvv:/etc/credstore.encrypted/staging-card_cvv.cred
+LoadCredentialEncrypted=card_name:/etc/credstore.encrypted/staging-card_name.cred
+
+# Loopback-only networking at the systemd layer (in addition to the app's
+# --fake-e2e loopback proxy).
+IPAddressDeny=any
+IPAddressAllow=localhost
+
+# Same hardening as production.
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=read-only
+StateDirectory=hermes-purchase-executor
+StateDirectoryMode=0700
+UMask=0077
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+KeyringMode=private
+RemoveIPC=yes
+TimeoutStartSec=600
+TimeoutStopSec=30
