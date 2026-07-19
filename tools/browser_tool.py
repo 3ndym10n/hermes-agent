@@ -1931,6 +1931,8 @@ def _run_browser_command(
     args: List[str] = None,
     timeout: Optional[int] = None,
     _engine_override: Optional[str] = None,
+    _stdin_text: Optional[str] = None,
+    _suppress_output: bool = False,
 ) -> Dict[str, Any]:
     """
     Run an agent-browser CLI command using our pre-created Browserbase session.
@@ -1944,6 +1946,9 @@ def _run_browser_command(
         _engine_override: Force a specific engine for this call only.  Used
                           internally by the Lightpanda fallback to retry with
                           Chrome without touching global state.
+        _stdin_text: Sensitive command input delivered over stdin instead of
+                     argv. Internal callers only.
+        _suppress_output: Discard child output for secret-bearing stdin.
 
     Returns:
         Parsed JSON response from agent-browser
@@ -2102,8 +2107,17 @@ def _run_browser_command(
         # sees EOF and blocks until the timeout fires.
         stdout_path = os.path.join(task_socket_dir, f"_stdout_{command}")
         stderr_path = os.path.join(task_socket_dir, f"_stderr_{command}")
-        stdout_fd = os.open(stdout_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        stderr_fd = os.open(stderr_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        sensitive_stdout = tempfile.TemporaryFile() if _suppress_output else None
+        stdout_fd = (
+            None
+            if _suppress_output
+            else os.open(stdout_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        )
+        stderr_fd = (
+            None
+            if _suppress_output
+            else os.open(stderr_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        )
         try:
             # See matching comment at the other Popen site above — on
             # Windows we put agent-browser in its own process group, force
@@ -2124,38 +2138,73 @@ def _run_browser_command(
                 _popen_extra["startupinfo"] = _si
             proc = subprocess.Popen(
                 cmd_parts,
-                stdout=stdout_fd,
-                stderr=stderr_fd,
-                stdin=subprocess.DEVNULL,
+                stdout=sensitive_stdout if _suppress_output else stdout_fd,
+                stderr=subprocess.DEVNULL if _suppress_output else stderr_fd,
+                stdin=subprocess.PIPE if _stdin_text is not None else subprocess.DEVNULL,
                 env=browser_env,
                 **_popen_extra,
             )
         finally:
-            os.close(stdout_fd)
-            os.close(stderr_fd)
+            if stdout_fd is not None:
+                os.close(stdout_fd)
+            if stderr_fd is not None:
+                os.close(stderr_fd)
 
         try:
-            proc.wait(timeout=timeout)
+            if _stdin_text is None:
+                proc.wait(timeout=timeout)
+            else:
+                proc.communicate(input=_stdin_text.encode("utf-8"), timeout=timeout)
         except subprocess.TimeoutExpired:
             proc.kill()
-            proc.wait()
+            proc.communicate() if _stdin_text is not None else proc.wait()
+            if sensitive_stdout is not None:
+                sensitive_stdout.close()
+                sensitive_stdout = None
             logger.warning("browser '%s' timed out after %ds (task=%s, socket_dir=%s)",
                            command, timeout, task_id, task_socket_dir)
             result = {"success": False, "error": f"Command timed out after {timeout} seconds"}
             # Fall through to fallback check below
         else:
-            with open(stdout_path, "r", encoding="utf-8") as f:
-                stdout = f.read()
-            with open(stderr_path, "r", encoding="utf-8") as f:
-                stderr = f.read()
+            if _suppress_output:
+                sensitive_stdout.seek(0)
+                stdout = sensitive_stdout.read().decode("utf-8", errors="replace")
+                sensitive_stdout.close()
+                sensitive_stdout = None
+                stderr = ""
+            else:
+                with open(stdout_path, "r", encoding="utf-8") as f:
+                    stdout = f.read()
+                with open(stderr_path, "r", encoding="utf-8") as f:
+                    stderr = f.read()
             returncode = proc.returncode
 
             # Clean up temp files (best-effort)
-            for p in (stdout_path, stderr_path):
+            for p in (() if _suppress_output else (stdout_path, stderr_path)):
                 try:
                     os.unlink(p)
                 except OSError:
                     pass
+
+            if _suppress_output:
+                if returncode != 0:
+                    return {"success": False, "error": "Sensitive browser evaluation failed"}
+                try:
+                    envelope = json.loads(stdout)
+                    raw_result = envelope.get("data", {}).get("result")
+                    fill_result = (
+                        json.loads(raw_result) if isinstance(raw_result, str) else raw_result
+                    )
+                    if (
+                        envelope.get("success") is not True
+                        or not isinstance(fill_result, dict)
+                        or not isinstance(fill_result.get("ok"), bool)
+                    ):
+                        raise ValueError
+                except (AttributeError, json.JSONDecodeError, TypeError, ValueError):
+                    return {"success": False, "error": "Sensitive browser evaluation failed"}
+                safe_result = json.dumps({"ok": fill_result["ok"]})
+                return {"success": True, "data": {"result": safe_result}}
 
             # Log stderr for diagnostics — use warning level on failure so it's visible
             if stderr and stderr.strip():
@@ -2224,8 +2273,14 @@ def _run_browser_command(
                 result = {"success": True, "data": {}}
 
     except Exception as e:
-        logger.warning("browser '%s' exception: %s", command, e, exc_info=True)
-        result = {"success": False, "error": str(e)}
+        if "sensitive_stdout" in locals() and sensitive_stdout is not None:
+            sensitive_stdout.close()
+        if _suppress_output:
+            logger.warning("browser '%s' sensitive evaluation failed", command)
+            result = {"success": False, "error": "Sensitive browser evaluation failed"}
+        else:
+            logger.warning("browser '%s' exception: %s", command, e, exc_info=True)
+            result = {"success": False, "error": str(e)}
 
     # --- Lightpanda automatic Chrome fallback ---
     # If engine is lightpanda and the result looks broken, retry with Chrome.
@@ -2872,7 +2927,13 @@ def browser_console(clear: bool = False, expression: Optional[str] = None, task_
     return json.dumps(response, ensure_ascii=False)
 
 
-def _browser_eval(expression: str, task_id: Optional[str] = None) -> str:
+def _browser_eval(
+    expression: str,
+    task_id: Optional[str] = None,
+    *,
+    stdin: bool = False,
+    suppress_output: bool = False,
+) -> str:
     """Evaluate a JavaScript expression in the page context and return the result."""
     if _is_camofox_mode():
         return _camofox_eval(expression, task_id)
@@ -2888,7 +2949,7 @@ def _browser_eval(expression: str, task_id: Optional[str] = None) -> str:
     try:
         from tools.browser_supervisor import SUPERVISOR_REGISTRY  # type: ignore[import-not-found]
         supervisor = SUPERVISOR_REGISTRY.get(effective_task_id)
-        if supervisor is not None:
+        if supervisor is not None and not stdin:
             sup_result = supervisor.evaluate_runtime(expression)
             if sup_result.get("ok"):
                 raw_result = sup_result.get("result")
@@ -2925,7 +2986,17 @@ def _browser_eval(expression: str, task_id: Optional[str] = None) -> str:
         logger.debug("browser_eval: supervisor path errored (%s), falling back", exc)
 
     # --- Fallback: agent-browser CLI subprocess (original path) -------------
-    result = _run_browser_command(effective_task_id, "eval", [expression])
+    if stdin:
+        result = _run_browser_command(
+            effective_task_id,
+            "eval",
+            ["--stdin"],
+            _engine_override="auto",
+            _stdin_text=expression,
+            _suppress_output=suppress_output,
+        )
+    else:
+        result = _run_browser_command(effective_task_id, "eval", [expression])
 
     if not result.get("success"):
         err = result.get("error", "eval failed")

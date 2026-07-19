@@ -1,0 +1,69 @@
+# Restricted Purchase Executor V0 (Hermes issue #65).
+# NOT installed by any script — Cal installs this manually (sudo) and stages
+# payment credentials with `systemd-creds encrypt` into /etc/credstore.encrypted.
+# Installation also creates the unprivileged `hermes-purchase-executor` user,
+# grants it read/execute ACLs only on this checkout + Playwright Chromium, and
+# writes /etc/hermes-purchase-executor/executor.env containing only:
+#   COGITATOR_BRIDGE_URL=https://<deployed-cogitator-host>
+# /etc/hermes-purchase-executor/config.yaml is a dedicated non-secret Hermes
+# config with browser.engine=chrome, sandbox_bypass=never, cloud disabled, and
+# record_sessions=false. The service must not read the gateway's ~/.env.
+# The executor is inert without this unit; hermes-gateway never loads these
+# credentials.
+#
+# Run one attempt for one ticket:
+#   printf '%s' "$TICKET_TOKEN" | systemd-run --wait --pipe ...  # or:
+#   systemctl start hermes-purchase-executor  (ticket_token staged as a credential)
+
+[Unit]
+Description=Hermes Restricted Purchase Executor V0 (one-shot, single ticket)
+
+[Service]
+Type=oneshot
+Restart=no
+User=hermes-purchase-executor
+Group=hermes-purchase-executor
+WorkingDirectory=/home/v0id/.hermes/hermes-agent
+Environment="HOME=/var/lib/hermes-purchase-executor"
+Environment="HERMES_HOME=/etc/hermes-purchase-executor"
+Environment="PLAYWRIGHT_BROWSERS_PATH=/home/v0id/.cache/ms-playwright"
+EnvironmentFile=/etc/hermes-purchase-executor/executor.env
+ExecStart=/home/v0id/.hermes/hermes-agent/venv/bin/python -m purchase_executor --bridge-url ${COGITATOR_BRIDGE_URL} --state-dir /var/lib/hermes-purchase-executor
+
+# Payment fields + ticket token: encrypted credentials, visible only to this
+# unit via $CREDENTIALS_DIRECTORY. Never exported to the environment.
+LoadCredentialEncrypted=card_number:/etc/credstore.encrypted/card_number.cred
+LoadCredentialEncrypted=card_expiry:/etc/credstore.encrypted/card_expiry.cred
+LoadCredentialEncrypted=card_cvv:/etc/credstore.encrypted/card_cvv.cred
+LoadCredentialEncrypted=card_name:/etc/credstore.encrypted/card_name.cred
+LoadCredentialEncrypted=ticket_token:/etc/credstore.encrypted/ticket_token.cred
+LoadCredentialEncrypted=cogitator_bridge_token:/etc/credstore.encrypted/cogitator_bridge_token.cred
+
+# Hardening
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=read-only
+StateDirectory=hermes-purchase-executor
+StateDirectoryMode=0700
+UMask=0077
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+KeyringMode=private
+RemoveIPC=yes
+TimeoutStartSec=300
+TimeoutStopSec=30
