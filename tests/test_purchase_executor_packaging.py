@@ -15,9 +15,21 @@ from pathlib import Path
 import pytest
 
 PKG = Path(__file__).resolve().parent.parent / "packaging" / "purchase-executor"
+PROD_UNIT = PKG / "hermes-purchase-executor.service"
 STAGING_UNIT = PKG / "hermes-purchase-executor-staging.service"
 STAGE_SCRIPT = PKG / "stage-synthetic-credentials.sh"
 DOCTOR = PKG / "doctor.sh"
+
+
+def _unit_values(unit_path, key):
+    vals = []
+    for line in unit_path.read_text().splitlines():
+        s = line.strip()
+        if s.startswith("#"):
+            continue
+        if s.startswith(key + "="):
+            vals.append(s.split("=", 1)[1].strip())
+    return vals
 
 
 def _staging_credentials():
@@ -87,6 +99,64 @@ def test_scripts_are_syntax_clean():
     for script in PKG.glob("*.sh"):
         r = subprocess.run(["bash", "-n", str(script)], capture_output=True, text=True)
         assert r.returncode == 0, f"{script.name}: {r.stderr}"
+
+
+@pytest.mark.parametrize("unit", [PROD_UNIT, STAGING_UNIT])
+def test_workdir_and_interpreter_are_reachable_via_bind_mounts(unit):
+    # The service user cannot traverse the human home (750/700, no ACL tools),
+    # so the units hide the home (ProtectHome=tmpfs) and bind-mount ONLY the
+    # needed subtrees read-only. Prove the WorkingDirectory and the actual Python
+    # interpreter are each inside a bind-mounted subtree AND world-accessible on
+    # disk (what makes them readable through the read-only bind).
+    assert _unit_values(unit, "ProtectHome") == ["tmpfs"]
+    binds = _unit_values(unit, "BindReadOnlyPaths")
+    workdir = _unit_values(unit, "WorkingDirectory")[0]
+    execstart = _unit_values(unit, "ExecStart")[0]
+
+    def covered(path):
+        return any(path == b or path.startswith(b.rstrip("/") + "/") for b in binds)
+
+    assert covered(workdir), f"{workdir} not covered by a bind mount {binds}"
+
+    # The interpreter in ExecStart, resolved through symlinks, must be covered.
+    py = execstart.split()[0]
+    real = os.path.realpath(py)
+    assert covered(real), f"interpreter {real} not covered by bind mounts {binds}"
+
+    # On this host the sources must be world-readable/executable for the bind to
+    # grant access (files keep real ownership inside the mount).
+    if os.path.exists(workdir):
+        mode = os.stat(workdir).st_mode
+        assert mode & stat.S_IROTH and mode & stat.S_IXOTH, f"{workdir} not world-rx"
+    if os.path.exists(real):
+        assert os.stat(real).st_mode & stat.S_IXOTH, f"{real} not world-executable"
+
+
+def test_units_do_not_weaken_home_protection():
+    # Regression against a lazy "fix" that broadly opens the home.
+    for unit in (PROD_UNIT, STAGING_UNIT):
+        text = unit.read_text()
+        assert "ProtectHome=read-only" not in text
+        assert "ProtectHome=no" not in text
+        # No bind mount of the whole private home or its parent.
+        for b in _unit_values(unit, "BindReadOnlyPaths"):
+            assert b.rstrip("/") not in {"/home", "/home/v0id"}, f"too-broad bind: {b}"
+
+
+def test_install_verifies_readability_and_drops_setfacl():
+    install = (PKG / "install.sh").read_text()
+    assert "setfacl" not in install  # ACL approach abandoned (tools may be absent)
+    assert "verify_world_readable" in install  # fail-loud precondition check
+    # The verification must not swallow errors (it exits non-zero on failure).
+    assert "exit 1" in install
+
+
+def test_cal_gate_stage_run_classifies_enabled_by_value():
+    gate = (PKG / "cal-gate.sh").read_text()
+    # The false "WARN prod ENABLED" came from an exit-code check on a static unit.
+    assert "&& echo \"WARN prod ENABLED\"" not in gate
+    assert 'prod_state="$(systemctl is-enabled' in gate
+    assert "is-active --quiet" in gate
 
 
 def test_install_does_not_disable_static_units():

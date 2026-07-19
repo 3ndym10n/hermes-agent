@@ -18,14 +18,31 @@ install -o root -g root -m 644 "$HERE/config.yaml" "$ETC/config.yaml"
 
 install -o "$USER_NAME" -g "$USER_NAME" -m 700 -d /var/lib/hermes-purchase-executor
 
-# Read/execute ACLs for the unprivileged user on exactly what it needs.
-if command -v setfacl >/dev/null; then
-  setfacl -R -m u:"$USER_NAME":rX "$CHECKOUT" "$CHECKOUT/venv" 2>/dev/null || true
-  [ -d /home/v0id/.cache/ms-playwright ] && \
-    setfacl -R -m u:"$USER_NAME":rX /home/v0id/.cache/ms-playwright 2>/dev/null || true
-  # Traverse into the home path (execute bit only, not read).
-  setfacl -m u:"$USER_NAME":--x /home/v0id /home/v0id/.hermes /home/v0id/.cache 2>/dev/null || true
-fi
+# The service reaches its runtime NOT via ACLs on the human home (fragile, and
+# the acl package may be absent) but via systemd BindReadOnlyPaths in the units.
+# That only works if the bind sources exist and are world-readable, since the
+# files keep their real ownership inside the mount. Verify that here and FAIL the
+# install loudly if not — no silent 2>/dev/null.
+PY_REAL="$(readlink -f "$CHECKOUT/venv/bin/python")"
+verify_world_readable() {
+  local path="$1"
+  [ -e "$path" ] || { echo "MISSING required runtime path: $path" >&2; exit 1; }
+  # 'others' must be able to read (dirs: read+traverse) — that is what lets the
+  # dedicated service user read it through the read-only bind mount.
+  if [ -d "$path" ]; then
+    [ "$(stat -c '%A' "$path" | cut -c8-9)" = "r-" ] || \
+      { echo "NOT world-readable (needed for bind mount): $path" >&2; exit 1; }
+  else
+    [ -r "$path" ] && [ "$(stat -c '%A' "$path" | cut -c8)" = "r" ] || \
+      { echo "NOT world-readable (needed for bind mount): $path" >&2; exit 1; }
+  fi
+}
+verify_world_readable "$CHECKOUT"
+verify_world_readable "$CHECKOUT/purchase_executor.py"
+verify_world_readable "$PY_REAL"
+[ -x "$PY_REAL" ] || { echo "interpreter not executable: $PY_REAL" >&2; exit 1; }
+verify_world_readable /home/v0id/.cache/ms-playwright
+echo "verified: service runtime is reachable via bind mounts (world-readable sources)."
 
 install -o root -g root -m 644 "$HERE/hermes-purchase-executor.service" /etc/systemd/system/
 install -o root -g root -m 644 "$HERE/hermes-purchase-executor-staging.service" /etc/systemd/system/

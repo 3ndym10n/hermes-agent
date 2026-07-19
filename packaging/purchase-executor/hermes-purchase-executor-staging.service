@@ -39,7 +39,14 @@ NoNewPrivileges=yes
 PrivateTmp=yes
 PrivateDevices=yes
 ProtectSystem=strict
-ProtectHome=read-only
+# Home hidden (tmpfs); only the needed runtime subtrees bind-mounted read-only.
+# Staging additionally needs the Cogitator checkout (the harness imports
+# governance to seed a temp DB and run the in-process bridge).
+ProtectHome=tmpfs
+BindReadOnlyPaths=/home/v0id/.hermes/hermes-agent
+BindReadOnlyPaths=/home/v0id/.local/share/uv
+BindReadOnlyPaths=/home/v0id/.cache/ms-playwright
+BindReadOnlyPaths=/home/v0id/Projects/Cogitator_clean
 StateDirectory=hermes-purchase-executor
 StateDirectoryMode=0700
 UMask=0077
