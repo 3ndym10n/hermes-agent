@@ -30,11 +30,14 @@ fi
 install -o root -g root -m 644 "$HERE/hermes-purchase-executor.service" /etc/systemd/system/
 install -o root -g root -m 644 "$HERE/hermes-purchase-executor-staging.service" /etc/systemd/system/
 systemctl daemon-reload
-# Explicitly keep both units disabled + stopped.
-systemctl disable hermes-purchase-executor.service 2>/dev/null || true
-systemctl disable hermes-purchase-executor-staging.service 2>/dev/null || true
+# Both units are STATIC (no [Install] section) — inherently inert: they cannot be
+# enabled to run at boot and only run when explicitly started. `systemctl disable`
+# is a no-op error on static units, so we don't call it. Belt-and-braces: ensure
+# neither is currently active.
+systemctl stop hermes-purchase-executor.service 2>/dev/null || true
+systemctl stop hermes-purchase-executor-staging.service 2>/dev/null || true
 
-echo "installed inert. Units are disabled. No credentials staged. Next:"
+echo "installed inert. Units are static (not bootable) and inactive. No credentials staged. Next:"
 echo "  1. edit $ETC/executor.env (COGITATOR_BRIDGE_URL)"
 echo "  2. stage-synthetic-credentials.sh   (staging only)"
 echo "  3. doctor.sh                         (verify)"
