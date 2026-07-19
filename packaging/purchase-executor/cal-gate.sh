@@ -43,8 +43,14 @@ case "${1:-}" in
       echo "STAGING: did not observe PASS — inspect the journal above." >&2
     fi
     echo "--- production unit still inert? ---"
-    systemctl is-enabled hermes-purchase-executor >/dev/null 2>&1 && echo "WARN prod ENABLED" || echo "prod unit disabled (good)"
-    systemctl is-active  hermes-purchase-executor >/dev/null 2>&1 && echo "WARN prod ACTIVE"  || echo "prod unit inactive (good)"
+    # Classify by STATE VALUE, not exit code: a static unit's is-enabled exits 0
+    # while printing "static" (inert). Only bootable states are a problem.
+    prod_state="$(systemctl is-enabled hermes-purchase-executor 2>/dev/null || true)"
+    case "$prod_state" in
+      enabled|enabled-runtime|alias|linked|linked-runtime) echo "WARN prod BOOTABLE ($prod_state)";;
+      *) echo "prod unit not bootable (${prod_state:-unknown}) (good)";;
+    esac
+    if systemctl is-active --quiet hermes-purchase-executor; then echo "WARN prod ACTIVE"; else echo "prod unit inactive (good)"; fi
     ;;
   rollback)
     "$HERE/uninstall.sh" "${2:-}"

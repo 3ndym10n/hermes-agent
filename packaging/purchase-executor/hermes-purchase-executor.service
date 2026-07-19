@@ -42,7 +42,15 @@ NoNewPrivileges=yes
 PrivateTmp=yes
 PrivateDevices=yes
 ProtectSystem=strict
-ProtectHome=read-only
+# The whole human home is hidden (tmpfs), then ONLY the exact runtime subtrees
+# the executor needs are bind-mounted back read-only. This gives the dedicated
+# service user access to the checkout + interpreter + browser WITHOUT any ACL on
+# /home/v0id and without weakening isolation (stronger than read-only). All bind
+# sources are world-readable; the installer verifies that.
+ProtectHome=tmpfs
+BindReadOnlyPaths=/home/v0id/.hermes/hermes-agent
+BindReadOnlyPaths=/home/v0id/.local/share/uv
+BindReadOnlyPaths=/home/v0id/.cache/ms-playwright
 StateDirectory=hermes-purchase-executor
 StateDirectoryMode=0700
 UMask=0077
