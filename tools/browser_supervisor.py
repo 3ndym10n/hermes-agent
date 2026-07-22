@@ -466,6 +466,7 @@ class CDPSupervisor:
         self,
         expression: str,
         *,
+        frame_id: Optional[str] = None,
         return_by_value: bool = True,
         await_promise: bool = True,
         timeout: float = 10.0,
@@ -492,22 +493,48 @@ class CDPSupervisor:
             if not self._active:
                 return {"ok": False, "error": "supervisor is not active"}
             session_id = self._page_session_id
+            frame = self._frames.get(frame_id) if frame_id else None
 
         if not session_id:
             return {"ok": False, "error": "supervisor has no attached page session"}
+        if frame_id and frame is None:
+            return {"ok": False, "error": f"frame_id {frame_id!r} not found"}
+
+        child_session_id = (
+            frame.cdp_session_id
+            if frame is not None and frame.is_oopif
+            else None
+        )
+        if frame is not None and frame.is_oopif and not child_session_id:
+            return {"ok": False, "error": f"frame_id {frame_id!r} has no active CDP session"}
 
         async def _do_eval(by_value: bool) -> Dict[str, Any]:
+            context_id = None
+            target_session_id = child_session_id or session_id
+            if frame is not None and frame.parent_frame_id and not frame.is_oopif:
+                world = await self._cdp(
+                    "Page.createIsolatedWorld",
+                    {"frameId": frame.frame_id, "worldName": "hermes-semantic-discovery"},
+                    session_id=session_id,
+                    timeout=timeout,
+                )
+                context_id = world.get("result", {}).get("executionContextId")
+                if not context_id:
+                    raise RuntimeError(f"could not create context for frame_id {frame.frame_id!r}")
+            params: Dict[str, Any] = {
+                "expression": expression,
+                "returnByValue": by_value,
+                "awaitPromise": await_promise,
+                # userGesture matters for things like clipboard / fullscreen
+                # APIs that require a user-activation context.
+                "userGesture": True,
+            }
+            if context_id is not None:
+                params["contextId"] = context_id
             return await self._cdp(
                 "Runtime.evaluate",
-                {
-                    "expression": expression,
-                    "returnByValue": by_value,
-                    "awaitPromise": await_promise,
-                    # userGesture matters for things like clipboard / fullscreen
-                    # APIs that require a user-activation context.
-                    "userGesture": True,
-                },
-                session_id=session_id,
+                params,
+                session_id=target_session_id,
                 timeout=timeout,
             )
 
@@ -718,11 +745,44 @@ class CDPSupervisor:
             {"autoAttach": True, "waitForDebuggerOnStart": False, "flatten": True},
             session_id=self._page_session_id,
         )
+        tree = await self._cdp("Page.getFrameTree", session_id=self._page_session_id)
+        self._record_frame_tree(tree.get("result", {}).get("frameTree"), self._page_session_id)
         # Install the dialog bridge — overrides native alert/confirm/prompt with
         # a synchronous XHR we intercept via Fetch domain. This is how we make
         # dialog response work on Browserbase (whose CDP proxy auto-dismisses
         # real native dialogs before we can call handleJavaScriptDialog).
         await self._install_dialog_bridge(self._page_session_id)
+
+    def _record_frame_tree(self, node: Optional[Dict[str, Any]], page_session_id: str) -> None:
+        """Seed current frames after attaching to an already-loaded page."""
+        if not node:
+            return
+
+        def visit(item: Dict[str, Any], parent_id: Optional[str] = None) -> None:
+            raw = item.get("frame") or {}
+            frame_id = raw.get("id")
+            if not frame_id:
+                return
+            with self._state_lock:
+                existing = self._frames.get(frame_id)
+                is_top = not (raw.get("parentId") or parent_id)
+                self._frames[frame_id] = FrameInfo(
+                    frame_id=frame_id,
+                    url=str(raw.get("url") or ""),
+                    origin=str(raw.get("securityOrigin") or raw.get("origin") or ""),
+                    parent_frame_id=raw.get("parentId") or parent_id,
+                    is_oopif=bool(existing.is_oopif if existing else False),
+                    cdp_session_id=(
+                        existing.cdp_session_id
+                        if existing and existing.cdp_session_id
+                        else page_session_id if is_top else None
+                    ),
+                    name=str(raw.get("name") or (existing.name if existing else "")),
+                )
+            for child in item.get("childFrames") or []:
+                visit(child, frame_id)
+
+        visit(node)
 
     async def _install_dialog_bridge(self, session_id: str) -> None:
         """Install the dialog-bridge init script + Fetch interceptor on a session.

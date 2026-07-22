@@ -2191,16 +2191,24 @@ def _run_browser_command(
                     return {"success": False, "error": "Sensitive browser evaluation failed"}
                 try:
                     envelope = json.loads(stdout)
-                    raw_result = envelope.get("data", {}).get("result")
-                    fill_result = (
-                        json.loads(raw_result) if isinstance(raw_result, str) else raw_result
-                    )
-                    if (
-                        envelope.get("success") is not True
-                        or not isinstance(fill_result, dict)
-                        or not isinstance(fill_result.get("ok"), bool)
-                    ):
-                        raise ValueError
+                    if command == "batch":
+                        if not isinstance(envelope, list) or not envelope or not all(
+                            isinstance(item, dict) and isinstance(item.get("success"), bool)
+                            for item in envelope
+                        ):
+                            raise ValueError
+                        fill_result = {"ok": all(item["success"] for item in envelope)}
+                    else:
+                        raw_result = envelope.get("data", {}).get("result")
+                        fill_result = (
+                            json.loads(raw_result) if isinstance(raw_result, str) else raw_result
+                        )
+                        if (
+                            envelope.get("success") is not True
+                            or not isinstance(fill_result, dict)
+                            or not isinstance(fill_result.get("ok"), bool)
+                        ):
+                            raise ValueError
                 except (AttributeError, json.JSONDecodeError, TypeError, ValueError):
                     return {"success": False, "error": "Sensitive browser evaluation failed"}
                 safe_result = json.dumps({"ok": fill_result["ok"]})

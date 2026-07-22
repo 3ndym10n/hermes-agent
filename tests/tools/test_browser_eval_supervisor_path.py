@@ -247,6 +247,9 @@ def _make_supervisor_with_cdp(cdp_response):
 
     thread = threading.Thread(target=_runner, daemon=True)
     thread.start()
+    ready = threading.Event()
+    loop.call_soon_threadsafe(ready.set)
+    assert ready.wait(timeout=2), "mock supervisor loop did not start"
 
     async def _fake_cdp(method, params=None, *, session_id=None, timeout=10.0):
         return cdp_response
@@ -260,6 +263,81 @@ def _make_supervisor_with_cdp(cdp_response):
 def _stop_supervisor(sup):
     sup._loop.call_soon_threadsafe(sup._loop.stop)
     sup._thread.join(timeout=2)
+
+
+class TestEvaluateRuntimeFrameRouting:
+    def test_oopif_uses_exact_child_session(self):
+        from tools.browser_supervisor import FrameInfo
+
+        sup = _make_supervisor_with_cdp({})
+        calls = []
+
+        async def fake_cdp(method, params=None, *, session_id=None, timeout=10.0):
+            calls.append((method, params, session_id))
+            return {"result": {"result": {"type": "string", "value": "hosted"}}}
+
+        sup._cdp = fake_cdp
+        sup._frames = {
+            "hosted-frame": FrameInfo(
+                frame_id="hosted-frame",
+                url="https://processor.example/fields",
+                origin="https://processor.example",
+                parent_frame_id="main-frame",
+                is_oopif=True,
+                cdp_session_id="child-session",
+            )
+        }
+        try:
+            out = sup.evaluate_runtime("location.origin", frame_id="hosted-frame")
+            assert out == {"ok": True, "result": "hosted", "result_type": "string"}
+            assert calls == [(
+                "Runtime.evaluate",
+                {
+                    "expression": "location.origin",
+                    "returnByValue": True,
+                    "awaitPromise": True,
+                    "userGesture": True,
+                },
+                "child-session",
+            )]
+        finally:
+            _stop_supervisor(sup)
+
+    def test_same_process_frame_uses_isolated_world(self):
+        from tools.browser_supervisor import FrameInfo
+
+        sup = _make_supervisor_with_cdp({})
+        calls = []
+
+        async def fake_cdp(method, params=None, *, session_id=None, timeout=10.0):
+            calls.append((method, params, session_id))
+            if method == "Page.createIsolatedWorld":
+                return {"result": {"executionContextId": 42}}
+            return {"result": {"result": {"type": "string", "value": "embedded"}}}
+
+        sup._cdp = fake_cdp
+        sup._frames = {
+            "embedded-frame": FrameInfo(
+                frame_id="embedded-frame",
+                url="https://merchant.example/fields",
+                origin="https://merchant.example",
+                parent_frame_id="main-frame",
+                is_oopif=False,
+            )
+        }
+        try:
+            out = sup.evaluate_runtime("location.origin", frame_id="embedded-frame")
+            assert out["ok"] is True
+            assert calls[0] == (
+                "Page.createIsolatedWorld",
+                {"frameId": "embedded-frame", "worldName": "hermes-semantic-discovery"},
+                "test-session-id",
+            )
+            assert calls[1][0] == "Runtime.evaluate"
+            assert calls[1][1]["contextId"] == 42
+            assert calls[1][2] == "test-session-id"
+        finally:
+            _stop_supervisor(sup)
 
 
 class TestEvaluateRuntimeResponseShaping:

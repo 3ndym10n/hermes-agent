@@ -13,15 +13,17 @@ import subprocess
 import urllib.error
 import urllib.request
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+import purchase_discovery as discovery
 import purchase_executor as pe
 import purchase_merchants
 
 # Tests exercise the real Porkbun adapter (production mode) against a fake
 # browser: the claimed domain is porkbun.com so adapter_for() resolves, and the
-# fake fill_fields records the ordered (selector, value) pairs without a DOM.
+# fake fill_fields records the ordered semantic plan and synthetic values without a DOM.
 MERCHANT = "porkbun.com"
 
 CLAIM = {
@@ -67,14 +69,58 @@ CONFIRM_PAGE = {
 }
 
 
+def _match(field, locator_kind, locator_value, *, confidence=100):
+    return discovery.Match(
+        field=field,
+        frame_path=(),
+        frame_origin=f"https://{MERCHANT}",
+        form_key="form#payment",
+        form_action_origin=f"https://{MERCHANT}",
+        locator_kind=locator_kind,
+        locator_value=locator_value,
+        role="button" if field == "submit" else "textbox",
+        type="button" if field == "submit" else "text",
+        name=field,
+        id="",
+        autocomplete={
+            "card_number": "cc-number", "card_expiry": "cc-exp",
+            "card_cvv": "cc-csc", "card_name": "cc-name", "submit": "",
+        }[field],
+        accessible_name="Pay now" if field == "submit" else field,
+        confidence=confidence,
+    )
+
+
+DISCOVERY_PLAN = discovery.DiscoveryPlan(
+    page_origin=f"https://{MERCHANT}",
+    frame_origins=(),
+    fields=tuple(
+        _match(field, "css", f'[autocomplete~="{autocomplete}"]')
+        for field, autocomplete in (
+            ("card_number", "cc-number"),
+            ("card_expiry", "cc-exp"),
+            ("card_cvv", "cc-csc"),
+            ("card_name", "cc-name"),
+        )
+    ),
+    submit=_match("submit", "role", "Pay now"),
+)
+
+
 class FakeBrowser:
     def __init__(self, pages=None, nav_success=True, fill_ok=True, submit_ok=True,
-                 on_eval=None):
+                 on_eval=None, plan=DISCOVERY_PLAN, discovery_error=None,
+                 frame_signals=None):
         self.pages = pages or [CHECKOUT_PAGE, CONFIRM_PAGE]
         self.nav_success = nav_success
         self.fill_ok = fill_ok
         self.submit_ok = submit_ok
         self.on_eval = on_eval
+        self.plan = plan
+        self.discovery_error = discovery_error
+        self.frame_signals = frame_signals or {
+            "ok": True, "challenge": False, "uncertain": False,
+        }
         self.calls = []
         self.cleaned = []
         self.index = 0
@@ -84,26 +130,38 @@ class FakeBrowser:
         self.calls.append(("navigate", url))
         return {"success": self.nav_success}
 
-    def fill_fields(self, task_id, ordered_fields):
+    def discover(self, task_id, canonical_domain, adapter, fake_e2e, extra_origins=(),
+                 bind_controls=True):
+        self.calls.append(("discover", bind_controls))
+        if self.discovery_error:
+            raise self.discovery_error
+        return self.plan
+
+    def fill_fields(self, task_id, plan, values):
         if self.on_eval:
             self.on_eval(self)
-        self.calls.append(("fill", ordered_fields))
+        self.calls.append(("fill", (plan, dict(values))))
         if self.fill_ok:
             self._filled = True
         return {"success": True, "result": {"ok": self.fill_ok}}
 
+    def submit(self, task_id, plan):
+        self.calls.append(("submit", plan))
+        if self.submit_ok:
+            self.index = 1
+        return {"success": True, "result": {"ok": self.submit_ok}}
+
     def eval_js(self, expression, task_id):
         if self.on_eval:
             self.on_eval(self)
-        if ".click()" in expression:  # submit_expression clicks the submit control
-            self.calls.append(("submit", ""))
-            if self.submit_ok:
-                self.index = 1
-            return {"success": True, "result": {"ok": self.submit_ok}}
         self.calls.append(("probe", ""))
         page = dict(self.pages[self.index])
         page["filled"] = self._filled
         return {"success": True, "result": page}
+
+    def signals(self, task_id, plan, extra_origins=()):
+        self.calls.append(("signals", dict(self.frame_signals)))
+        return dict(self.frame_signals)
 
     def cleanup(self, task_id):
         self.cleaned.append(task_id)
@@ -175,16 +233,15 @@ def test_happy_path_completes_once(tmp_path, creds):
     assert completion["merchant_display_name"] == "Fake Registrar"
     assert completion["final_amount"] == "22.00"
     assert completion["merchant_domain"] == MERCHANT
-    # Genuine input: fill went through fill_fields with Porkbun's selectors,
-    # in card-field order, carrying the credential values (never el.value).
+    # Generic plan, not merchant selectors, drives genuine browser input.
     fill_calls = [payload for kind, payload in browser.calls if kind == "fill"]
     assert len(fill_calls) == 1
-    assert fill_calls[0] == [
-        (purchase_merchants.PORKBUN.selectors[f],
-         {"card_number": "4242424242424242", "card_expiry": "12/29",
-          "card_cvv": "123", "card_name": "Fake Holder"}[f])
-        for f in purchase_merchants.CARD_FIELDS
-    ]
+    used_plan, values = fill_calls[0]
+    assert used_plan.fingerprint == DISCOVERY_PLAN.fingerprint
+    assert values == {
+        "card_number": "4242424242424242", "card_expiry": "12/29",
+        "card_cvv": "123", "card_name": "Fake Holder",
+    }
     receipt_path = tmp_path / "state" / completion["receipt"]["restricted_artifact_path"]
     assert receipt_path.is_file()
     assert stat.S_IMODE(receipt_path.stat().st_mode) == 0o600
@@ -250,8 +307,20 @@ def test_check_terms_currency_item_quantity_recurrence():
     )
 
 
-def test_captcha_before_submit_is_definitive_failure(tmp_path, creds):
-    page = dict(CHECKOUT_PAGE, text=CHECKOUT_TEXT + "\nPlease solve this CAPTCHA")
+def test_control_binding_is_disabled_after_credentials_are_filled(tmp_path, creds):
+    browser, bridge = FakeBrowser(), FakeBridge()
+    assert run(browser, bridge, tmp_path) == pe.EXIT_COMPLETED
+    assert [value for kind, value in browser.calls if kind == "discover"] == [
+        True, True, False
+    ]
+
+
+@pytest.mark.parametrize("challenge", [
+    "Please solve this CAPTCHA",
+    "MFA verification code required",
+])
+def test_challenge_before_submit_is_definitive_failure(tmp_path, creds, challenge):
+    page = dict(CHECKOUT_PAGE, text=CHECKOUT_TEXT + "\n" + challenge)
     browser, bridge = FakeBrowser(pages=[page, CONFIRM_PAGE]), FakeBridge()
     assert run(browser, bridge, tmp_path) == pe.EXIT_DEFINITIVE_FAILURE
     assert terminal_calls(bridge)[0][1]["failure_category"] == "human_challenge_required"
@@ -265,6 +334,35 @@ def test_3ds_after_submit_is_uncertain(tmp_path, creds):
     action, context = terminal_calls(bridge)[0]
     assert action == "record_uncertain_result"
     assert context["failure_category"] == "post_submit_challenge"
+    assert [kind for kind, _ in browser.calls].count("submit") == 1
+
+
+def test_challenge_precedes_simultaneous_success(tmp_path, creds):
+    after = dict(
+        CONFIRM_PAGE,
+        text="Order confirmed. 3-D Secure authentication required.",
+    )
+    browser, bridge = FakeBrowser(pages=[CHECKOUT_PAGE, after]), FakeBridge()
+    assert run(browser, bridge, tmp_path) == pe.EXIT_UNCERTAIN
+    assert terminal_calls(bridge)[0][1]["failure_category"] == "post_submit_challenge"
+
+
+def test_hosted_3ds_precedes_main_frame_success(tmp_path, creds):
+    browser = FakeBrowser(frame_signals={
+        "ok": True, "challenge": False, "uncertain": True,
+    })
+    bridge = FakeBridge()
+    assert run(browser, bridge, tmp_path) == pe.EXIT_UNCERTAIN
+    assert terminal_calls(bridge)[0][1]["failure_category"] == "post_submit_challenge"
+    assert [kind for kind, _ in browser.calls].count("submit") == 1
+
+
+def test_post_submit_wrong_origin_is_uncertain_even_with_success(tmp_path, creds):
+    redirected = dict(CONFIRM_PAGE, url="https://evil.example/confirmed")
+    browser = FakeBrowser(pages=[CHECKOUT_PAGE, redirected])
+    bridge = FakeBridge()
+    assert run(browser, bridge, tmp_path) == pe.EXIT_UNCERTAIN
+    assert terminal_calls(bridge)[0][1]["failure_category"] == "post_submit_wrong_origin"
     assert [kind for kind, _ in browser.calls].count("submit") == 1
 
 
@@ -320,7 +418,6 @@ def test_no_snapshots_no_model_no_credstore():
     # No JavaScript value assignment anywhere: production fill uses genuine
     # browser input (agent-browser fill via batch), never `element.value = ...`.
     assert ".value" not in pe.PAGE_PROBE_JS
-    assert ".value" not in pe.submit_expression("button[type='submit']", "porkbun.com", False)
     assert ".value =" not in source and ".value=" not in source
     assert "el.value" not in source
 
@@ -377,21 +474,24 @@ def test_unhandled_exception_reports_once_and_cleans_up(tmp_path, creds):
     assert "synthetic card_name" not in (tmp_path / "state" / "audit.jsonl").read_text()
 
 
-def test_form_action_and_post_fill_origin_are_rejected(tmp_path, creds):
-    external_form = dict(CHECKOUT_PAGE, form_action="https://evil.example/pay")
-    browser, bridge = FakeBrowser(pages=[external_form, CONFIRM_PAGE]), FakeBridge()
+def test_discovery_and_post_fill_origin_are_rejected(tmp_path, creds):
+    browser = FakeBrowser(discovery_error=discovery.DiscoveryError(
+        "wrong_origin", "payment_frame_origin_rejected"
+    ))
+    bridge = FakeBridge()
     assert run(browser, bridge, tmp_path) == pe.EXIT_DEFINITIVE_FAILURE
+    assert terminal_calls(bridge)[0][1]["failure_category"] == "wrong_origin"
     assert "fill" not in [kind for kind, _ in browser.calls]
 
-    # A redirect to a different registrable domain that happens during fill is
+    # A redirect to a different origin that happens during fill is
     # caught by the post-fill origin re-check before any submit.
     redirected = dict(CHECKOUT_PAGE, url="https://evil.example/pay")
     browser = FakeBrowser(pages=[CHECKOUT_PAGE, CONFIRM_PAGE])
     bridge = FakeBridge()
     original_fill = browser.fill_fields
 
-    def redirect_after_fill(task_id, ordered_fields):
-        result = original_fill(task_id, ordered_fields)
+    def redirect_after_fill(task_id, plan, values):
+        result = original_fill(task_id, plan, values)
         browser.pages[0] = redirected  # page navigates away post-fill
         return result
 
@@ -452,6 +552,20 @@ def test_sigterm_during_claim_audit_cleans_up_and_reports(tmp_path, creds):
     assert terminal_calls(bridge)[0][1]["failure_category"] == "terminated_before_submit"
     assert browser.cleaned == ["purchase_pt_test"]
 
+
+
+def test_checkout_not_ready_precedes_credential_access(tmp_path, creds, monkeypatch):
+    def explode():
+        raise AssertionError("credentials must not be read before discovery passes")
+
+    monkeypatch.setattr(pe, "load_payment_fields", explode)
+    browser = FakeBrowser(discovery_error=discovery.DiscoveryError(
+        "checkout_not_ready", "card_number_ambiguous"
+    ))
+    bridge = FakeBridge()
+    assert run(browser, bridge, tmp_path) == pe.EXIT_DEFINITIVE_FAILURE
+    assert terminal_calls(bridge)[0][1]["failure_category"] == "checkout_not_ready"
+    assert "fill" not in [kind for kind, _ in browser.calls]
 
 def test_missing_credentials_directory_stops_before_fill(tmp_path, monkeypatch):
     monkeypatch.delenv("CREDENTIALS_DIRECTORY", raising=False)
@@ -521,6 +635,246 @@ def test_sensitive_browser_eval_uses_stdin_and_scrubs_env(monkeypatch):
     monkeypatch.setattr(bt, "browser_navigate", fake_navigate)
     pe.real_browser().navigate("https://registrar.example", "purchase_x")
     assert os.environ["COGITATOR_BRIDGE_TOKEN"] == "bridge-secret"
+
+
+@pytest.mark.parametrize(
+    "hosted,main_frames,expected",
+    [
+        (
+            {
+                "fields": [{
+                    "visible": True,
+                    "enabled": True,
+                    "autocomplete": "one-time-code",
+                    "accessible_name": "Code",
+                }],
+                "frames": [],
+            },
+            None,
+            {"challenge": True},
+        ),
+        (
+            {
+                "fields": [],
+                "frames": [{
+                    "selector": "iframe#captcha",
+                    "src": "https://www.google.com/recaptcha/api2/anchor",
+                    "hint": "",
+                    "visible": True,
+                }],
+            },
+            None,
+            {"challenge": True},
+        ),
+        (
+            None,
+            [{
+                "selector": "iframe#unknown",
+                "src": "https://js.stripe.com/v3/fields",
+                "hint": "",
+                "visible": True,
+            }],
+            {"uncertain": True},
+        ),
+    ],
+    ids=["metadata-only-mfa", "nested-captcha", "source-only-wrong-processor"],
+)
+def test_post_submit_signals_use_metadata_and_frame_src(
+    monkeypatch, hosted, main_frames, expected
+):
+    from tools.browser_supervisor import SUPERVISOR_REGISTRY
+
+    processor = "https://pay.processor.example"
+    frame_selector = "iframe#hosted"
+    frames = main_frames if main_frames is not None else [{
+        "selector": frame_selector,
+        "src": f"{processor}/fields",
+        "hint": "Secure payment fields",
+        "visible": True,
+    }]
+    main = {
+        "url": f"https://{MERCHANT}/confirmed",
+        "fields": [],
+        "submits": [],
+        "frames": frames,
+        "challenge": False,
+        "uncertain": False,
+    }
+    if hosted is not None:
+        hosted = {
+            "url": f"{processor}/fields",
+            "submits": [],
+            "challenge": False,
+            "uncertain": False,
+            **hosted,
+        }
+
+    class Supervisor:
+        def snapshot(self):
+            children = [] if hosted is None else [{
+                "frame_id": "hosted",
+                "parent_frame_id": "main",
+                "url": hosted["url"],
+                "origin": processor,
+                "is_oopif": True,
+                "session_id": "child",
+            }]
+            return SimpleNamespace(frame_tree={
+                "top": {
+                    "frame_id": "main",
+                    "url": main["url"],
+                    "origin": f"https://{MERCHANT}",
+                    "is_oopif": False,
+                },
+                "children": children,
+                "truncated": False,
+            })
+
+        def evaluate_runtime(self, expression, frame_id=None):
+            payload = hosted if frame_id == "hosted" else main
+            return {"ok": True, "result": json.dumps(payload)}
+
+    monkeypatch.setattr(SUPERVISOR_REGISTRY, "get", lambda *args: Supervisor())
+    plan = discovery.DiscoveryPlan(
+        page_origin=f"https://{MERCHANT}",
+        frame_origins=(processor,) if hosted is not None else (),
+        fields=DISCOVERY_PLAN.fields,
+        submit=DISCOVERY_PLAN.submit,
+    )
+    result = pe.real_browser().signals("purchase_x", plan)
+    assert result["ok"] is True
+    for key, value in expected.items():
+        assert result[key] is value
+
+
+def test_hosted_ref_must_focus_inside_exact_discovered_frame(monkeypatch):
+    from tools import browser_tool as bt
+    from tools.browser_supervisor import SUPERVISOR_REGISTRY
+
+    processor = "https://pay.processor.example"
+    frame_selector = "iframe#hosted"
+    autocompletes = {
+        "card_number": "cc-number",
+        "card_expiry": "cc-exp",
+        "card_cvv": "cc-csc",
+        "card_name": "cc-name",
+    }
+
+    def raw_field(field):
+        return {
+            "selector": f"input#{field}",
+            "role": "textbox",
+            "type": "text",
+            "name": field,
+            "id": field,
+            "autocomplete": autocompletes[field],
+            "accessible_name": field,
+            "visible": True,
+            "enabled": True,
+            "readonly": False,
+            "form_key": "form#hosted",
+            "form_action": f"{processor}/tokenize",
+            "form_context": True,
+        }
+
+    main = {
+        "url": f"https://{MERCHANT}/checkout",
+        "fields": [],
+        "submits": [{
+            "selector": "button#pay",
+            "role": "button",
+            "type": "submit",
+            "name": "",
+            "id": "pay",
+            "autocomplete": "",
+            "accessible_name": "Pay now",
+            "visible": True,
+            "enabled": True,
+            "readonly": False,
+            "form_key": "form#payment",
+            "form_action": f"https://{MERCHANT}/pay",
+            "form_context": True,
+        }],
+        "frames": [{
+            "selector": frame_selector,
+            "src": f"{processor}/fields",
+            "hint": "Secure payment fields",
+            "visible": True,
+        }],
+        "challenge": False,
+    }
+    hosted = {
+        "url": f"{processor}/fields",
+        "fields": [raw_field(field) for field in discovery.FIELD_NAMES],
+        "submits": [],
+        "frames": [],
+        "challenge": False,
+    }
+
+    class Supervisor:
+        focused = ""
+
+        def snapshot(self):
+            return SimpleNamespace(frame_tree={
+                "top": {
+                    "frame_id": "main",
+                    "url": main["url"],
+                    "origin": f"https://{MERCHANT}",
+                    "is_oopif": False,
+                },
+                "children": [{
+                    "frame_id": "hosted",
+                    "parent_frame_id": "main",
+                    "url": hosted["url"],
+                    "origin": processor,
+                    "is_oopif": True,
+                    "session_id": "child",
+                }],
+                "truncated": False,
+            })
+
+        def evaluate_runtime(self, expression, frame_id=None):
+            if expression == discovery.DISCOVERY_JS:
+                payload = hosted if frame_id == "hosted" else main
+                return {"ok": True, "result": json.dumps(payload)}
+            if expression == "document.activeElement?.blur(); true":
+                return {"ok": True, "result": True}
+            if expression == "location.origin":
+                return {
+                    "ok": True,
+                    "result": processor if frame_id == "hosted" else f"https://{MERCHANT}",
+                }
+            # @wrong-card has the right role/name globally but focused a control
+            # outside the exact hosted frame, so its frame-local active proof fails.
+            return {"ok": True, "result": self.focused != "@wrong-card"}
+
+    supervisor = Supervisor()
+
+    def fake_run(task_id, command, args, **kwargs):
+        if command == "get":
+            return {"success": True, "data": {"cdpUrl": "ws://127.0.0.1:9222/devtools/browser/x"}}
+        if command == "snapshot":
+            refs = {
+                "wrong-card": {"role": "textbox", "name": "card_number"},
+                "expiry": {"role": "textbox", "name": "card_expiry"},
+                "cvv": {"role": "textbox", "name": "card_cvv"},
+                "name": {"role": "textbox", "name": "card_name"},
+            }
+            return {"success": True, "data": {"refs": refs}}
+        if command == "focus":
+            supervisor.focused = args[0]
+            return {"success": True}
+        raise AssertionError(command)
+
+    monkeypatch.setattr(bt, "_run_browser_command", fake_run)
+    monkeypatch.setattr(SUPERVISOR_REGISTRY, "get_or_start", lambda *args: supervisor)
+    monkeypatch.setattr(SUPERVISOR_REGISTRY, "get", lambda *args: supervisor)
+    adapter = SimpleNamespace(
+        processor_origins=(processor,), field_hints={}, submit_hints=(),
+    )
+    with pytest.raises(discovery.DiscoveryError) as error:
+        pe.real_browser().discover("purchase_x", MERCHANT, adapter, False)
+    assert error.value.reason == "card_number_ref_wrong_frame"
 
 
 def test_sensitive_browser_output_is_discarded(tmp_path, monkeypatch, caplog):
@@ -600,6 +954,42 @@ def test_sensitive_browser_result_is_strictly_whitelisted(tmp_path, monkeypatch,
     assert marker not in json.dumps(result)
     assert marker not in caplog.text
 
+
+
+def test_sensitive_batch_result_is_strictly_whitelisted(tmp_path, monkeypatch, caplog):
+    from tools import browser_tool as bt
+
+    marker = "4111111111111111 Fake Holder 123 12/29"
+
+    class FakeProcess:
+        returncode = 0
+
+        def __init__(self, stdout):
+            self.stdout = stdout
+
+        def communicate(self, input=None, timeout=None):
+            self.stdout.write(json.dumps([
+                {"success": True, "data": {"value": marker}},
+                {"success": False, "error": marker},
+            ]).encode())
+
+        def kill(self):
+            pass
+
+    monkeypatch.setattr(bt, "_find_agent_browser", lambda: "/bin/agent-browser")
+    monkeypatch.setattr(bt, "_chromium_installed", lambda: True)
+    monkeypatch.setattr(bt, "_is_local_mode", lambda: True)
+    monkeypatch.setattr(bt, "_get_session_info", lambda task_id: {"session_name": "h_test"})
+    monkeypatch.setattr(bt, "_socket_safe_tmpdir", lambda: str(tmp_path))
+    monkeypatch.setattr(bt, "_write_owner_pid", lambda *args: None)
+    monkeypatch.setattr(bt.subprocess, "Popen", lambda args, **kwargs: FakeProcess(kwargs["stdout"]))
+    result = bt._run_browser_command(
+        "purchase_x", "batch", ["--json", "--bail"], timeout=1,
+        _stdin_text=marker, _suppress_output=True,
+    )
+    assert result == {"success": True, "data": {"result": '{"ok": false}'}}
+    assert marker not in json.dumps(result)
+    assert marker not in caplog.text
 
 def test_fake_e2e_flag_is_loopback_only():
     assert pe.origin_allowed("http://127.0.0.1:8000/x", "registrar.example", fake_e2e=True)
@@ -684,32 +1074,11 @@ def test_adapter_allowlist_is_porkbun_only():
     assert purchase_merchants.adapter_for("anything", fake_e2e=True) is purchase_merchants.MOCK
 
 
-def test_porkbun_selectors_resolve_against_sanitized_fixture():
-    from html.parser import HTMLParser
-
-    fixture = Path(pe.__file__).parent / "tests" / "fixtures" / "porkbun_checkout_v0.html"
-    html = fixture.read_text()
-
-    class Collector(HTMLParser):
-        def __init__(self):
-            super().__init__()
-            self.input_names = set()
-            self.has_submit = False
-
-        def handle_starttag(self, tag, attrs):
-            a = dict(attrs)
-            if tag == "input" and a.get("name"):
-                self.input_names.add(a["name"])
-            if tag == "button" and a.get("type") == "submit":
-                self.has_submit = True
-
-    collector = Collector()
-    collector.feed(html)
-    for field in purchase_merchants.CARD_FIELDS:
-        selector = purchase_merchants.PORKBUN.selectors[field]
-        name = selector.split("'")[1]  # input[name='X'] -> X
-        assert name in collector.input_names, f"{field} selector {selector} not in fixture"
-    assert collector.has_submit
+def test_merchant_adapter_has_no_primary_selector_map():
+    adapter = purchase_merchants.PORKBUN
+    assert not hasattr(adapter, "selectors")
+    assert adapter.processor_origins == ()
+    assert set((adapter.field_hints or {})).issubset(purchase_merchants.CARD_FIELDS)
 
 
 def test_sanitized_fixture_has_no_secrets():
@@ -727,9 +1096,11 @@ def test_sanitized_fixture_has_no_secrets():
 
 def test_genuine_input_uses_batch_over_stdin_not_argv_or_value_assignment():
     source = Path(pe.__file__).read_text()
-    # Fill is delivered as a batch whose commands (incl. the value) ride stdin.
+    # Fill is delivered as a suppressed-output batch over stdin.
     assert '"batch"' in source
     assert "_stdin_text=json.dumps(commands)" in source
+    assert "_suppress_output=True" in source
+    assert 'match.command("fill"' in source
     # And never element.value assignment.
     assert "el.value" not in source and ".value =" not in source
 

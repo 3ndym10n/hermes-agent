@@ -49,11 +49,12 @@ from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import urlsplit, urlunsplit
 
+import purchase_discovery as discovery
 import purchase_merchants
 
 BRIDGE_PATH = "/api/cogitator_bridge"
 BRIDGE_TOKEN_ENV = "COGITATOR_BRIDGE_TOKEN"
-CREDENTIAL_FIELDS = ("card_number", "card_expiry", "card_cvv", "card_name")
+CREDENTIAL_FIELDS = discovery.FIELD_NAMES
 RECEIPT_PREFIX = "restricted/purchase_receipts"
 DEFAULT_STATE_DIR = "~/.hermes/purchase_executor"
 POST_SUBMIT_WAIT_SECONDS = 20
@@ -128,42 +129,13 @@ def redact_payment_data(value, payment_values: dict):
 PAGE_PROBE_JS = (
     "(() => { const t = document.body ? document.body.innerText : '';"
     " const m = document.querySelector('#merchant, [data-merchant]');"
-    " const f = document.querySelector('form');"
     " return JSON.stringify({url: location.href, text: t.slice(0, 20000),"
     " merchant: (m && m.textContent || document.title || '').trim(),"
-    " has_form: !!f, form_action: f ? f.action : '',"
     " filled: document.documentElement.dataset.hermesPurchaseFilled === '1'}); })()"
 )
-
-def _origin_guard_js(canonical_domain: str, fake_e2e: bool) -> str:
-    return (
-        "const allowed = raw => { try { const u = new URL(raw);"
-        f" const canonical = {json.dumps(canonical_domain.lower())};"
-        f" if ({json.dumps(fake_e2e)}) return ['127.0.0.1','localhost','::1'].includes(u.hostname);"
-        " return u.protocol === 'https:' && u.hostname === canonical;"
-        " } catch { return false; } };"
-    )
-
-
 # Set after a successful genuine-input fill; the post-fill re-probe reads this
 # marker (never the field values) to confirm fill happened and guard double-fill.
 FILLED_MARK_JS = "(document.documentElement.dataset.hermesPurchaseFilled = '1')"
-
-
-def submit_expression(submit_selector: str, canonical_domain: str, fake_e2e: bool) -> str:
-    # Origin-guarded click of the merchant's real submit control. No payment
-    # value is touched here; clicking the button (not form.submit()) triggers
-    # the checkout's real submit handler.
-    return (
-        "(() => {"
-        + _origin_guard_js(canonical_domain, fake_e2e)
-        + " const f = document.querySelector('form');"
-        f" const b = document.querySelector({json.dumps(submit_selector)});"
-        " if (!f || !b || !allowed(location.href) || !allowed(f.action))"
-        " return JSON.stringify({ok: false});"
-        " b.click();"
-        " return JSON.stringify({ok: true}); })()"
-    )
 
 
 CHALLENGE_RE = re.compile(
@@ -210,6 +182,10 @@ class _Stop(Exception):
 
 def real_browser() -> SimpleNamespace:
     from tools import browser_tool as bt
+    from tools.browser_supervisor import SUPERVISOR_REGISTRY
+
+    bindings: dict[tuple[str, str, tuple[str, ...]], str] = {}
+    references: dict[tuple[str, str, str, tuple[str, ...]], str] = {}
 
     def _call(fn, /, *args, **kwargs) -> dict:
         secret_env = {
@@ -225,30 +201,280 @@ def real_browser() -> SimpleNamespace:
         finally:
             os.environ.update(secret_env)
 
-    def fill_fields(task_id, ordered_fields):
-        # Genuine browser text input (Playwright fill via the agent-browser
-        # CLI = Input.insertText under the hood), NOT element.value assignment.
-        # The values ride in the batch JSON delivered over stdin, never argv,
-        # never env; the CLI's stdout echoes selectors + success flags only,
-        # never the inserted values.
-        commands = [["find", "first", sel, "fill", val] for sel, val in ordered_fields]
-        commands.append(["eval", FILLED_MARK_JS])
+    def _supervisor(task_id: str):
+        raw = _call(bt._run_browser_command, task_id, "get", ["cdp-url"])
+        cdp_url = str(raw.get("data", {}).get("cdpUrl") or "") if isinstance(raw, dict) else ""
+        parts = urlsplit(cdp_url)
+        if parts.scheme != "ws" or (parts.hostname or "").lower() not in LOOPBACK_HOSTS:
+            raise discovery.DiscoveryError("checkout_not_ready", "browser_metadata_unavailable")
+        try:
+            return SUPERVISOR_REGISTRY.get_or_start(task_id, cdp_url)
+        except Exception as error:
+            raise discovery.DiscoveryError(
+                "checkout_not_ready", "browser_metadata_unavailable"
+            ) from error
+
+    def _parse_metadata(evaluated: dict) -> dict:
+        raw = evaluated.get("result") if evaluated.get("ok") else None
+        try:
+            parsed = json.loads(raw) if isinstance(raw, str) else raw
+        except json.JSONDecodeError:
+            return {"success": False}
+        return ({"success": True, "result": parsed}
+                if isinstance(parsed, dict) else {"success": False})
+
+    def _context_reader(task_id: str, supervisor):
+        tree = supervisor.snapshot().frame_tree
+        if tree.get("truncated") or not tree.get("top"):
+            return (lambda frame_path: {"success": False}), {}
+        frames = [tree["top"], *(tree.get("children") or [])]
+        frame_ids: dict[tuple[str, ...], str] = {(): tree["top"]["frame_id"]}
+        cache: dict[tuple[str, ...], dict] = {}
+
+        def inspect_context(frame_path: tuple[str, ...]) -> dict:
+            if frame_path in cache:
+                return cache[frame_path]
+            if not frame_path:
+                evaluated = supervisor.evaluate_runtime(discovery.DISCOVERY_JS)
+            else:
+                parent_path = frame_path[:-1]
+                parent = inspect_context(parent_path)
+                if not parent.get("success"):
+                    return {"success": False}
+                descriptors = [
+                    item for item in parent["result"].get("frames") or []
+                    if item.get("selector") == frame_path[-1]
+                ]
+                parent_id = frame_ids.get(parent_path)
+                if len(descriptors) != 1 or not parent_id:
+                    return {"success": False}
+                declared_url = str(descriptors[0].get("src") or "")
+                candidates = [
+                    item for item in frames
+                    if item.get("parent_frame_id") == parent_id
+                    and item.get("url") == declared_url
+                ]
+                if len(candidates) != 1:
+                    return {"success": False}
+                frame_id = str(candidates[0]["frame_id"])
+                frame_ids[frame_path] = frame_id
+                evaluated = supervisor.evaluate_runtime(
+                    discovery.DISCOVERY_JS, frame_id=frame_id
+                )
+            result = _parse_metadata(evaluated)
+            cache[frame_path] = result
+            return result
+
+        return inspect_context, frame_ids
+
+    def _reference_is_exact(task_id: str, plan, match, ref: str) -> bool:
+        supervisor = SUPERVISOR_REGISTRY.get(task_id)
+        frame_id = bindings.get((task_id, plan.fingerprint, match.frame_path))
+        if supervisor is None or not frame_id:
+            return False
+        target = frame_id if match.frame_path else None
+        cleared = supervisor.evaluate_runtime(
+            "document.activeElement?.blur(); true", frame_id=target
+        )
+        focused = _call(bt._run_browser_command, task_id, "focus", [ref])
+        active = supervisor.evaluate_runtime(match.active_expression(), frame_id=target)
+        exact_origin = supervisor.evaluate_runtime("location.origin", frame_id=target)
+        return bool(
+            cleared.get("ok")
+            and focused.get("success")
+            and active.get("ok")
+            and active.get("result") is True
+            and exact_origin.get("ok")
+            and exact_origin.get("result") == match.frame_origin
+        )
+
+    def _bind_references(task_id: str, plan) -> None:
+        raw = _call(bt._run_browser_command, task_id, "snapshot", ["-i"])
+        refs = raw.get("data", {}).get("refs", {}) if isinstance(raw, dict) else {}
+        if not raw.get("success") or not isinstance(refs, dict):
+            raise discovery.DiscoveryError("checkout_not_ready", "control_refs_unavailable")
+        for match in [*plan.fields, plan.submit]:
+            if not match.frame_path:
+                continue
+            expected_name = " ".join(match.accessible_name.split())
+            candidates = [
+                ref for ref, metadata in refs.items()
+                if isinstance(metadata, dict)
+                and str(metadata.get("role") or "").lower() == match.role.lower()
+                and " ".join(str(metadata.get("name") or "").split()) == expected_name
+            ]
+            if len(candidates) != 1:
+                raise discovery.DiscoveryError(
+                    "checkout_not_ready",
+                    f"{match.field}_ref_{'missing' if not candidates else 'ambiguous'}",
+                )
+            ref = "@" + candidates[0].lstrip("@")
+            if not _reference_is_exact(task_id, plan, match, ref):
+                raise discovery.DiscoveryError(
+                    "checkout_not_ready", f"{match.field}_ref_wrong_frame"
+                )
+            references[(task_id, plan.fingerprint, match.field, match.frame_path)] = ref
+
+    def discover(task_id, canonical_domain, adapter, fake_e2e, extra_origins=(), bind_controls=True):
+        supervisor = _supervisor(task_id)
+        inspect_context, frame_ids = _context_reader(task_id, supervisor)
+        plan = discovery.discover_checkout(
+            inspect_context,
+            canonical_domain=canonical_domain,
+            processor_origins=adapter.processor_origins + tuple(extra_origins),
+            field_hints=adapter.field_hints,
+            submit_hints=adapter.submit_hints,
+            fake_e2e=fake_e2e,
+        )
+        for frame_path, frame_id in frame_ids.items():
+            bindings[(task_id, plan.fingerprint, frame_path)] = frame_id
+        if bind_controls:
+            _bind_references(task_id, plan)
+        return plan
+
+    def _verify_origins(task_id: str, plan) -> bool:
+        supervisor = SUPERVISOR_REGISTRY.get(task_id)
+        if supervisor is None:
+            return False
+        matches = [*plan.fields, plan.submit]
+        checked: set[tuple[tuple[str, ...], str]] = set()
+        for match in matches:
+            key = (match.frame_path, match.frame_origin)
+            if key in checked:
+                continue
+            checked.add(key)
+            frame_id = bindings.get((task_id, plan.fingerprint, match.frame_path))
+            if not frame_id:
+                return False
+            evaluated = supervisor.evaluate_runtime(
+                "location.origin", frame_id=frame_id if match.frame_path else None
+            )
+            if not evaluated.get("ok") or evaluated.get("result") != match.frame_origin:
+                return False
+        return True
+
+    def _frame_commands(match) -> list[list[str]]:
+        commands = [["frame", "main"]]
+        commands.extend(["frame", selector] for selector in match.frame_path)
+        return commands
+
+    def _batch_ok(result: object) -> bool:
+        if isinstance(result, list):
+            return bool(result) and all(
+                isinstance(item, dict) and item.get("success") for item in result
+            )
+        return bool(
+            isinstance(result, dict)
+            and result.get("success")
+            and result.get("data", {}).get("result") == '{"ok": true}'
+        )
+
+    def fill_fields(task_id, plan, values):
+        # Re-focus every hosted ref and prove it lands inside the exact
+        # allowlisted frame before the secret-bearing batch.
+        hosted = []
+        for match in plan.fields:
+            if match.frame_path:
+                ref = references.get(
+                    (task_id, plan.fingerprint, match.field, match.frame_path)
+                )
+                if not ref or not _reference_is_exact(task_id, plan, match, ref):
+                    return {"success": True, "result": {"ok": False}}
+                hosted.append((match, ref))
+        if not _verify_origins(task_id, plan):
+            return {"success": True, "result": {"ok": False}}
+        # Playwright semantic locators and genuine browser fill. Values ride in
+        # batch JSON over stdin, while all child output is discarded.
+        commands = []
+        hosted_refs = {match.field: ref for match, ref in hosted}
+        for match in plan.fields:
+            if match.frame_path:
+                commands.append(["fill", hosted_refs[match.field], values[match.field]])
+            else:
+                commands.extend(_frame_commands(match))
+                commands.append(match.command("fill", values[match.field]))
+        commands.extend([["frame", "main"], ["eval", FILLED_MARK_JS]])
         result = _call(
             bt._run_browser_command,
             task_id,
             "batch",
-            ["--json"],
+            ["--json", "--bail"],
+            _stdin_text=json.dumps(commands),
+            _suppress_output=True,
+        )
+        return {"success": True, "result": {"ok": _batch_ok(result)}}
+
+    def submit(task_id, plan):
+        match = plan.submit
+        if match.frame_path:
+            ref = references.get(
+                (task_id, plan.fingerprint, match.field, match.frame_path)
+            )
+            if not ref or not _reference_is_exact(task_id, plan, match, ref):
+                return {"success": True, "result": {"ok": False}}
+            commands = [["click", ref]]
+        else:
+            commands = _frame_commands(match)
+            commands.append(match.command("click"))
+        if not _verify_origins(task_id, plan):
+            return {"success": True, "result": {"ok": False}}
+        result = _call(
+            bt._run_browser_command,
+            task_id,
+            "batch",
+            ["--json", "--bail"],
             _stdin_text=json.dumps(commands),
         )
-        ok = isinstance(result, list) and bool(result) and all(
-            isinstance(item, dict) and item.get("success") for item in result
-        )
-        return {"success": True, "result": {"ok": ok}}
+        return {"success": True, "result": {"ok": _batch_ok(result)}}
+
+    def signals(task_id, plan, extra_origins=()):
+        supervisor = SUPERVISOR_REGISTRY.get(task_id)
+        if supervisor is None:
+            return {"ok": False}
+        inspect_context, _ = _context_reader(task_id, supervisor)
+        allowed = {plan.page_origin, *plan.frame_origins}
+        allowed.update(discovery.origin(item) for item in extra_origins)
+        queue = [()]
+        seen = 0
+        challenge = uncertain = False
+        while queue:
+            frame_path = queue.pop(0)
+            seen += 1
+            if seen > discovery.MAX_FRAMES:
+                return {"ok": False}
+            inspected = inspect_context(frame_path)
+            if not inspected.get("success"):
+                return {"ok": False}
+            raw = inspected["result"]
+            current_origin = discovery.origin(str(raw.get("url") or ""))
+            if (not frame_path and current_origin != plan.page_origin) or (
+                frame_path and current_origin not in allowed
+            ):
+                uncertain = True
+            challenge = challenge or discovery.metadata_challenge(raw)
+            uncertain = uncertain or bool(raw.get("uncertain"))
+            if len(frame_path) >= discovery.MAX_FRAME_DEPTH:
+                continue
+            for frame in raw.get("frames") or []:
+                if not frame.get("visible"):
+                    continue
+                frame_origin = discovery.origin(str(frame.get("src") or ""))
+                selector = str(frame.get("selector") or "")
+                if frame_origin in allowed and selector:
+                    queue.append(frame_path + (selector,))
+                elif discovery.payment_frame_hint(
+                    f"{frame.get('src') or ''} {frame.get('hint') or ''}"
+                ):
+                    uncertain = True
+        return {"ok": True, "challenge": challenge, "uncertain": uncertain}
 
     return SimpleNamespace(
         navigate=lambda url, task_id: _call(bt.browser_navigate, url, task_id=task_id),
         eval_js=lambda exp, task_id: _call(bt._browser_eval, exp, task_id=task_id, stdin=True),
+        discover=discover,
         fill_fields=fill_fields,
+        submit=submit,
+        signals=signals,
         cleanup=lambda task_id: _call(bt.cleanup_browser, task_id),
     )
 
@@ -424,10 +650,9 @@ def origin_allowed(url: str, canonical_domain: str, *, fake_e2e: bool) -> bool:
 
 
 def page_origin_allowed(page: dict, canonical_domain: str, *, fake_e2e: bool) -> bool:
-    return origin_allowed(page.get("url", ""), canonical_domain, fake_e2e=fake_e2e) and (
-        not page.get("has_form")
-        or origin_allowed(page.get("form_action", ""), canonical_domain, fake_e2e=fake_e2e)
-    )
+    # Relevant form actions are validated by semantic discovery; unrelated
+    # forms must neither authorize nor block the checkout.
+    return origin_allowed(page.get("url", ""), canonical_domain, fake_e2e=fake_e2e)
 
 
 def check_terms(page_text: str, claim: dict) -> list[str]:
@@ -623,6 +848,7 @@ def run_once(
     stdin=None,
     post_submit_wait: float = POST_SUBMIT_WAIT_SECONDS,
     sleep=time.sleep,
+    fake_processor_origins: tuple[str, ...] = (),
 ) -> int:
     """One attempt: claim → checkout → exactly one terminal report. No retry."""
     intent = "Restricted Purchase Executor V0 run for one claimed execution ticket."
@@ -727,38 +953,58 @@ def run_once(
             page_text = page.get("text", "")
             if CHALLENGE_RE.search(page_text):
                 raise _Stop("definitive", "human_challenge_required")
+            if page.get("filled"):
+                raise _Stop("definitive", "invalid_checkout_state")
+            merchant_name = page.get("merchant", "")
+
+            def discover_checkout(bind_controls=True):
+                try:
+                    return browser.discover(
+                        task_id,
+                        claim["canonical_merchant_domain"],
+                        adapter,
+                        fake_e2e,
+                        fake_processor_origins,
+                        bind_controls,
+                    )
+                except discovery.DiscoveryError as error:
+                    audit("discovery_rejected", reason=error.reason, **error.audit)
+                    raise _Stop("definitive", error.category) from error
+
+            plan = discover_checkout()
+            audit("discovered", **plan.audit())
             mismatches = check_terms(page_text, claim)
             if mismatches:
                 audit("terms_rejected", mismatches=mismatches)
                 raise _Stop("definitive", "terms_changed")
-            if not page.get("has_form"):
-                raise _Stop("definitive", "checkout_form_missing")
-            if page.get("filled"):
-                raise _Stop("definitive", "invalid_checkout_state")
-            merchant_name = page.get("merchant", "")
             audit("revalidated", total=claim["maximum_total"], currency=claim["currency"])
 
-            payment_values = load_payment_fields()
-            # Verify origin immediately before the atomic fill batch. ponytail:
-            # origin is checked once right before the single batch that fills
-            # all fields (the batch can't navigate mid-run); true per-field
-            # re-verification would need CDP-level interleaving — upgrade path.
+            # A second terms + discovery pass closes the pre-credential TOCTOU
+            # window. No payment file has been opened before both gates pass.
             prefill = browser.eval_js(PAGE_PROBE_JS, task_id)
-            if not prefill.get("success") or not page_origin_allowed(
-                prefill["result"], claim["canonical_merchant_domain"], fake_e2e=fake_e2e
+            if not prefill.get("success"):
+                raise _Stop("definitive", "page_read_failed")
+            prefill_page = prefill["result"]
+            if not page_origin_allowed(
+                prefill_page, claim["canonical_merchant_domain"], fake_e2e=fake_e2e
             ):
                 raise _Stop("definitive", "wrong_origin")
-            ordered_fields = [
-                (adapter.selectors[field], payment_values[field])
-                for field in purchase_merchants.CARD_FIELDS
-            ]
-            fill = browser.fill_fields(task_id, ordered_fields)
+            if CHALLENGE_RE.search(prefill_page.get("text", "")):
+                raise _Stop("definitive", "human_challenge_required")
+            if check_terms(prefill_page.get("text", ""), claim):
+                raise _Stop("definitive", "terms_changed")
+            confirmed_plan = discover_checkout()
+            if confirmed_plan.fingerprint != plan.fingerprint:
+                raise _Stop("definitive", "checkout_not_ready")
+
+            payment_values = load_payment_fields()
+            fill = browser.fill_fields(task_id, confirmed_plan, payment_values)
             if not fill.get("result", {}).get("ok"):
                 raise _Stop("definitive", "fill_failed")
             audit("filled")
 
-            # Post-fill, pre-submit revalidation: text-only re-read, never a
-            # snapshot/screenshot; the probe reads no input values.
+            # Post-fill, pre-submit revalidation reads metadata and visible text
+            # only — never field values, a snapshot, or a screenshot.
             recheck = browser.eval_js(PAGE_PROBE_JS, task_id)
             if not recheck.get("success"):
                 raise _Stop("definitive", "page_read_failed")
@@ -774,14 +1020,12 @@ def run_once(
                 raise _Stop("definitive", "human_challenge_required")
             if check_terms(recheck_text, claim):
                 raise _Stop("definitive", "terms_changed")
+            final_plan = discover_checkout(bind_controls=False)
+            if final_plan.fingerprint != confirmed_plan.fingerprint:
+                raise _Stop("definitive", "checkout_not_ready")
 
             submitted = True
-            submit = browser.eval_js(
-                submit_expression(
-                    adapter.submit_selector(), claim["canonical_merchant_domain"], fake_e2e
-                ),
-                task_id,
-            )
+            submit = browser.submit(task_id, final_plan)
             if not submit.get("success") or not submit.get("result", {}).get("ok"):
                 raise _Stop("uncertain", "submit_outcome_unknown")
             audit("submitted")
@@ -791,11 +1035,30 @@ def run_once(
             while True:
                 outcome = browser.eval_js(PAGE_PROBE_JS, task_id)
                 if outcome.get("success"):
-                    final_text = outcome["result"].get("text", "")
+                    outcome_page = outcome["result"]
+                    if not page_origin_allowed(
+                        outcome_page,
+                        claim["canonical_merchant_domain"],
+                        fake_e2e=fake_e2e,
+                    ):
+                        raise _Stop("uncertain", "post_submit_wrong_origin")
+                    final_text = outcome_page.get("text", "")
+                    frame_state = browser.signals(
+                        task_id,
+                        final_plan,
+                        adapter.processor_origins + tuple(fake_processor_origins),
+                    )
+                    challenged = (
+                        POST_SUBMIT_CHALLENGE_RE.search(final_text)
+                        or CHALLENGE_RE.search(final_text)
+                        or not frame_state.get("ok")
+                        or frame_state.get("challenge")
+                        or frame_state.get("uncertain")
+                    )
+                    if challenged:
+                        raise _Stop("uncertain", "post_submit_challenge")
                     if SUCCESS_RE.search(final_text):
                         break
-                    if POST_SUBMIT_CHALLENGE_RE.search(final_text) or CHALLENGE_RE.search(final_text):
-                        raise _Stop("uncertain", "post_submit_challenge")
                 if time.monotonic() >= deadline:
                     raise _Stop("uncertain", "outcome_unknown")
                 sleep(1)
@@ -852,6 +1115,8 @@ def parse_args(argv=None) -> argparse.Namespace:
                         help="explicit checkout URL; only valid with --fake-e2e")
     parser.add_argument("--checkout-path", default="/checkout",
                         help="path appended to https://<canonical merchant domain>")
+    parser.add_argument("--fake-processor-origin", action="append", default=[],
+                        help="exact loopback hosted-field origin; fake-E2E only")
     parser.add_argument("--state-dir", default=DEFAULT_STATE_DIR,
                         help="audit/spool/receipt directory")
     args = parser.parse_args(argv)
@@ -860,8 +1125,11 @@ def parse_args(argv=None) -> argparse.Namespace:
             parser.error("--fake-e2e requires a loopback --checkout-url")
         if not _is_loopback(args.bridge_url):
             parser.error("--fake-e2e requires a loopback --bridge-url")
-    elif args.checkout_url:
-        parser.error("--checkout-url is only valid with --fake-e2e")
+        for item in args.fake_processor_origin:
+            if discovery.origin(item) != item or not _is_loopback(item):
+                parser.error("--fake-processor-origin must be an exact loopback origin")
+    elif args.checkout_url or args.fake_processor_origin:
+        parser.error("--checkout-url/--fake-processor-origin require --fake-e2e")
     return args
 
 
@@ -894,6 +1162,7 @@ def main(argv=None) -> int:
             state_dir=state_dir,
             checkout_url_for=checkout_url_for,
             fake_e2e=args.fake_e2e,
+            fake_processor_origins=tuple(args.fake_processor_origin),
         )
 
     if not args.fake_e2e:
