@@ -36,23 +36,19 @@ _SCRIPTS_DIR = str(Path(__file__).resolve().parent)
 if _SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, _SCRIPTS_DIR)
 
-from _hermes_home import display_hermes_home, get_hermes_home
+from google_auth import (
+    SERVICE_PROFILES,
+    oauth_client_path,
+    oauth_token_path,
+    private_state_path,
+    secure_existing_file,
+    write_private_json,
+)
 
-HERMES_HOME = get_hermes_home()
-TOKEN_PATH = HERMES_HOME / "google_token.json"
-CLIENT_SECRET_PATH = HERMES_HOME / "google_client_secret.json"
-PENDING_AUTH_PATH = HERMES_HOME / "google_oauth_pending.json"
-
-SCOPES = [
-    "https://www.googleapis.com/auth/gmail.readonly",
-    "https://www.googleapis.com/auth/gmail.send",
-    "https://www.googleapis.com/auth/gmail.modify",
-    "https://www.googleapis.com/auth/calendar",
-    "https://www.googleapis.com/auth/drive",
-    "https://www.googleapis.com/auth/contacts.readonly",
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/documents",
-]
+TOKEN_PATH = oauth_token_path()
+CLIENT_SECRET_PATH = oauth_client_path()
+PENDING_AUTH_PATH = private_state_path("google_oauth_pending.json")
+SCOPES = list(SERVICE_PROFILES["linxio"])
 
 REQUIRED_PACKAGES = ["google-api-python-client", "google-auth-oauthlib", "google-auth-httplib2"]
 
@@ -76,21 +72,25 @@ def _load_token_payload(path: Path = TOKEN_PATH) -> dict:
         return {}
 
 
-def _missing_scopes_from_payload(payload: dict) -> list[str]:
+def _scope_mismatch_from_payload(payload: dict) -> tuple[list[str], list[str]]:
     raw = payload.get("scopes") or payload.get("scope")
     if not raw:
-        return []
+        return list(SCOPES), []
     granted = {s.strip() for s in (raw.split() if isinstance(raw, str) else raw) if s.strip()}
-    return sorted(scope for scope in SCOPES if scope not in granted)
+    required = set(SCOPES)
+    return sorted(required - granted), sorted(granted - required)
 
 
-def _format_missing_scopes(missing_scopes: list[str]) -> str:
-    bullets = "\n".join(f"  - {scope}" for scope in missing_scopes)
-    return (
-        "Token is valid but missing required Google Workspace scopes:\n"
-        f"{bullets}\n"
-        "Run the Google Workspace setup again from this same Hermes profile to refresh consent."
-    )
+def _report_scope_mismatch(payload: dict) -> bool:
+    missing, unexpected = _scope_mismatch_from_payload(payload)
+    if not (missing or unexpected):
+        return False
+    print("SCOPE_MISMATCH: Token must grant exactly the Linxio service profile scopes.")
+    for label, scopes in (("Missing", missing), ("Unexpected", unexpected)):
+        for scope in scopes:
+            print(f"  {label}: {scope}")
+    print("Run --auth-url again and approve the exact requested permissions.")
+    return True
 
 
 def install_deps():
@@ -187,28 +187,22 @@ def check_auth(quiet: bool = False):
     if not TOKEN_PATH.exists():
         print(f"NOT_AUTHENTICATED: No token at {TOKEN_PATH}")
         return False
+    secure_existing_file(TOKEN_PATH)
 
     _ensure_deps()
     from google.oauth2.credentials import Credentials
     from google.auth.transport.requests import Request
 
     try:
-        # Don't pass scopes — user may have authorized only a subset.
-        # Passing scopes forces google-auth to validate them on refresh,
-        # which fails with invalid_scope if the token has fewer scopes
-        # than requested.
-        creds = Credentials.from_authorized_user_file(str(TOKEN_PATH))
+        creds = Credentials.from_authorized_user_file(str(TOKEN_PATH), SCOPES)
     except Exception as e:
         print(f"TOKEN_CORRUPT: {e}")
         return False
 
     payload = _load_token_payload(TOKEN_PATH)
+    if _report_scope_mismatch(payload):
+        return False
     if creds.valid:
-        missing_scopes = _missing_scopes_from_payload(payload)
-        if missing_scopes:
-            print(f"AUTHENTICATED (partial): Token valid but missing {len(missing_scopes)} scopes:")
-            for s in missing_scopes:
-                print(f"  - {s}")
         if not quiet:
             print(f"AUTHENTICATED: Token valid at {TOKEN_PATH}")
         return True
@@ -216,17 +210,12 @@ def check_auth(quiet: bool = False):
     if creds.expired and creds.refresh_token:
         try:
             creds.refresh(Request())
-            TOKEN_PATH.write_text(
-                json.dumps(
-                    _normalize_authorized_user_payload(json.loads(creds.to_json())),
-                    indent=2,
-                )
+            write_private_json(
+                TOKEN_PATH,
+                _normalize_authorized_user_payload(json.loads(creds.to_json())),
             )
-            missing_scopes = _missing_scopes_from_payload(_load_token_payload(TOKEN_PATH))
-            if missing_scopes:
-                print(f"AUTHENTICATED (partial): Token refreshed but missing {len(missing_scopes)} scopes:")
-                for s in missing_scopes:
-                    print(f"  - {s}")
+            if _report_scope_mismatch(_load_token_payload(TOKEN_PATH)):
+                return False
             if not quiet:
                 print(f"AUTHENTICATED: Token refreshed at {TOKEN_PATH}")
             return True
@@ -270,21 +259,22 @@ def store_client_secret(path: str):
         print("Download the correct file from: https://console.cloud.google.com/apis/credentials")
         sys.exit(1)
 
-    CLIENT_SECRET_PATH.write_text(json.dumps(data, indent=2))
+    if src != CLIENT_SECRET_PATH.resolve():
+        write_private_json(CLIENT_SECRET_PATH, data)
+    else:
+        secure_existing_file(CLIENT_SECRET_PATH)
     print(f"OK: Client secret saved to {CLIENT_SECRET_PATH}")
 
 
 def _save_pending_auth(*, state: str, code_verifier: str):
     """Persist the OAuth session bits needed for a later token exchange."""
-    PENDING_AUTH_PATH.write_text(
-        json.dumps(
-            {
-                "state": state,
-                "code_verifier": code_verifier,
-                "redirect_uri": REDIRECT_URI,
-            },
-            indent=2,
-        )
+    write_private_json(
+        PENDING_AUTH_PATH,
+        {
+            "state": state,
+            "code_verifier": code_verifier,
+            "redirect_uri": REDIRECT_URI,
+        },
     )
 
 
@@ -331,6 +321,7 @@ def get_auth_url():
     if not CLIENT_SECRET_PATH.exists():
         print("ERROR: No client secret stored. Run --client-secret first.")
         sys.exit(1)
+    secure_existing_file(CLIENT_SECRET_PATH)
 
     _ensure_deps()
     from google_auth_oauthlib.flow import Flow
@@ -355,6 +346,7 @@ def exchange_auth_code(code: str):
     if not CLIENT_SECRET_PATH.exists():
         print("ERROR: No client secret stored. Run --client-secret first.")
         sys.exit(1)
+    secure_existing_file(CLIENT_SECRET_PATH)
 
     pending_auth = _load_pending_auth()
     raw_callback = code
@@ -367,24 +359,25 @@ def exchange_auth_code(code: str):
     from google_auth_oauthlib.flow import Flow
     from urllib.parse import parse_qs, urlparse
 
-    # Extract granted scopes from the callback URL if the user pasted the full redirect URL.
-    granted_scopes = list(SCOPES)
+    # Capture the consent result so a partial or unexpectedly broad grant can
+    # be rejected before any token reaches disk.
+    callback_scopes = []
     if isinstance(raw_callback, str) and raw_callback.startswith("http"):
         params = parse_qs(urlparse(raw_callback).query)
         scope_val = (params.get("scope") or [""])[0].strip()
         if scope_val:
-            granted_scopes = scope_val.split()
+            callback_scopes = scope_val.split()
 
     flow = Flow.from_client_secrets_file(
         str(CLIENT_SECRET_PATH),
-        scopes=granted_scopes,
+        scopes=SCOPES,
         redirect_uri=pending_auth.get("redirect_uri", REDIRECT_URI),
         state=pending_auth["state"],
         code_verifier=pending_auth["code_verifier"],
     )
 
     try:
-        # Accept partial scopes — user may deselect some permissions in the consent screen
+        # Complete the exchange so we can validate what Google actually granted.
         os.environ["OAUTHLIB_RELAX_TOKEN_SCOPE"] = "1"
         flow.fetch_token(code=code)
     except Exception as e:
@@ -395,25 +388,19 @@ def exchange_auth_code(code: str):
     creds = flow.credentials
     token_payload = _normalize_authorized_user_payload(json.loads(creds.to_json()))
 
-    # Store only the scopes actually granted by the user, not what was requested.
-    # creds.to_json() writes the requested scopes, which causes refresh to fail
-    # with invalid_scope if the user only authorized a subset.
+    # Prefer Google's granted-scope result over the requested scope list.
     actually_granted = list(creds.granted_scopes or []) if hasattr(creds, "granted_scopes") and creds.granted_scopes else []
     if actually_granted:
         token_payload["scopes"] = actually_granted
-    elif granted_scopes != SCOPES:
-        # granted_scopes was extracted from the callback URL
-        token_payload["scopes"] = granted_scopes
-
-    missing_scopes = _missing_scopes_from_payload(token_payload)
-    if missing_scopes:
-        print(f"WARNING: Token missing some Google Workspace scopes: {', '.join(missing_scopes)}")
-        print("Some services may not be available.")
-
-    TOKEN_PATH.write_text(json.dumps(token_payload, indent=2))
+    elif callback_scopes:
+        token_payload["scopes"] = callback_scopes
+    if _report_scope_mismatch(token_payload):
+        PENDING_AUTH_PATH.unlink(missing_ok=True)
+        raise SystemExit(1)
+    write_private_json(TOKEN_PATH, token_payload)
     PENDING_AUTH_PATH.unlink(missing_ok=True)
     print(f"OK: Authenticated. Token saved to {TOKEN_PATH}")
-    print(f"Profile-scoped token location: {display_hermes_home()}/google_token.json")
+    print(f"Token location: {TOKEN_PATH}")
 
 
 def revoke():
@@ -453,6 +440,12 @@ def main():
     parser = argparse.ArgumentParser(description="Google Workspace OAuth setup for Hermes")
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--check", action="store_true", help="Check if auth is valid (exit 0=yes, 1=no)")
+    parser.add_argument(
+        "--service-profile",
+        choices=sorted(SERVICE_PROFILES),
+        default="linxio",
+        help="Named least-privilege authorization profile (default: linxio)",
+    )
     group.add_argument("--check-live", action="store_true", help="Check auth with a real API call (detects disabled_client)")
     group.add_argument("--client-secret", metavar="PATH", help="Store OAuth client_secret.json")
     group.add_argument("--auth-url", action="store_true", help="Print OAuth URL for user to visit")

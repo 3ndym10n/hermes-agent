@@ -65,6 +65,7 @@ def _write_token(path: Path, *, token="ya29.test", expiry=None, **extra):
     }
     if expiry is not None:
         data["expiry"] = expiry
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     path.write_text(json.dumps(data))
 
 
@@ -153,26 +154,14 @@ def test_bridge_exits_on_missing_token(bridge_module):
         bridge_module.get_valid_token()
 
 
-def test_bridge_main_injects_token_env(bridge_module, tmp_path):
-    """main() sets GOOGLE_WORKSPACE_CLI_TOKEN in subprocess env."""
-    future = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
-    token_path = bridge_module.get_token_path()
-    _write_token(token_path, token="ya29.injected", expiry=future)
-
-    captured = {}
-
-    def capture_run(cmd, **kwargs):
-        captured["cmd"] = cmd
-        captured["env"] = kwargs.get("env", {})
-        return MagicMock(returncode=0)
-
-    with patch.object(sys, "argv", ["gws_bridge.py", "gmail", "+triage"]):
-        with patch.object(subprocess, "run", side_effect=capture_run):
-            with pytest.raises(SystemExit):
+def test_bridge_main_rejects_arbitrary_authenticated_commands(bridge_module):
+    with patch.object(sys, "argv", ["gws_bridge.py", "gmail", "users", "messages", "send"]):
+        with patch.object(subprocess, "run") as run:
+            with pytest.raises(SystemExit) as exc_info:
                 bridge_module.main()
 
-    assert captured["env"]["GOOGLE_WORKSPACE_CLI_TOKEN"] == "ya29.injected"
-    assert captured["cmd"] == ["gws", "gmail", "+triage"]
+    assert exc_info.value.code == 2
+    run.assert_not_called()
 
 
 def test_api_calendar_list_uses_events_list(api_module):
@@ -337,14 +326,14 @@ def test_api_gmail_search_reads_headers_case_insensitively(
     ]
 
 
-def test_api_gmail_send_uses_conventional_mime_header_casing(api_module):
+def test_api_gmail_draft_uses_conventional_mime_header_casing(api_module):
     captured = {}
 
     def fake_run_gws(parts, *, params=None, body=None):
         captured["parts"] = parts
         captured["params"] = params
         captured["body"] = body
-        return {"id": "sent-1", "threadId": "thread-1"}
+        return {"id": "draft-1", "message": {"id": "msg-1", "threadId": "thread-1"}}
 
     api_module._run_gws = fake_run_gws
     args = api_module.argparse.Namespace(
@@ -355,12 +344,13 @@ def test_api_gmail_send_uses_conventional_mime_header_casing(api_module):
         cc="copy@example.com",
         from_header="sender@example.com",
         thread_id="thread-1",
-        func=api_module.gmail_send,
+        func=api_module.gmail_draft_create,
     )
 
-    api_module.gmail_send(args)
+    api_module.gmail_draft_create(args)
 
-    raw = api_module.base64.urlsafe_b64decode(captured["body"]["raw"])
+    assert captured["parts"] == ["gmail", "users", "drafts", "create"]
+    raw = api_module.base64.urlsafe_b64decode(captured["body"]["message"]["raw"])
     raw_text = raw.decode()
     assert "To: recipient@example.com" in raw_text
     assert "Subject: hello" in raw_text
@@ -377,7 +367,7 @@ def test_api_gmail_send_uses_conventional_mime_header_casing(api_module):
         ("From", "Subject", "Message-ID"),
     ],
 )
-def test_api_gmail_reply_reads_headers_case_insensitively_and_uses_conventional_mime_header_casing(
+def test_api_gmail_reply_draft_reads_headers_case_insensitively_and_uses_conventional_mime_header_casing(
     api_module,
     header_names,
 ):
@@ -405,22 +395,22 @@ def test_api_gmail_reply_reads_headers_case_insensitively_and_uses_conventional_
                 },
             }
 
-        assert parts == ["gmail", "users", "messages", "send"]
+        assert parts == ["gmail", "users", "drafts", "create"]
         assert params == {"userId": "me"}
-        return {"id": "sent-1", "threadId": "thread-1"}
+        return {"id": "draft-1", "message": {"id": "msg-1", "threadId": "thread-1"}}
 
     api_module._run_gws = fake_run_gws
     args = api_module.argparse.Namespace(
         message_id="msg-1",
         body="reply body",
         from_header="recipient@example.com",
-        func=api_module.gmail_reply,
+        func=api_module.gmail_draft_reply,
     )
 
-    api_module.gmail_reply(args)
+    api_module.gmail_draft_reply(args)
 
     assert len(calls) == 2
-    body = calls[1]["body"]
+    body = calls[1]["body"]["message"]
     assert body["threadId"] == "thread-1"
     raw = api_module.base64.urlsafe_b64decode(body["raw"])
     raw_text = raw.decode()

@@ -31,6 +31,9 @@ _SENSITIVE_QUERY_PARAMS = frozenset({
     "secret",
     "key",
     "code",           # OAuth authorization codes
+    "authorization_code",
+    "approval_token",
+    "code_verifier",
     "signature",      # pre-signed URL signatures
     "x-amz-signature",
 })
@@ -105,6 +108,8 @@ _PREFIX_PATTERNS = [
     r"brv_[A-Za-z0-9]{10,}",            # ByteRover API key
     r"xai-[A-Za-z0-9]{30,}",            # xAI (Grok) API key
     r"ntn_[A-Za-z0-9]{10,}",            # Notion internal integration token
+    r"1//[A-Za-z0-9_-]{10,}",          # Google OAuth refresh token
+    r"GOCSPX-[A-Za-z0-9_-]{10,}",      # Google OAuth client secret
 ]
 
 # ENV assignment patterns: KEY=value where KEY contains a secret-like name
@@ -114,7 +119,7 @@ _ENV_ASSIGN_RE = re.compile(
 )
 
 # JSON field patterns: "apiKey": "value", "token": "value", etc.
-_JSON_KEY_NAMES = r"(?:api_?[Kk]ey|token|secret|password|access_token|refresh_token|auth_token|bearer|secret_value|raw_secret|secret_input|key_material)"
+_JSON_KEY_NAMES = r"(?:api_?[Kk]ey|token|secret|password|access_token|refresh_token|auth_token|approval_token|authorization_code|code_verifier|client_secret|bearer|secret_value|raw_secret|secret_input|key_material)"
 _JSON_FIELD_RE = re.compile(
     rf'("{_JSON_KEY_NAMES}")\s*:\s*"([^"]+)"',
     re.IGNORECASE,
@@ -154,6 +159,29 @@ _JWT_RE = re.compile(
 # E.164 phone numbers: +<country><number>, 7-15 digits
 # Negative lookahead prevents matching hex strings or identifiers
 _SIGNAL_PHONE_RE = re.compile(r"(\+[1-9]\d{6,14})(?![A-Za-z0-9])")
+
+# Persistent logs have a stricter privacy boundary than in-memory tool output.
+_EMAIL_RE = re.compile(
+    r"(?<![A-Za-z0-9.!#$%&'*+/=?^_{|}~-])"
+    r"[A-Za-z0-9.!#$%&'*+/=?^_{|}~-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+"
+)
+_PHONE_RE = re.compile(r"(?<![A-Za-z0-9])(?:\+?\d[\d(). -]{6,}\d)(?![A-Za-z0-9])")
+_EMAIL_CONTENT_FIELD_RE = re.compile(
+    r'("(?:body|snippet)"\s*:\s*)"(?:\\.|[^"\\])*"',
+    re.IGNORECASE,
+)
+_SENSITIVE_CLI_ARG_RE = re.compile(
+    r"(--(?:auth-code|approval-token|code-verifier|client-secret)(?:=|\s+))"
+    r"(?:'[^']*'|\"(?:\\.|[^\"])*\"|\S+)",
+    re.IGNORECASE,
+)
+_EMAIL_CONTENT_ARG_RE = re.compile(
+    r"(--(?:body|content)(?:=|\s+))(?:'[^']*'|\"(?:\\.|[^\"])*\"|\S+)",
+    re.IGNORECASE,
+)
+_GOOGLE_OAUTH_VALUE_RE = re.compile(
+    r"(?<![A-Za-z0-9_-])(?:ya29\.[A-Za-z0-9._-]{8,}|4/[A-Za-z0-9._-]{8,})(?![A-Za-z0-9._-])"
+)
 
 # URLs containing query strings — matches `scheme://...?...[# or end]`.
 # Used to scan text for URLs whose query params may contain secrets.
@@ -486,7 +514,30 @@ def _has_http_method_substring(text: str) -> bool:
     return any(method in upper for method in _HTTP_METHOD_SUBSTRINGS)
 
 
+def redact_persistent_text(text: str) -> str:
+    """Redact secrets and customer PII at the on-disk logging boundary."""
+    text = redact_sensitive_text(text, force=True)
+    if not text:
+        return text
+    text = _redact_url_query_params(text)
+    text = _redact_http_request_target_query_params(text)
+    text = _SENSITIVE_CLI_ARG_RE.sub(r"\1***", text)
+    text = _EMAIL_CONTENT_ARG_RE.sub(r"\1[REDACTED EMAIL CONTENT]", text)
+    text = _GOOGLE_OAUTH_VALUE_RE.sub("***", text)
+    text = _EMAIL_CONTENT_FIELD_RE.sub(
+        lambda match: match.group(1) + '"[REDACTED EMAIL CONTENT]"', text
+    )
+    text = _EMAIL_RE.sub("[REDACTED EMAIL]", text)
+    return _PHONE_RE.sub("[REDACTED PHONE]", text)
+
+
+class PersistentRedactingFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        return redact_persistent_text(super().format(record))
+
+
 class RedactingFormatter(logging.Formatter):
+
     """Log formatter that redacts secrets from all log messages."""
 
     def __init__(self, fmt=None, datefmt=None, style='%', **kwargs):

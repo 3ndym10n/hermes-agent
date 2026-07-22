@@ -1,11 +1,6 @@
 #!/usr/bin/env python3
-"""Bridge between Hermes OAuth token and gws CLI.
-
-Refreshes the token if expired, then executes gws with the valid access token.
-"""
+"""Legacy token refresher; arbitrary authenticated gws execution is disabled."""
 import json
-import os
-import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -15,11 +10,11 @@ _SCRIPTS_DIR = str(Path(__file__).resolve().parent)
 if _SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, _SCRIPTS_DIR)
 
-from _hermes_home import get_hermes_home
+from google_auth import oauth_token_path, secure_existing_file, write_private_json
 
 
 def get_token_path() -> Path:
-    return get_hermes_home() / "google_token.json"
+    return oauth_token_path()
 
 
 def _normalize_authorized_user_payload(payload: dict) -> dict:
@@ -68,8 +63,8 @@ def refresh_token(token_data: dict) -> dict:
         tz=timezone.utc,
     ).isoformat()
 
-    get_token_path().write_text(
-        json.dumps(_normalize_authorized_user_payload(token_data), indent=2)
+    write_private_json(
+        get_token_path(), _normalize_authorized_user_payload(token_data)
     )
     return token_data
 
@@ -80,6 +75,7 @@ def get_valid_token() -> str:
     if not token_path.exists():
         print("ERROR: No Google token found. Run setup.py --auth-url first.", file=sys.stderr)
         sys.exit(1)
+    secure_existing_file(token_path)
 
     token_data = json.loads(token_path.read_text())
 
@@ -94,17 +90,9 @@ def get_valid_token() -> str:
 
 
 def main():
-    """Refresh token if needed, then exec gws with remaining args."""
-    if len(sys.argv) < 2:
-        print("Usage: gws_bridge.py <gws args...>", file=sys.stderr)
-        sys.exit(1)
-
-    access_token = get_valid_token()
-    env = os.environ.copy()
-    env["GOOGLE_WORKSPACE_CLI_TOKEN"] = access_token
-
-    result = subprocess.run(["gws"] + sys.argv[1:], env=env)
-    sys.exit(result.returncode)
+    """Reject arbitrary authenticated gws execution; use the policy CLI."""
+    print("Direct gws execution is disabled; use google_api.py.", file=sys.stderr)
+    raise SystemExit(2)
 
 
 if __name__ == "__main__":
