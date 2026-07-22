@@ -17,6 +17,7 @@ import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import cast
 
 import google_api
 from google_auth import ensure_private_directory, private_state_path
@@ -139,7 +140,9 @@ def cleanup_expired(now: float | None = None) -> int:
             continue
         try:
             data = _read_private_json(path, MAX_PRIVATE_FILE_BYTES, "comparison state")
-            expires = float(data.get("expires_at", 0)) if isinstance(data, dict) else 0
+            state = cast(dict[str, object], data) if isinstance(data, dict) else {}
+            expires_at = state.get("expires_at", 0)
+            expires = float(expires_at) if isinstance(expires_at, (int, float, str)) else 0
         except (EmailLearningError, ValueError):
             expires = 0
         if expires < cutoff or len(list(root.glob("*.json"))) > MAX_STATES:
@@ -154,10 +157,15 @@ def load_state(state_id: str) -> dict:
     if path.is_symlink() or not path.is_file():
         raise EmailLearningError("comparison state is absent or expired")
     data = _read_private_json(path, MAX_PRIVATE_FILE_BYTES, "comparison state")
-    if (not isinstance(data, dict) or data.get("state_id") != state_id
-            or float(data.get("expires_at", 0)) < time.time()):
+    if not isinstance(data, dict):
         raise EmailLearningError("comparison state is absent or expired")
-    return data
+    state = cast(dict[str, object], data)
+    if state.get("state_id") != state_id:
+        raise EmailLearningError("comparison state is absent or expired")
+    expires_at = state.get("expires_at", 0)
+    if not isinstance(expires_at, (int, float, str)) or float(expires_at) < time.time():
+        raise EmailLearningError("comparison state is absent or expired")
+    return state
 
 
 def delete_state(state_id: str) -> None:
@@ -174,18 +182,19 @@ def load_draft(path: str | Path) -> dict:
                "cc", "from_header", "html", "context"}
     if not isinstance(data, dict) or set(data) - allowed:
         raise EmailLearningError("draft file has unsupported fields")
-    kind = str(data.get("source_kind") or "").lower()
-    body = str(data.get("body") or "")
+    draft = cast(dict[str, object], data)
+    kind = str(draft.get("source_kind") or "").lower()
+    body = str(draft.get("body") or "")
     if kind not in SOURCE_KINDS or not body or len(body) > MAX_BODY_CHARS:
         raise EmailLearningError("draft file is invalid")
     normalized = {
-        "source_kind": kind, "source_id": _opaque(data.get("source_id"), "source id"),
-        "thread_id": _opaque(data.get("thread_id"), "thread id") if data.get("thread_id") else "",
-        "to": str(data.get("to") or "").strip(), "subject": str(data.get("subject") or "").strip(),
-        "body": body, "cc": str(data.get("cc") or "").strip(),
-        "from_header": str(data.get("from_header") or "").strip(),
-        "html": bool(data.get("html", False)),
-        "context_fingerprint": context_fingerprint(data.get("context")),
+        "source_kind": kind, "source_id": _opaque(draft.get("source_id"), "source id"),
+        "thread_id": _opaque(draft.get("thread_id"), "thread id") if draft.get("thread_id") else "",
+        "to": str(draft.get("to") or "").strip(), "subject": str(draft.get("subject") or "").strip(),
+        "body": body, "cc": str(draft.get("cc") or "").strip(),
+        "from_header": str(draft.get("from_header") or "").strip(),
+        "html": bool(draft.get("html", False)),
+        "context_fingerprint": context_fingerprint(draft.get("context")),
     }
     if not normalized["to"] or not normalized["subject"]:
         raise EmailLearningError("draft file is invalid")
@@ -195,14 +204,15 @@ def load_draft(path: str | Path) -> dict:
 def context_fingerprint(value: object) -> str:
     if not isinstance(value, dict) or set(value) != set(CONTEXT_BUCKETS):
         raise EmailLearningError("draft context must contain the four fact buckets")
-    canonical = {}
+    context = cast(dict[str, object], value)
+    canonical: dict[str, list[str]] = {}
     for bucket in CONTEXT_BUCKETS:
-        items = value[bucket]
+        items = context[bucket]
         if (not isinstance(items, list) or len(items) > 50
                 or any(not isinstance(item, str) or not item.strip() or len(item) > 2_000
                        for item in items)):
             raise EmailLearningError("draft context bucket is invalid")
-        canonical[bucket] = items
+        canonical[bucket] = cast(list[str], items)
     return _sha(_canonical(canonical))
 
 
@@ -387,19 +397,23 @@ def cmd_record(args) -> None:
         if (not isinstance(codes_data, dict) or "lesson_codes" not in codes_data
                 or set(codes_data) - {"lesson_codes", "outcomes"}):
             raise EmailLearningError("lesson code file is invalid")
-        codes = codes_data.get("lesson_codes") if isinstance(codes_data, dict) else None
-        outcomes = codes_data.get("outcomes", []) if isinstance(codes_data, dict) else []
-        if not isinstance(codes, list) or not 1 <= len(codes) <= 8 or any(code not in LESSON_CODES for code in codes):
+        selections = cast(dict[str, object], codes_data)
+        codes, outcomes = selections.get("lesson_codes"), selections.get("outcomes", [])
+        if (not isinstance(codes, list) or not 1 <= len(codes) <= 8
+                or any(not isinstance(code, str) or code not in LESSON_CODES for code in codes)):
             raise EmailLearningError("lesson code file is invalid")
-        if not isinstance(outcomes, list) or any(value not in OUTCOMES for value in outcomes):
+        if (not isinstance(outcomes, list)
+                or any(not isinstance(value, str) or value not in OUTCOMES for value in outcomes)):
             raise EmailLearningError("outcome metadata is invalid")
+        lesson_codes, outcome_values = cast(list[str], codes), cast(list[str], outcomes)
         comparison_id = secrets.token_urlsafe(18)
         payload = {"source": {"kind": "message", "id": final["id"], "thread_id": final["thread_id"]},
                    "comparison_id": comparison_id,
                    "captured_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
                    "analysis": comparison["analysis"],
-                   "lessons": [{"code": code, "evidence_kind": "inferred"} for code in codes],
-                   "outcomes": sorted(set(outcomes))}
+                   "lessons": [{"code": code, "evidence_kind": "inferred"}
+                               for code in lesson_codes],
+                   "outcomes": sorted(set(outcome_values))}
         payload["comparison_fingerprint"] = hashlib.sha256(_canonical(payload).encode()).hexdigest()
         payload["confirm"] = True
         token, url = os.environ.get(BRIDGE_TOKEN_ENV, "").strip(), os.environ.get(BRIDGE_URL_ENV, "").strip()

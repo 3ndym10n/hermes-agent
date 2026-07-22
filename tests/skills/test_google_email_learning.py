@@ -8,7 +8,7 @@ import time
 from pathlib import Path
 from unittest.mock import MagicMock
 
-import pytest
+import pytest  # ty: ignore[unresolved-import, unused-ignore-comment]
 
 
 SCRIPTS = Path(__file__).resolve().parents[2] / "skills/productivity/google-workspace/scripts"
@@ -22,8 +22,8 @@ def learning(monkeypatch, tmp_path):
     sys.path.insert(0, str(SCRIPTS))
     sys.modules.pop("google_api", None)
     spec = importlib.util.spec_from_file_location(f"email_learning_test_{time.time_ns()}", MODULE)
+    assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
     spec.loader.exec_module(module)
     yield module
     sys.modules.pop("google_api", None)
