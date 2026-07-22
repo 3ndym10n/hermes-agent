@@ -8,6 +8,7 @@ import io
 import json
 import os
 import signal
+from dataclasses import replace
 import stat
 import subprocess
 import urllib.error
@@ -48,10 +49,27 @@ CLAIM = {
         "cancellation_terms": "No recurring commitment authorized.",
         "auto_renew": False,
     },
+    "checkout_target": {
+        "merchant_id": MERCHANT,
+        "product_kind": "domain_registration",
+        "product_id": "example.com",
+        "session_requirement": "anonymous",
+    },
+}
+CLAIM["checkout_terms"] = {
+    "product_or_service": CLAIM["approved_item"],
+    "quantity": CLAIM["quantity"],
+    "quoted_subtotal": "20.00",
+    "tax": "2.00",
+    "mandatory_fees": "0.00",
+    "final_quoted_total": CLAIM["maximum_total"],
+    "currency": CLAIM["currency"],
+    "recurrence_authorization": CLAIM["recurrence_authorization"],
 }
 
 CHECKOUT_TEXT = (
     "Fake Registrar\nexample.com domain registration\nQuantity: 1\n"
+    "Subtotal: 20.00 AUD\nTax: 2.00 AUD\nMandatory fees: 0.00 AUD\n"
     "Total: 22.00 AUD\nPay now"
 )
 CHECKOUT_PAGE = {
@@ -60,6 +78,7 @@ CHECKOUT_PAGE = {
     "merchant": "Fake Registrar",
     "has_form": True,
     "form_action": f"https://{MERCHANT}/pay",
+    "prepared_session": False,
 }
 CONFIRM_PAGE = {
     "url": f"https://{MERCHANT}/pay",
@@ -105,6 +124,19 @@ DISCOVERY_PLAN = discovery.DiscoveryPlan(
     ),
     submit=_match("submit", "role", "Pay now"),
 )
+
+
+TEST_ADAPTER = replace(
+    purchase_merchants.PORKBUN,
+    cart_paths={
+        "domain_registration": "/checkout?product_kind=domain_registration&product_id={product_id}&quantity={quantity}",
+        "merchant_sku": "/checkout?product_kind=merchant_sku&product_id={product_id}&quantity={quantity}",
+    },
+)
+
+
+def _adapter_for_test(domain, *, fake_e2e):
+    return TEST_ADAPTER if domain == MERCHANT else None
 
 
 class FakeBrowser:
@@ -212,9 +244,10 @@ def run(browser, bridge, tmp_path, *, fake_e2e=False, token="tok\n"):
         browser=browser,
         audit=pe.audit_factory(state),
         state_dir=state,
-        checkout_url_for=lambda claim: "https://porkbun.com/checkout",
+        checkout_url_for=lambda claim: "https://porkbun.com",
         fake_e2e=fake_e2e,
         stdin=io.StringIO(token),
+        adapter_for=_adapter_for_test,
         post_submit_wait=0.2,
         sleep=lambda seconds: None,
     )
@@ -246,6 +279,9 @@ def test_happy_path_completes_once(tmp_path, creds):
     assert receipt_path.is_file()
     assert stat.S_IMODE(receipt_path.stat().st_mode) == 0o600
     assert browser.cleaned == ["purchase_pt_test"]
+    assert ("navigate", "https://porkbun.com/checkout?product_kind=domain_registration&product_id=example.com&quantity=1") in browser.calls
+    first_discovery = next(index for index, call in enumerate(browser.calls) if call[0] == "discover")
+    assert [kind for kind, _ in browser.calls[:first_discovery]].count("probe") == 2
 
 
 def test_claim_rejected_touches_nothing(tmp_path, creds):
@@ -278,6 +314,156 @@ def test_price_mismatch_aborts_without_submit(tmp_path, creds):
     assert "submit" not in [kind for kind, _ in browser.calls]
 
 
+@pytest.mark.parametrize(
+    "case",
+    [
+        "missing_target", "extra_target", "merchant_mismatch", "product_mismatch",
+        "domain_prefix", "quantity_mismatch", "total_mismatch",
+        "inconsistent_components", "recurrence_mismatch",
+    ],
+)
+def test_invalid_checkout_contract_stops_before_navigation_or_credentials(
+    tmp_path, creds, monkeypatch, case,
+):
+    claim = json.loads(json.dumps(CLAIM))
+    if case == "missing_target":
+        claim.pop("checkout_target")
+    elif case == "extra_target":
+        claim["checkout_target"]["unexpected"] = "x"
+    elif case == "merchant_mismatch":
+        claim["checkout_target"]["merchant_id"] = "evil.example"
+    elif case == "product_mismatch":
+        claim["checkout_target"]["product_id"] = "other.example"
+    elif case == "domain_prefix":
+        claim["approved_item"] = "notexample.com domain registration"
+        claim["checkout_terms"]["product_or_service"] = claim["approved_item"]
+    elif case == "quantity_mismatch":
+        claim["checkout_terms"]["quantity"] = 2
+    elif case == "total_mismatch":
+        claim["checkout_terms"]["final_quoted_total"] = "21.00"
+    elif case == "inconsistent_components":
+        claim["checkout_terms"]["tax"] = "3.00"
+    else:
+        claim["checkout_terms"]["recurrence_authorization"]["auto_renew"] = True
+
+    monkeypatch.setattr(
+        pe, "load_payment_fields",
+        lambda: (_ for _ in ()).throw(AssertionError("credentials opened")),
+    )
+    browser, bridge = FakeBrowser(), FakeBridge(claim=claim)
+    assert run(browser, bridge, tmp_path) == pe.EXIT_DEFINITIVE_FAILURE
+    assert terminal_calls(bridge)[0][1]["failure_category"] == "checkout_not_ready"
+    assert browser.calls == []
+    assert browser.cleaned == ["purchase_pt_test"]
+
+
+def test_sku_contract_matches_cogitator_and_cart_path_is_encoded():
+    claim = json.loads(json.dumps(CLAIM))
+    claim["approved_item"] = "Basic hosting"
+    claim["checkout_terms"]["product_or_service"] = claim["approved_item"]
+    claim["checkout_target"].update(product_kind="merchant_sku", product_id="plan:basic")
+
+    target, _ = pe._checkout_contract(claim, TEST_ADAPTER)
+    assert purchase_merchants.cart_path(
+        TEST_ADAPTER, target["product_kind"], target["product_id"], claim["quantity"]
+    ) == "/checkout?product_kind=merchant_sku&product_id=plan%3Abasic&quantity=1"
+
+
+def test_production_adapter_without_verified_cart_path_fails_before_navigation(
+    tmp_path, creds, monkeypatch,
+):
+    monkeypatch.setattr(
+        pe, "load_payment_fields",
+        lambda: (_ for _ in ()).throw(AssertionError("credentials opened")),
+    )
+    browser, bridge = FakeBrowser(), FakeBridge()
+    result = pe.run_once(
+        bridge_post=bridge,
+        browser=browser,
+        audit=pe.audit_factory(tmp_path),
+        state_dir=tmp_path,
+        checkout_url_for=lambda claim: "https://porkbun.com",
+        fake_e2e=False,
+        stdin=io.StringIO("tok\n"),
+    )
+    assert result == pe.EXIT_DEFINITIVE_FAILURE
+    assert terminal_calls(bridge)[0][1]["failure_category"] == "checkout_not_ready"
+    assert browser.calls == []
+
+
+def test_authenticated_checkout_without_prepared_session_is_login_required(
+    tmp_path, creds, monkeypatch,
+):
+    claim = json.loads(json.dumps(CLAIM))
+    claim["checkout_target"]["session_requirement"] = "authenticated"
+    page = dict(CHECKOUT_PAGE, url="http://127.0.0.1:8000/cart", prepared_session=False)
+    monkeypatch.setattr(
+        pe, "load_payment_fields",
+        lambda: (_ for _ in ()).throw(AssertionError("credentials opened")),
+    )
+    browser, bridge = FakeBrowser(pages=[page, CONFIRM_PAGE]), FakeBridge(claim=claim)
+    result = pe.run_once(
+        bridge_post=bridge,
+        browser=browser,
+        audit=pe.audit_factory(tmp_path),
+        state_dir=tmp_path,
+        checkout_url_for=lambda claimed: "http://127.0.0.1:8000",
+        fake_e2e=True,
+        stdin=io.StringIO("tok\n"),
+    )
+    assert result == pe.EXIT_DEFINITIVE_FAILURE
+    assert terminal_calls(bridge)[0][1]["failure_category"] == "login_required"
+    assert [kind for kind, _ in browser.calls].count("navigate") == 1
+    assert "fill" not in [kind for kind, _ in browser.calls]
+
+
+@pytest.mark.parametrize(
+    "text,problem",
+    [
+        (CHECKOUT_TEXT.replace("Subtotal: 20.00", "Subtotal: 21.00"), "subtotal_mismatch"),
+        (CHECKOUT_TEXT.replace("Tax: 2.00 AUD\n", ""), "tax_missing"),
+        (CHECKOUT_TEXT + "\nMandatory fees: 0.00 AUD", "mandatory_fees_ambiguous"),
+        (CHECKOUT_TEXT.replace("Total: 22.00", "Total: 23.00"), "total_mismatch"),
+        (CHECKOUT_TEXT.replace("Tax: 2.00 AUD", "Tax: 2.00 USD"), "currency_mismatch"),
+        (CHECKOUT_TEXT + "\nQuantity: 2", "quantity_ambiguous"),
+        (CHECKOUT_TEXT + "\nexample.com domain registration", "item_ambiguous"),
+        (
+            CHECKOUT_TEXT.replace(
+                "example.com domain registration",
+                "Other item\nRelated: example.com domain registration",
+            ),
+            "item_missing",
+        ),
+    ],
+)
+def test_exact_commercial_breakdown_is_required(text, problem):
+    assert problem in pe.check_terms(text, CLAIM)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        CHECKOUT_TEXT.replace("Subtotal: 20.00", "Subtotal: 21.00"),
+        CHECKOUT_TEXT + "\nQuantity: 2",
+        CHECKOUT_TEXT + "\nexample.com domain registration",
+        CHECKOUT_TEXT.replace(
+            "example.com domain registration",
+            "Other item\nRelated: example.com domain registration",
+        ),
+    ],
+)
+def test_term_failure_precedes_credential_access(tmp_path, creds, monkeypatch, text):
+    page = dict(CHECKOUT_PAGE, text=text)
+    monkeypatch.setattr(
+        pe, "load_payment_fields",
+        lambda: (_ for _ in ()).throw(AssertionError("credentials opened")),
+    )
+    browser, bridge = FakeBrowser(pages=[page, CONFIRM_PAGE]), FakeBridge()
+    assert run(browser, bridge, tmp_path) == pe.EXIT_DEFINITIVE_FAILURE
+    assert terminal_calls(bridge)[0][1]["failure_category"] == "terms_changed"
+    assert "discover" not in [kind for kind, _ in browser.calls]
+
+
 def test_check_terms_currency_item_quantity_recurrence():
     assert pe.check_terms(CHECKOUT_TEXT, CLAIM) == []
     assert "currency_missing" in pe.check_terms(CHECKOUT_TEXT.replace("AUD", "USD"), CLAIM)
@@ -289,9 +475,18 @@ def test_check_terms_currency_item_quantity_recurrence():
         CHECKOUT_TEXT.replace("Quantity: 1\n", ""), CLAIM)
     assert "unexpected_recurrence" in pe.check_terms(
         CHECKOUT_TEXT + "\nauto-renews yearly", CLAIM)
-    monthly = {**CLAIM, "recurrence_authorization": dict(
+    monthly_recurrence = dict(
         CLAIM["recurrence_authorization"], commitment_type="subscription",
-        billing_interval="monthly", auto_renew=True)}
+        billing_interval="monthly", auto_renew=True,
+    )
+    monthly = {
+        **CLAIM,
+        "recurrence_authorization": monthly_recurrence,
+        "checkout_terms": {
+            **CLAIM["checkout_terms"],
+            "recurrence_authorization": monthly_recurrence,
+        },
+    }
     assert "recurrence_not_shown" in pe.check_terms(CHECKOUT_TEXT, monthly)
     recurring_text = (
         CHECKOUT_TEXT + "\nsubscription\nBilling interval: monthly\nRenewal amount: 22.00\n"
@@ -1017,9 +1212,10 @@ def test_unsafe_checkout_url_is_rejected_before_navigation(tmp_path, creds):
         browser=browser,
         audit=pe.audit_factory(tmp_path),
         state_dir=tmp_path,
-        checkout_url_for=lambda claim: "https://registrar.example@evil.example/checkout",
+        checkout_url_for=lambda claim: "https://registrar.example@evil.example",
         fake_e2e=False,
         stdin=io.StringIO("tok\n"),
+        adapter_for=_adapter_for_test,
     )
     assert result == pe.EXIT_DEFINITIVE_FAILURE
     assert browser.calls == []

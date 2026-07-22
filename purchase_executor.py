@@ -48,7 +48,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import quote, urlsplit, urlunsplit
 
 import purchase_discovery as discovery
 import purchase_merchants
@@ -132,6 +132,7 @@ PAGE_PROBE_JS = (
     " const m = document.querySelector('#merchant, [data-merchant]');"
     " return JSON.stringify({url: location.href, text: t.slice(0, 20000),"
     " merchant: (m && m.textContent || document.title || '').trim(),"
+    " prepared_session: document.documentElement.dataset.hermesPreparedSession === 'authenticated',"
     " filled: document.documentElement.dataset.hermesPurchaseFilled === '1'}); })()"
 )
 # Set after a successful genuine-input fill; the post-fill re-probe reads this
@@ -155,7 +156,6 @@ RECURRING_RE = re.compile(
     r"(?i)subscription|auto[- ]?renew|recurring|billed (?:monthly|annually|yearly)"
 )
 AUTO_RENEW_RE = re.compile(r"(?i)auto(?:matically)?[- ]?renew")
-TOTAL_RE = re.compile(r"(?i)total\D{0,10}(\d+\.\d{2})")
 
 
 # --- control-flow signals ----------------------------------------------------
@@ -666,24 +666,120 @@ def page_origin_allowed(page: dict, canonical_domain: str, *, fake_e2e: bool) ->
     return origin_allowed(page.get("url", ""), canonical_domain, fake_e2e=fake_e2e)
 
 
+def _checkout_contract(claim: dict, adapter) -> tuple[dict, dict]:
+    target = claim.get("checkout_target")
+    terms = claim.get("checkout_terms")
+    target_keys = {"merchant_id", "product_kind", "product_id", "session_requirement"}
+    term_keys = {
+        "product_or_service", "quantity", "quoted_subtotal", "tax",
+        "mandatory_fees", "final_quoted_total", "currency",
+        "recurrence_authorization",
+    }
+    recurrence_keys = {
+        "commitment_type", "billing_interval", "renewal_amount", "renewal_date",
+        "cancellation_deadline", "contract_duration", "cancellation_terms", "auto_renew",
+    }
+    if not isinstance(target, dict) or set(target) != target_keys:
+        raise _Stop("definitive", "checkout_not_ready")
+    if not isinstance(terms, dict) or set(terms) != term_keys:
+        raise _Stop("definitive", "checkout_not_ready")
+    recurrence = terms.get("recurrence_authorization")
+    if not isinstance(recurrence, dict) or set(recurrence) != recurrence_keys:
+        raise _Stop("definitive", "checkout_not_ready")
+    canonical = str(claim.get("canonical_merchant_domain") or "").lower()
+    if target["merchant_id"] != canonical or (
+        adapter is not purchase_merchants.MOCK and adapter.canonical_domain != canonical
+    ):
+        raise _Stop("definitive", "checkout_not_ready")
+    if target["session_requirement"] not in {"anonymous", "authenticated"}:
+        raise _Stop("definitive", "checkout_not_ready")
+    product_id = target["product_id"]
+    if not isinstance(product_id, str) or not product_id or len(product_id) > 160:
+        raise _Stop("definitive", "checkout_not_ready")
+    if target["product_kind"] == "domain_registration":
+        if not re.fullmatch(
+            r"(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}",
+            product_id,
+        ) or product_id not in str(terms["product_or_service"]).lower().split():
+            raise _Stop("definitive", "checkout_not_ready")
+    elif target["product_kind"] == "merchant_sku":
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,159}", product_id):
+            raise _Stop("definitive", "checkout_not_ready")
+    else:
+        raise _Stop("definitive", "checkout_not_ready")
+    quantity = terms["quantity"]
+    if isinstance(quantity, bool) or not isinstance(quantity, int) or quantity < 1:
+        raise _Stop("definitive", "checkout_not_ready")
+    money_fields = ("quoted_subtotal", "tax", "mandatory_fees", "final_quoted_total")
+    if any(not re.fullmatch(r"\d{1,10}\.\d{2}", str(terms.get(key) or "")) for key in money_fields):
+        raise _Stop("definitive", "checkout_not_ready")
+    cents = {
+        key: int(str(terms[key]).replace(".", ""))
+        for key in money_fields
+    }
+    if cents["quoted_subtotal"] + cents["tax"] + cents["mandatory_fees"] != cents["final_quoted_total"]:
+        raise _Stop("definitive", "checkout_not_ready")
+    if (
+        terms["product_or_service"] != claim.get("approved_item")
+        or quantity != claim.get("quantity")
+        or terms["final_quoted_total"] != claim.get("maximum_total")
+        or terms["currency"] != claim.get("currency")
+        or recurrence != claim.get("recurrence_authorization")
+    ):
+        raise _Stop("definitive", "checkout_not_ready")
+    return target, terms
+
+
+def _checkout_url(base_url: str, cart_path: str) -> str:
+    base = urlsplit(base_url)
+    relative = urlsplit(cart_path)
+    if not base.scheme or not base.netloc or relative.scheme or relative.netloc or not relative.path.startswith("/"):
+        return ""
+    return urlunsplit((base.scheme, base.netloc, relative.path, relative.query, ""))
+
+
 def check_terms(page_text: str, claim: dict) -> list[str]:
     problems = []
-    approved_total = claim["maximum_total"]
-    totals = TOTAL_RE.findall(page_text)
-    if not totals:
-        problems.append("total_missing")
-    elif any(total != approved_total for total in totals):
-        problems.append("total_mismatch")
-    if claim["currency"] not in page_text:
+    terms = claim["checkout_terms"]
+    currency = terms["currency"]
+    if currency not in page_text:
         problems.append("currency_missing")
-    if claim["approved_item"].lower() not in page_text.lower():
+    labels = {
+        "subtotal": (r"(?:quoted\s+)?subtotal", terms["quoted_subtotal"]),
+        "tax": (r"tax", terms["tax"]),
+        "mandatory_fees": (r"(?:mandatory\s+)?fees", terms["mandatory_fees"]),
+        "total": (r"(?:final\s+|order\s+)?total", terms["final_quoted_total"]),
+    }
+    for name, (label, expected) in labels.items():
+        matches = re.findall(
+            rf"(?im)^\s*(?:{label})\s*:\s*(\d{{1,10}}\.\d{{2}})\s+([A-Z]{{3}})\s*$",
+            page_text,
+        )
+        if not matches:
+            problems.append(f"{name}_missing")
+        elif len(matches) != 1:
+            problems.append(f"{name}_ambiguous")
+        else:
+            amount, found_currency = matches[0]
+            if amount != expected:
+                problems.append(f"{name}_mismatch")
+            if found_currency != currency and "currency_mismatch" not in problems:
+                problems.append("currency_mismatch")
+    item_matches = re.findall(
+        rf"(?im)^\s*{re.escape(terms['product_or_service'])}\s*$", page_text
+    )
+    if not item_matches:
         problems.append("item_missing")
-    quantity_match = re.search(r"(?i)quantity\D{0,5}(\d+)", page_text)
-    if not quantity_match:
+    elif len(item_matches) != 1:
+        problems.append("item_ambiguous")
+    quantities = re.findall(r"(?im)^\s*quantity\s*:\s*(\d+)\s*$", page_text)
+    if not quantities:
         problems.append("quantity_missing")
-    elif int(quantity_match.group(1)) != int(claim["quantity"]):
+    elif len(quantities) != 1:
+        problems.append("quantity_ambiguous")
+    elif int(quantities[0]) != int(terms["quantity"]):
         problems.append("quantity_mismatch")
-    recurrence = claim["recurrence_authorization"]
+    recurrence = terms["recurrence_authorization"]
     is_recurring_page = bool(RECURRING_RE.search(page_text))
     if recurrence["commitment_type"] == "one_time" and is_recurring_page:
         problems.append("unexpected_recurrence")
@@ -860,6 +956,7 @@ def run_once(
     post_submit_wait: float = POST_SUBMIT_WAIT_SECONDS,
     sleep=time.sleep,
     fake_processor_origins: tuple[str, ...] = (),
+    adapter_for=purchase_merchants.adapter_for,
 ) -> int:
     """One attempt: claim → checkout → exactly one terminal report. No retry."""
     intent = "Restricted Purchase Executor V0 run for one claimed execution ticket."
@@ -933,40 +1030,84 @@ def run_once(
             if termination["pending"]:
                 raise _Terminated()
             audit("claimed", ticket_id=ticket_id, proposal_id=claim["proposal_id"], task_id=task_id)
-            # Fail closed on an unsupported merchant BEFORE opening credential
-            # files, filling, or submitting. Production allows Porkbun only;
-            # fake/staging uses the loopback mock adapter.
-            adapter = purchase_merchants.adapter_for(
-                claim["canonical_merchant_domain"], fake_e2e=fake_e2e
-            )
+            # Fail closed on an unsupported merchant and malformed ticket contract
+            # before navigation, credential access, fill, or submit.
+            adapter = adapter_for(claim["canonical_merchant_domain"], fake_e2e=fake_e2e)
             if adapter is None:
                 audit("merchant_rejected", domain=strip_query(claim["canonical_merchant_domain"]))
                 raise _Stop("definitive", "merchant_not_supported")
-            checkout_url = checkout_url_for(claim)
+            target, _ = _checkout_contract(claim, adapter)
+            path = purchase_merchants.cart_path(
+                adapter, target["product_kind"], target["product_id"], claim["quantity"]
+            )
+            if not path:
+                raise _Stop("definitive", "checkout_not_ready")
+            base_url = checkout_url_for(claim)
+            checkout_url = _checkout_url(base_url, path)
             if not origin_allowed(
                 checkout_url, claim["canonical_merchant_domain"], fake_e2e=fake_e2e
             ):
                 raise _Stop("definitive", "wrong_origin")
-            navigation = browser.navigate(checkout_url, task_id)
+
+            authenticated = target["session_requirement"] == "authenticated"
+            navigation_url = checkout_url
+            if authenticated:
+                handoff_path = adapter.fake_session_handoff_path if (
+                    fake_e2e and adapter is purchase_merchants.MOCK
+                ) else ""
+                if not handoff_path:
+                    raise _Stop("definitive", "login_required")
+                navigation_url = _checkout_url(
+                    base_url, f"{handoff_path}?return={quote(path, safe='')}"
+                )
+                if not origin_allowed(
+                    navigation_url, claim["canonical_merchant_domain"], fake_e2e=fake_e2e
+                ):
+                    raise _Stop("definitive", "wrong_origin")
+
+            navigation = browser.navigate(navigation_url, task_id)
+            if authenticated:
+                audit("session_handoff", success=bool(navigation.get("success")))
             audit("navigated", url=strip_query(checkout_url), success=bool(navigation.get("success")))
             if not navigation.get("success"):
                 raise _Stop("definitive", "navigation_failed")
 
-            probe = browser.eval_js(PAGE_PROBE_JS, task_id)
-            if not probe.get("success"):
-                raise _Stop("definitive", "page_read_failed")
-            page = probe["result"]
-            if not page_origin_allowed(
-                page, claim["canonical_merchant_domain"], fake_e2e=fake_e2e
-            ):
-                audit("origin_rejected", url=strip_query(page.get("url", "")))
-                raise _Stop("definitive", "wrong_origin")
-            page_text = page.get("text", "")
-            if CHALLENGE_RE.search(page_text):
-                raise _Stop("definitive", "human_challenge_required")
-            if page.get("filled"):
-                raise _Stop("definitive", "invalid_checkout_state")
+            def inspect_precredential(gate: str):
+                probe = browser.eval_js(PAGE_PROBE_JS, task_id)
+                if not probe.get("success"):
+                    raise _Stop("definitive", "page_read_failed")
+                page = probe["result"]
+                if not page_origin_allowed(
+                    page, claim["canonical_merchant_domain"], fake_e2e=fake_e2e
+                ):
+                    audit("origin_rejected", url=strip_query(page.get("url", "")))
+                    raise _Stop("definitive", "wrong_origin")
+                page_text = page.get("text", "")
+                if CHALLENGE_RE.search(page_text):
+                    raise _Stop("definitive", "human_challenge_required")
+                if page.get("filled"):
+                    raise _Stop("definitive", "invalid_checkout_state")
+                if authenticated and not (
+                    fake_e2e
+                    and adapter is purchase_merchants.MOCK
+                    and page.get("prepared_session") is True
+                ):
+                    raise _Stop("definitive", "login_required")
+                mismatches = check_terms(page_text, claim)
+                if mismatches:
+                    audit("terms_rejected", gate=gate, mismatches=mismatches)
+                    raise _Stop("definitive", "terms_changed")
+                audit(
+                    "checkout_validated", gate=gate,
+                    total=claim["maximum_total"], currency=claim["currency"],
+                )
+                return page
+
+            # The prepared cart, session, and exact commercial breakdown pass
+            # twice before semantic payment discovery begins.
+            page = inspect_precredential("bootstrap")
             merchant_name = page.get("merchant", "")
+            inspect_precredential("prefill")
 
             def discover_checkout(bind_controls=True):
                 try:
@@ -984,26 +1125,10 @@ def run_once(
 
             plan = discover_checkout()
             audit("discovered", **plan.audit())
-            mismatches = check_terms(page_text, claim)
-            if mismatches:
-                audit("terms_rejected", mismatches=mismatches)
-                raise _Stop("definitive", "terms_changed")
-            audit("revalidated", total=claim["maximum_total"], currency=claim["currency"])
 
-            # A second terms + discovery pass closes the pre-credential TOCTOU
-            # window. No payment file has been opened before both gates pass.
-            prefill = browser.eval_js(PAGE_PROBE_JS, task_id)
-            if not prefill.get("success"):
-                raise _Stop("definitive", "page_read_failed")
-            prefill_page = prefill["result"]
-            if not page_origin_allowed(
-                prefill_page, claim["canonical_merchant_domain"], fake_e2e=fake_e2e
-            ):
-                raise _Stop("definitive", "wrong_origin")
-            if CHALLENGE_RE.search(prefill_page.get("text", "")):
-                raise _Stop("definitive", "human_challenge_required")
-            if check_terms(prefill_page.get("text", ""), claim):
-                raise _Stop("definitive", "terms_changed")
+            # Preserve V0.2's second discovery fingerprint and terms gate before
+            # opening any payment credential file.
+            inspect_precredential("discovery_confirmation")
             confirmed_plan = discover_checkout()
             if confirmed_plan.fingerprint != plan.fingerprint:
                 raise _Stop("definitive", "checkout_not_ready")
@@ -1029,6 +1154,12 @@ def run_once(
             recheck_text = recheck_page.get("text", "")
             if CHALLENGE_RE.search(recheck_text):
                 raise _Stop("definitive", "human_challenge_required")
+            if authenticated and not (
+                fake_e2e
+                and adapter is purchase_merchants.MOCK
+                and recheck_page.get("prepared_session") is True
+            ):
+                raise _Stop("definitive", "login_required")
             if check_terms(recheck_text, claim):
                 raise _Stop("definitive", "terms_changed")
             final_plan = discover_checkout(bind_controls=False)
@@ -1124,8 +1255,6 @@ def parse_args(argv=None) -> argparse.Namespace:
                         help="loopback-only acceptance mode; refuses any non-loopback URL")
     parser.add_argument("--checkout-url", default="",
                         help="explicit checkout URL; only valid with --fake-e2e")
-    parser.add_argument("--checkout-path", default="/checkout",
-                        help="path appended to https://<canonical merchant domain>")
     parser.add_argument("--fake-processor-origin", action="append", default=[],
                         help="exact loopback hosted-field origin; fake-E2E only")
     parser.add_argument("--state-dir", default=DEFAULT_STATE_DIR,
@@ -1163,7 +1292,7 @@ def main(argv=None) -> int:
     def checkout_url_for(claim: dict) -> str:
         if args.fake_e2e:
             return args.checkout_url
-        return f"https://{claim['canonical_merchant_domain']}{args.checkout_path}"
+        return f"https://{claim['canonical_merchant_domain']}"
 
     def execute() -> int:
         return run_once(

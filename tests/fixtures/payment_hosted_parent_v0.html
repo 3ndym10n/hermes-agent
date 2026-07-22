@@ -6,9 +6,12 @@
   <h1 id="merchant">Fake Registrar</h1>
   <p>example.com domain registration</p>
   <p>Quantity: 1</p>
+  <p>Subtotal: 20.00 AUD</p>
+  <p>Tax: 2.00 AUD</p>
+  <p>Mandatory fees: 0.00 AUD</p>
   <p>Total: 22.00 AUD</p>
   <iframe id="hosted-payment" title="Secure payment fields"
-          src="{{PROCESSOR_ORIGIN}}/fields" style="width: 500px; height: 300px"></iframe>
+          src="{{PROCESSOR_ORIGIN}}/fields" style="width: 500px; height: 180px"></iframe>
   <form id="payment" aria-label="Payment" action="/pay" method="post">
     <button type="submit">Pay now</button>
   </form>
