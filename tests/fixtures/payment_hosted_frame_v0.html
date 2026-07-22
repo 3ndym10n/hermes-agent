@@ -1,0 +1,13 @@
+<!doctype html>
+<!-- Sanitized loopback-only hosted-payment field fixture. -->
+<html lang="en">
+<head><meta charset="utf-8"><title>Hosted payment fields</title></head>
+<body>
+  <form id="hosted" aria-label="Payment" action="/tokenize" method="post">
+    <label>Card number <input name="account" autocomplete="cc-number"></label>
+    <label>Expiration date <input name="expires" autocomplete="cc-exp"></label>
+    <label>Security code <input name="verification" autocomplete="cc-csc"></label>
+    <label>Name on card <input name="holder" autocomplete="cc-name"></label>
+  </form>
+</body>
+</html>

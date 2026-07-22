@@ -1,4 +1,4 @@
-"""Fake end-to-end acceptance for the Restricted Purchase Executor V0 (issue #65).
+"""Fake end-to-end acceptance for semantic purchase discovery (issues #65/#73).
 
 Everything is local and synthetic:
   * temporary SQLite governance DB seeded with one approved proposal + ticket,
@@ -38,17 +38,10 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
-CHECKOUT_HTML = b"""<!doctype html><html><body>
-<h1 id="merchant">Fake Registrar</h1>
-<p>example.com domain registration</p>
-<p>Quantity: 1</p>
-<p>Total: 22.00 AUD</p>
-<form action="/pay" method="post">
-  <input name="card_number"><input name="card_expiry">
-  <input name="card_cvv"><input name="card_name">
-  <button type="submit">Pay</button>
-</form>
-</body></html>"""
+SAME_PAGE_FIXTURE = REPO_ROOT / "tests" / "fixtures" / "payment_same_page_v0.html"
+HOSTED_PARENT_FIXTURE = REPO_ROOT / "tests" / "fixtures" / "payment_hosted_parent_v0.html"
+HOSTED_FRAME_FIXTURE = REPO_ROOT / "tests" / "fixtures" / "payment_hosted_frame_v0.html"
+
 
 CONFIRM_HTML = b"""<!doctype html><html><body>
 <h1>Order confirmed</h1>
@@ -59,6 +52,8 @@ CONFIRM_HTML = b"""<!doctype html><html><body>
 
 
 class MockMerchant(BaseHTTPRequestHandler):
+    checkout_html = b""
+
     def log_message(self, *args):
         pass
 
@@ -70,11 +65,33 @@ class MockMerchant(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
-        self._send(CHECKOUT_HTML if self.path.startswith("/checkout") else b"<html>404</html>")
+        self._send(self.checkout_html if self.path.startswith("/checkout") else b"<html>404</html>")
 
     def do_POST(self):
         self.rfile.read(int(self.headers.get("Content-Length") or 0))
         self._send(CONFIRM_HTML)
+
+
+class MockProcessor(BaseHTTPRequestHandler):
+    def log_message(self, *args):
+        pass
+
+    def do_GET(self):
+        body = (
+            HOSTED_FRAME_FIXTURE.read_bytes()
+            if self.path.startswith("/fields")
+            else b"<html>404</html>"
+        )
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_POST(self):
+        self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        self.send_response(204)
+        self.end_headers()
 
 
 def browser_proc_count() -> int:
@@ -109,6 +126,10 @@ def require(condition: bool, invariant: str) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--cogitator-repo", required=True)
+    parser.add_argument(
+        "--hosted-frame", action="store_true",
+        help="serve card fields from a second exact-allowlisted loopback origin",
+    )
     parser.add_argument(
         "--credentials-dir", default="",
         help="use externally-provided synthetic credentials (e.g. the staging "
@@ -198,6 +219,18 @@ def main() -> int:
     threading.Thread(target=bridge_server.serve_forever, daemon=True).start()
     bridge_url = f"http://127.0.0.1:{bridge_server.server_address[1]}"
 
+    processor_server = None
+    processor_origin = ""
+    if args.hosted_frame:
+        processor_server = ThreadingHTTPServer(("127.0.0.1", 0), MockProcessor)
+        threading.Thread(target=processor_server.serve_forever, daemon=True).start()
+        processor_origin = f"http://127.0.0.1:{processor_server.server_address[1]}"
+        MockMerchant.checkout_html = HOSTED_PARENT_FIXTURE.read_text().replace(
+            "{{PROCESSOR_ORIGIN}}", processor_origin
+        ).encode()
+    else:
+        MockMerchant.checkout_html = SAME_PAGE_FIXTURE.read_bytes()
+
     merchant_server = ThreadingHTTPServer(("127.0.0.1", 0), MockMerchant)
     threading.Thread(target=merchant_server.serve_forever, daemon=True).start()
     checkout_url = f"http://127.0.0.1:{merchant_server.server_address[1]}/checkout"
@@ -234,13 +267,22 @@ def main() -> int:
     env = dict(os.environ)
     env["CREDENTIALS_DIRECTORY"] = str(creds)
     env["COGITATOR_BRIDGE_TOKEN"] = bridge_token
+    command = [
+        sys.executable, "-m", "purchase_executor",
+        "--bridge-url", bridge_url,
+        "--fake-e2e", "--checkout-url", checkout_url,
+        "--state-dir", str(tmp / "state"),
+    ]
+    if processor_origin:
+        command.extend(["--fake-processor-origin", processor_origin])
     run = subprocess.run(
-        [sys.executable, "-m", "purchase_executor",
-         "--bridge-url", bridge_url,
-         "--fake-e2e", "--checkout-url", checkout_url,
-         "--state-dir", str(tmp / "state")],
+        command,
         input=ticket["ticket_token"], text=True, capture_output=True,
         cwd=REPO_ROOT, env=env, timeout=240,
+    )
+    require(
+        not any(value in run.stdout + run.stderr for value in expected.values()),
+        "executor output contains a payment value",
     )
     print(run.stdout, end="")
     print(run.stderr, end="", file=sys.stderr)
@@ -277,12 +319,20 @@ def main() -> int:
 
     audit = (tmp / "state" / "audit.jsonl").read_text()
     require("4242424242424242" not in audit, "audit log contains no card number")
+    require('"phase": "discovered"' in audit, "semantic discovery audited")
     require('"phase": "cleaned_up"' in audit, "browser cleanup audited")
+    if args.hosted_frame:
+        require(processor_origin in audit, "hosted processor origin audited")
+    else:
+        require('"frame_origins": []' in audit, "same-page discovery has no hosted frames")
 
     bridge_server.shutdown()
     merchant_server.shutdown()
+    if processor_server:
+        processor_server.shutdown()
     print(json.dumps({
         "fake_e2e": "PASS",
+        "checkout_shape": "hosted_frame" if args.hosted_frame else "same_page",
         "proposal_id": proposal_id,
         "ticket_id": ticket["ticket_id"],
         "ledger_before": ledger_before, "ledger_after": ledger_after,

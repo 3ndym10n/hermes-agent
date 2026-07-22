@@ -1,0 +1,16 @@
+<!doctype html>
+<!-- Sanitized loopback-only hosted-payment parent fixture. -->
+<html lang="en">
+<head><meta charset="utf-8"><title>Fake Registrar Hosted Checkout</title></head>
+<body>
+  <h1 id="merchant">Fake Registrar</h1>
+  <p>example.com domain registration</p>
+  <p>Quantity: 1</p>
+  <p>Total: 22.00 AUD</p>
+  <iframe id="hosted-payment" title="Secure payment fields"
+          src="{{PROCESSOR_ORIGIN}}/fields" style="width: 500px; height: 300px"></iframe>
+  <form id="payment" aria-label="Payment" action="/pay" method="post">
+    <button type="submit">Pay now</button>
+  </form>
+</body>
+</html>
