@@ -475,18 +475,13 @@ def test_check_terms_currency_item_quantity_recurrence():
         CHECKOUT_TEXT.replace("Quantity: 1\n", ""), CLAIM)
     assert "unexpected_recurrence" in pe.check_terms(
         CHECKOUT_TEXT + "\nauto-renews yearly", CLAIM)
-    monthly_recurrence = dict(
-        CLAIM["recurrence_authorization"], commitment_type="subscription",
-        billing_interval="monthly", auto_renew=True,
+    monthly_recurrence = json.loads(json.dumps(CLAIM["recurrence_authorization"]))
+    monthly_recurrence.update(
+        commitment_type="subscription", billing_interval="monthly", auto_renew=True
     )
-    monthly = {
-        **CLAIM,
-        "recurrence_authorization": monthly_recurrence,
-        "checkout_terms": {
-            **CLAIM["checkout_terms"],
-            "recurrence_authorization": monthly_recurrence,
-        },
-    }
+    monthly = json.loads(json.dumps(CLAIM))
+    monthly["recurrence_authorization"] = monthly_recurrence
+    monthly["checkout_terms"]["recurrence_authorization"] = monthly_recurrence
     assert "recurrence_not_shown" in pe.check_terms(CHECKOUT_TEXT, monthly)
     recurring_text = (
         CHECKOUT_TEXT + "\nsubscription\nBilling interval: monthly\nRenewal amount: 22.00\n"
