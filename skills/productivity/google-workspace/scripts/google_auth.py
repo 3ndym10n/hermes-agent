@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 from pathlib import Path
 
 from _hermes_home import get_hermes_home
@@ -42,22 +43,28 @@ def private_state_path(name: str) -> Path:
 
 
 def ensure_private_directory(path: Path) -> None:
+    if path.is_symlink():
+        raise ValueError("private directory must not be a symlink")
     path.mkdir(mode=0o700, parents=True, exist_ok=True)
     path.chmod(0o700)
 
 
 def write_private_json(path: Path, payload: dict) -> None:
     ensure_private_directory(path.parent)
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     try:
         os.fchmod(fd, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as stream:
             fd = -1
             json.dump(payload, stream, indent=2)
             stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
     finally:
         if fd >= 0:
             os.close(fd)
+        Path(temporary).unlink(missing_ok=True)
 
 
 def secure_existing_file(path: Path) -> None:

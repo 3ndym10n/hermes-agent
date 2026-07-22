@@ -40,15 +40,18 @@ The browser consent and redirect step requires the user. Never print or copy cre
 
 ```bash
 GAPI="python ${HERMES_HOME:-$HOME/.hermes}/skills/productivity/google-workspace/scripts/google_api.py"
+EMAIL="python ${HERMES_HOME:-$HOME/.hermes}/skills/productivity/google-workspace/scripts/email_learning.py"
 $GAPI gmail search 'from:customer@example.com newer_than:30d' --max 10
 $GAPI gmail get MESSAGE_ID
 $GAPI gmail thread THREAD_ID
-$GAPI gmail draft-create --to recipient@example.com --subject 'Subject' --body 'Body'
-$GAPI gmail draft-reply MESSAGE_ID --body 'Reply body'
+$EMAIL draft-preview --draft-file PRIVATE_0600_JSON
+$EMAIL draft-create STATE_ID --draft-file PRIVATE_0600_JSON --approval-token TOKEN
 $GAPI gmail draft-delete DRAFT_ID
 ```
 
-There is no send, reply-send, or draft-send command.
+Drafts require an explicitly selected message/thread, a structured four-bucket context, and a one-time exact-preview approval. There is no send, reply-send, or draft-send command.
+
+Writing comparison is separate: after Cal manually sends the approved email, `comparison-preview` accepts only that explicitly selected Gmail message with a `SENT` label. Hermes never sends it.
 
 ## Calendar
 

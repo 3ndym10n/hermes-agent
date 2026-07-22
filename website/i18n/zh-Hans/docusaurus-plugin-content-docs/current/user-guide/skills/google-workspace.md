@@ -40,15 +40,18 @@ $GSETUP --service-profile linxio --auth-code '完整的本地重定向 URL'
 
 ```bash
 GAPI="python ${HERMES_HOME:-$HOME/.hermes}/skills/productivity/google-workspace/scripts/google_api.py"
+EMAIL="python ${HERMES_HOME:-$HOME/.hermes}/skills/productivity/google-workspace/scripts/email_learning.py"
 $GAPI gmail search 'from:customer@example.com newer_than:30d' --max 10
 $GAPI gmail get MESSAGE_ID
 $GAPI gmail thread THREAD_ID
-$GAPI gmail draft-create --to recipient@example.com --subject 'Subject' --body 'Body'
-$GAPI gmail draft-reply MESSAGE_ID --body 'Reply body'
+$EMAIL draft-preview --draft-file PRIVATE_0600_JSON
+$EMAIL draft-create STATE_ID --draft-file PRIVATE_0600_JSON --approval-token TOKEN
 $GAPI gmail draft-delete DRAFT_ID
 ```
 
-不存在 send、reply-send 或 draft-send 命令。
+草稿必须绑定 Cal 明确选择的消息或线程、四类结构化上下文及一次性精确预览批准。不存在 send、reply-send 或 draft-send 命令。
+
+写作比较是独立步骤：Cal 手动发送已批准的邮件后，`comparison-preview` 只接受 Cal 明确选择且带有 Gmail `SENT` 标签的消息。Hermes 永远不会发送邮件。
 
 ## Calendar
 

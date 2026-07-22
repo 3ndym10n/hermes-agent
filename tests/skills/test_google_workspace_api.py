@@ -328,14 +328,15 @@ def test_api_gmail_search_reads_headers_case_insensitively(
 
 def test_api_gmail_draft_uses_conventional_mime_header_casing(api_module):
     captured = {}
-
-    def fake_run_gws(parts, *, params=None, body=None):
-        captured["parts"] = parts
-        captured["params"] = params
-        captured["body"] = body
-        return {"id": "draft-1", "message": {"id": "msg-1", "threadId": "thread-1"}}
-
-    api_module._run_gws = fake_run_gws
+    service = MagicMock()
+    service.users.return_value.drafts.return_value.create.return_value.execute.return_value = {
+        "id": "draft-1", "message": {"id": "msg-1", "threadId": "thread-1"}}
+    service.users.return_value.drafts.return_value.create.side_effect = (
+        lambda **kwargs: captured.update(kwargs) or MagicMock(
+            execute=lambda: {"id": "draft-1", "message": {"id": "msg-1", "threadId": "thread-1"}})
+    )
+    api_module.build_service = lambda *_args: service
+    api_module._approve_gmail_draft = lambda *_args: True
     args = api_module.argparse.Namespace(
         to="recipient@example.com",
         subject="hello",
@@ -344,12 +345,13 @@ def test_api_gmail_draft_uses_conventional_mime_header_casing(api_module):
         cc="copy@example.com",
         from_header="sender@example.com",
         thread_id="thread-1",
+        source_kind="message",
+        source_id="msg-1",
         func=api_module.gmail_draft_create,
     )
 
     api_module.gmail_draft_create(args)
 
-    assert captured["parts"] == ["gmail", "users", "drafts", "create"]
     raw = api_module.base64.urlsafe_b64decode(captured["body"]["message"]["raw"])
     raw_text = raw.decode()
     assert "To: recipient@example.com" in raw_text
@@ -372,18 +374,8 @@ def test_api_gmail_reply_draft_reads_headers_case_insensitively_and_uses_convent
     header_names,
 ):
     from_name, subject_name, message_id_name = header_names
-    calls = []
-
-    def fake_run_gws(parts, *, params=None, body=None):
-        calls.append({"parts": parts, "params": params, "body": body})
-        if parts == ["gmail", "users", "messages", "get"]:
-            assert params == {
-                "userId": "me",
-                "id": "msg-1",
-                "format": "metadata",
-                "metadataHeaders": ["From", "Subject", "Message-ID"],
-            }
-            return {
+    service = MagicMock()
+    service.users.return_value.messages.return_value.get.return_value.execute.return_value = {
                 "id": "msg-1",
                 "threadId": "thread-1",
                 "payload": {
@@ -394,12 +386,13 @@ def test_api_gmail_reply_draft_reads_headers_case_insensitively_and_uses_convent
                     ],
                 },
             }
-
-        assert parts == ["gmail", "users", "drafts", "create"]
-        assert params == {"userId": "me"}
-        return {"id": "draft-1", "message": {"id": "msg-1", "threadId": "thread-1"}}
-
-    api_module._run_gws = fake_run_gws
+    captured = {}
+    service.users.return_value.drafts.return_value.create.side_effect = (
+        lambda **kwargs: captured.update(kwargs) or MagicMock(
+            execute=lambda: {"id": "draft-1", "message": {"id": "msg-1", "threadId": "thread-1"}})
+    )
+    api_module.build_service = lambda *_args: service
+    api_module._approve_gmail_draft = lambda *_args: True
     args = api_module.argparse.Namespace(
         message_id="msg-1",
         body="reply body",
@@ -409,8 +402,7 @@ def test_api_gmail_reply_draft_reads_headers_case_insensitively_and_uses_convent
 
     api_module.gmail_draft_reply(args)
 
-    assert len(calls) == 2
-    body = calls[1]["body"]["message"]
+    body = captured["body"]["message"]
     assert body["threadId"] == "thread-1"
     raw = api_module.base64.urlsafe_b64decode(body["raw"])
     raw_text = raw.decode()
