@@ -13,7 +13,7 @@ import types
 from pathlib import Path
 from unittest.mock import MagicMock
 
-import pytest
+import pytest  # ty: ignore[unresolved-import]
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -32,8 +32,8 @@ EXPECTED_SCOPES = {
 
 def _load(path: Path, name: str):
     spec = importlib.util.spec_from_file_location(name, path)
+    assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
     spec.loader.exec_module(module)
     return module
 
@@ -231,7 +231,7 @@ def test_calendar_approval_is_bound_to_exact_plan(api, capsys):
 
 def test_drive_create_file_marks_linxio_ownership(api, monkeypatch, capsys):
     media_module = types.ModuleType("googleapiclient.http")
-    media_module.MediaInMemoryUpload = lambda data, **kwargs: (data, kwargs)
+    setattr(media_module, "MediaInMemoryUpload", lambda data, **kwargs: (data, kwargs))
     monkeypatch.setitem(sys.modules, "googleapiclient.http", media_module)
     create = MagicMock()
     create.return_value.execute.return_value = {"id": "file-1", "name": "Knowledge"}
@@ -297,7 +297,7 @@ def test_smoke_test_uses_drafts_no_attendees_and_always_cleans_up(
     smoke = _load(SMOKE_PATH, "google_smoke_cleanup_test")
 
     media_module = types.ModuleType("googleapiclient.http")
-    media_module.MediaInMemoryUpload = lambda data, **kwargs: (data, kwargs)
+    setattr(media_module, "MediaInMemoryUpload", lambda data, **kwargs: (data, kwargs))
     monkeypatch.setitem(sys.modules, "googleapiclient.http", media_module)
 
     gmail = MagicMock()
@@ -354,7 +354,7 @@ def test_smoke_test_cleans_draft_and_drive_after_calendar_failure(
     sys.modules.pop("google_api", None)
     smoke = _load(SMOKE_PATH, "google_smoke_failure_cleanup_test")
     media_module = types.ModuleType("googleapiclient.http")
-    media_module.MediaInMemoryUpload = lambda data, **kwargs: (data, kwargs)
+    setattr(media_module, "MediaInMemoryUpload", lambda data, **kwargs: (data, kwargs))
     monkeypatch.setitem(sys.modules, "googleapiclient.http", media_module)
 
     gmail = MagicMock()

@@ -88,7 +88,7 @@ def run(approval_token: str) -> None:
         draft_id = draft["id"]
         checks["gmail_draft_create"] = True
 
-        from googleapiclient.http import MediaInMemoryUpload
+        from googleapiclient.http import MediaInMemoryUpload  # ty: ignore[unresolved-import]
 
         drive = build_service("drive", "v3")
         created = drive.files().create(
