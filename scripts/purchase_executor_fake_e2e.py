@@ -1,4 +1,4 @@
-"""Fake end-to-end acceptance for semantic purchase discovery (issues #65/#73).
+"""Fake end-to-end acceptance for semantic purchase discovery (issues #65/#73/#75).
 
 Everything is local and synthetic:
   * temporary SQLite governance DB seeded with one approved proposal + ticket,
@@ -32,6 +32,7 @@ import threading
 import time
 import urllib.request
 import urllib.error
+import urllib.parse
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -53,21 +54,51 @@ CONFIRM_HTML = b"""<!doctype html><html><body>
 
 class MockMerchant(BaseHTTPRequestHandler):
     checkout_html = b""
+    authenticated_session = False
+    requests = []
 
     def log_message(self, *args):
         pass
 
-    def _send(self, body: bytes):
+    def _send(self, body: bytes, headers=()):
         self.send_response(200)
         self.send_header("Content-Type", "text/html")
         self.send_header("Content-Length", str(len(body)))
+        for name, value in headers:
+            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(body)
 
     def do_GET(self):
-        self._send(self.checkout_html if self.path.startswith("/checkout") else b"<html>404</html>")
+        request = urllib.parse.urlsplit(self.path)
+        self.requests.append(("GET", request.path))
+        if request.path == "/__hermes_session_handoff" and self.authenticated_session:
+            destination = urllib.parse.parse_qs(request.query).get("return", [""])[0]
+            if destination == "/checkout?product_kind=domain_registration&product_id=example.com&quantity=1":
+                self.send_response(302)
+                self.send_header("Location", destination)
+                self.send_header(
+                    "Set-Cookie",
+                    "hermes_mock_session=ready; Path=/; HttpOnly; SameSite=Strict",
+                )
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+        if self.path == "/checkout?product_kind=domain_registration&product_id=example.com&quantity=1":
+            body = self.checkout_html
+            cookie = self.headers.get("Cookie", "")
+            if self.authenticated_session and "hermes_mock_session=ready" in cookie:
+                body = body.replace(
+                    b'<html lang="en">',
+                    b'<html lang="en" data-hermes-prepared-session="authenticated">',
+                    1,
+                )
+            self._send(body)
+            return
+        self._send(b"<html>404</html>")
 
     def do_POST(self):
+        self.requests.append(("POST", urllib.parse.urlsplit(self.path).path))
         self.rfile.read(int(self.headers.get("Content-Length") or 0))
         self._send(CONFIRM_HTML)
 
@@ -131,6 +162,10 @@ def main() -> int:
         help="serve card fields from a second exact-allowlisted loopback origin",
     )
     parser.add_argument(
+        "--authenticated-session", action="store_true",
+        help="prove a synthetic cookie-backed prepared session in the same browser task",
+    )
+    parser.add_argument(
         "--credentials-dir", default="",
         help="use externally-provided synthetic credentials (e.g. the staging "
         "unit's systemd $CREDENTIALS_DIRECTORY) instead of generating them; "
@@ -187,6 +222,12 @@ def main() -> int:
         "free_alternatives_considered": False,
         "necessary_to_launch": True,
         "optional_convenience": False,
+        "checkout_target": {
+            "merchant_id": "registrar.example",
+            "product_kind": "domain_registration",
+            "product_id": "example.com",
+            "session_requirement": "authenticated" if args.authenticated_session else "anonymous",
+        },
     }
     created = governance.create_purchase_proposal(db, proposal_payload)
     proposal_id = created["proposal_id"]
@@ -231,9 +272,10 @@ def main() -> int:
     else:
         MockMerchant.checkout_html = SAME_PAGE_FIXTURE.read_bytes()
 
+    MockMerchant.authenticated_session = args.authenticated_session
     merchant_server = ThreadingHTTPServer(("127.0.0.1", 0), MockMerchant)
     threading.Thread(target=merchant_server.serve_forever, daemon=True).start()
-    checkout_url = f"http://127.0.0.1:{merchant_server.server_address[1]}/checkout"
+    checkout_url = f"http://127.0.0.1:{merchant_server.server_address[1]}"
 
     # --- synthetic credentials ----------------------------------------------
     # Either use externally-staged synthetic creds (systemd name-binding) or
@@ -286,7 +328,10 @@ def main() -> int:
     )
     print(run.stdout, end="")
     print(run.stderr, end="", file=sys.stderr)
-    require(run.returncode == 0, f"executor exit code {run.returncode} (want 0=completed)")
+    require(
+        run.returncode == 0,
+        f"executor exit code {run.returncode} (want 0=completed); requests={MockMerchant.requests}",
+    )
 
     # --- proofs --------------------------------------------------------------
     ledger_after = governance.get_ledger_snapshot(db)
@@ -321,6 +366,7 @@ def main() -> int:
     require("4242424242424242" not in audit, "audit log contains no card number")
     require('"phase": "discovered"' in audit, "semantic discovery audited")
     require('"phase": "cleaned_up"' in audit, "browser cleanup audited")
+    require("hermes_mock_session" not in audit, "session cookie absent from audit")
     if args.hosted_frame:
         require(processor_origin in audit, "hosted processor origin audited")
     else:
@@ -333,6 +379,7 @@ def main() -> int:
     print(json.dumps({
         "fake_e2e": "PASS",
         "checkout_shape": "hosted_frame" if args.hosted_frame else "same_page",
+        "session_shape": "authenticated" if args.authenticated_session else "anonymous",
         "proposal_id": proposal_id,
         "ticket_id": ticket["ticket_id"],
         "ledger_before": ledger_before, "ledger_after": ledger_after,
