@@ -495,7 +495,7 @@ def test_discovery_and_post_fill_origin_are_rejected(tmp_path, creds):
         browser.pages[0] = redirected  # page navigates away post-fill
         return result
 
-    browser.fill_fields = redirect_after_fill
+    browser.fill_fields = redirect_after_fill  # ty: ignore[invalid-assignment]
     assert run(browser, bridge, tmp_path) == pe.EXIT_DEFINITIVE_FAILURE
     assert "submit" not in [kind for kind, _ in browser.calls]
 

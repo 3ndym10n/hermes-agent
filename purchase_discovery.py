@@ -353,7 +353,7 @@ def discover_checkout(inspect_context, *, canonical_domain: str,
     if not fake_e2e and any(urlsplit(item).scheme != "https" for item in processors):
         raise ValueError("production processor origins must use HTTPS")
 
-    queue = [()]
+    queue: list[tuple[str, ...]] = [()]
     contexts: list[tuple[tuple[str, ...], str, dict]] = []
     allowed: set[str] = set(processors)
     main_origin = ""

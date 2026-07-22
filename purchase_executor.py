@@ -47,6 +47,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
+from typing import cast
 from urllib.parse import urlsplit, urlunsplit
 
 import purchase_discovery as discovery
@@ -360,13 +361,23 @@ def real_browser() -> SimpleNamespace:
 
     def _batch_ok(result: object) -> bool:
         if isinstance(result, list):
-            return bool(result) and all(
-                isinstance(item, dict) and item.get("success") for item in result
-            )
+            if not result:
+                return False
+            for item in result:
+                if not isinstance(item, dict):
+                    return False
+                if not cast(dict[str, object], item).get("success"):
+                    return False
+            return True
+        if not isinstance(result, dict):
+            return False
+        mapping = cast(dict[str, object], result)
+        raw_data = mapping.get("data")
+        data = cast(dict[str, object], raw_data) if isinstance(raw_data, dict) else None
         return bool(
-            isinstance(result, dict)
-            and result.get("success")
-            and result.get("data", {}).get("result") == '{"ok": true}'
+            mapping.get("success")
+            and data is not None
+            and data.get("result") == '{"ok": true}'
         )
 
     def fill_fields(task_id, plan, values):
@@ -434,7 +445,7 @@ def real_browser() -> SimpleNamespace:
         inspect_context, _ = _context_reader(task_id, supervisor)
         allowed = {plan.page_origin, *plan.frame_origins}
         allowed.update(discovery.origin(item) for item in extra_origins)
-        queue = [()]
+        queue: list[tuple[str, ...]] = [()]
         seen = 0
         challenge = uncertain = False
         while queue:

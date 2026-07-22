@@ -2,7 +2,7 @@
 
 import json
 
-import pytest
+import pytest  # ty: ignore[unresolved-import]
 
 import purchase_discovery as discovery
 
