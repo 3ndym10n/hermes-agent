@@ -167,6 +167,26 @@ class TestSetupLogging:
         content = agent_log.read_text()
         assert "test message for agent.log" in content
 
+    def test_persistent_logs_redact_google_secrets_and_customer_content(self, hermes_home):
+        hermes_logging.setup_logging(hermes_home=hermes_home)
+        raw = (
+            "--auth-code 4/authorizationcode --approval-token approval-secret "
+            "customer@example.com +1 (555) 867-5309 "
+            '--body "raw customer email body" ya29.accesstoken '
+            '1//refresh_token_value GOCSPX-client_secret_value'
+        )
+        logging.getLogger("test.google_privacy").warning(raw)
+        for handler in logging.getLogger().handlers:
+            handler.flush()
+
+        content = (hermes_home / "logs" / "agent.log").read_text()
+        for sensitive in (
+            "authorizationcode", "approval-secret", "customer@example.com",
+            "555", "raw customer email body", "accesstoken",
+            "refresh_token_value", "client_secret_value",
+        ):
+            assert sensitive not in content
+
     def test_warnings_appear_in_both_logs(self, hermes_home):
         hermes_logging.setup_logging(hermes_home=hermes_home)
 

@@ -29,13 +29,10 @@ class FakeCredentials:
             "client_secret": "client-secret",
             "scopes": [
                 "https://www.googleapis.com/auth/gmail.readonly",
-                "https://www.googleapis.com/auth/gmail.send",
-                "https://www.googleapis.com/auth/gmail.modify",
-                "https://www.googleapis.com/auth/calendar",
-                "https://www.googleapis.com/auth/drive.readonly",
-                "https://www.googleapis.com/auth/contacts.readonly",
-                "https://www.googleapis.com/auth/spreadsheets",
-                "https://www.googleapis.com/auth/documents.readonly",
+                "https://www.googleapis.com/auth/gmail.compose",
+                "https://www.googleapis.com/auth/drive.file",
+                "https://www.googleapis.com/auth/calendar.readonly",
+                "https://www.googleapis.com/auth/calendar.events.owned",
             ],
         }
 
@@ -170,28 +167,31 @@ class TestExchangeAuthCode:
             json.dumps({"state": "saved-state", "code_verifier": "saved-verifier"})
         )
 
+        from urllib.parse import quote
+        scopes = quote(" ".join(setup_module.SCOPES), safe="")
         setup_module.exchange_auth_code(
-            "http://localhost:1/?code=4/extracted-code&state=saved-state&scope=gmail"
+            f"http://localhost:1/?code=4/extracted-code&state=saved-state&scope={scopes}"
         )
 
         flow = FakeFlow.created[-1]
         assert flow.fetch_token_calls == [{"code": "4/extracted-code"}]
 
     def test_passes_scopes_from_redirect_url_to_flow(self, setup_module):
-        """Callback URL carries space-delimited scope list; Flow must receive it (not full SCOPES)."""
+        """Callback scopes are validated, while Flow always requests the exact profile."""
         setup_module.PENDING_AUTH_PATH.write_text(
             json.dumps({"state": "saved-state", "code_verifier": "saved-verifier"})
         )
         g1 = "https://www.googleapis.com/auth/gmail.readonly"
-        g2 = "https://www.googleapis.com/auth/calendar"
+        g2 = "https://www.googleapis.com/auth/calendar.readonly"
         from urllib.parse import quote
 
         scope_q = quote(f"{g1} {g2}", safe="")
-        setup_module.exchange_auth_code(
-            f"http://localhost:1/?code=4/extracted-code&state=saved-state&scope={scope_q}"
-        )
-        flow = FakeFlow.created[-1]
-        assert flow.scopes == [g1, g2]
+        with pytest.raises(SystemExit):
+            setup_module.exchange_auth_code(
+                f"http://localhost:1/?code=4/extracted-code&state=saved-state&scope={scope_q}"
+            )
+        assert FakeFlow.created[-1].scopes == setup_module.SCOPES
+        assert not setup_module.TOKEN_PATH.exists()
 
     def test_rejects_state_mismatch(self, setup_module, capsys):
         setup_module.PENDING_AUTH_PATH.write_text(
@@ -229,12 +229,10 @@ class TestExchangeAuthCode:
         assert setup_module.PENDING_AUTH_PATH.exists()
         assert not setup_module.TOKEN_PATH.exists()
 
-    def test_accepts_narrower_scopes_with_warning(self, setup_module, capsys):
-        """Partial scopes are accepted with a warning (gws migration: v2.0)."""
+    def test_rejects_narrower_scopes_without_saving(self, setup_module, capsys):
         setup_module.PENDING_AUTH_PATH.write_text(
             json.dumps({"state": "saved-state", "code_verifier": "saved-verifier"})
         )
-        setup_module.TOKEN_PATH.write_text(json.dumps({"token": "***", "scopes": setup_module.SCOPES}))
         FakeFlow.credentials_payload = {
             "token": "***",
             "refresh_token": "***",
@@ -242,19 +240,16 @@ class TestExchangeAuthCode:
             "client_id": "client-id",
             "client_secret": "client-secret",
             "scopes": [
-                "https://www.googleapis.com/auth/drive.readonly",
-                "https://www.googleapis.com/auth/spreadsheets",
+                "https://www.googleapis.com/auth/drive.file",
             ],
         }
 
-        setup_module.exchange_auth_code("4/test-auth-code")
+        with pytest.raises(SystemExit):
+            setup_module.exchange_auth_code("4/test-auth-code")
 
         out = capsys.readouterr().out
-        assert "warning" in out.lower()
-        assert "missing" in out.lower()
-        # Token is saved (partial scopes accepted)
-        assert setup_module.TOKEN_PATH.exists()
-        # Pending auth is cleaned up
+        assert "scope_mismatch" in out.lower()
+        assert not setup_module.TOKEN_PATH.exists()
         assert not setup_module.PENDING_AUTH_PATH.exists()
 
 
