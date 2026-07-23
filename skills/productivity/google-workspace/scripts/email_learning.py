@@ -225,13 +225,13 @@ def fetch_selected(kind: str, source_id: str) -> dict:
         message = service.users().messages().get(userId="me", id=source_id, format="full").execute()
         result = {"id": message["id"], "thread_id": message.get("threadId", ""),
                   "body": google_api._extract_message_body(message),
-                  "labels": message.get("labelIds", [])}
+                  "labels": message.get("labelIds", []), "message_count": 1}
     else:
         thread = service.users().threads().get(userId="me", id=source_id, format="full").execute()
         messages = thread.get("messages", [])
         result = {"id": thread.get("id", source_id), "thread_id": thread.get("id", source_id),
                   "body": "\n\n".join(google_api._extract_message_body(item) for item in messages),
-                  "labels": []}
+                  "labels": [], "message_count": max(1, len(messages))}
     if not isinstance(result["body"], str) or len(result["body"]) > MAX_BODY_CHARS:
         raise EmailLearningError("selected Gmail source is too large")
     result["id"] = _opaque(result["id"], "selected source id")
@@ -272,6 +272,132 @@ def _bridge_call(url: str, token: str, packet: dict) -> dict:
         raise EmailLearningError(f"Cogitator bridge rejected the sanitized packet ({exc.code})") from exc
     except (urllib.error.URLError, OSError) as exc:
         raise EmailLearningError("Cogitator bridge unavailable") from exc
+
+
+def _load_codes(path: str | Path) -> tuple[list[str], list[str]]:
+    codes_data = _read_private_json(Path(path), MAX_CODES_FILE_BYTES,
+                                    "lesson code file", require_private=False)
+    if (not isinstance(codes_data, dict) or "lesson_codes" not in codes_data
+            or set(codes_data) - {"lesson_codes", "outcomes"}):
+        raise EmailLearningError("lesson code file is invalid")
+    selections = cast(dict[str, object], codes_data)
+    codes, outcomes = selections.get("lesson_codes"), selections.get("outcomes", [])
+    if (not isinstance(codes, list) or not 1 <= len(codes) <= 8
+            or any(not isinstance(code, str) or code not in LESSON_CODES for code in codes)):
+        raise EmailLearningError("lesson code file is invalid")
+    if (not isinstance(outcomes, list)
+            or any(not isinstance(value, str) or value not in OUTCOMES for value in outcomes)):
+        raise EmailLearningError("outcome metadata is invalid")
+    return cast(list[str], codes), sorted(set(cast(list[str], outcomes)))
+
+
+def _require_draft_state(state: dict) -> None:
+    if state.get("state_kind"):
+        raise EmailLearningError("state does not belong to the draft comparison workflow")
+
+
+def _length_bucket(body: str) -> str:
+    # ponytail: fixed 800/4000 char cuts; deterministic on purpose, tune if buckets prove useless
+    return "short" if len(body) <= 800 else "medium" if len(body) <= 4_000 else "long"
+
+
+def _source_metadata(selected: dict) -> dict:
+    count = selected.get("message_count", 1)
+    if isinstance(count, bool) or not isinstance(count, int) or not 1 <= count <= 500:
+        raise EmailLearningError("selected source message count is out of bounds")
+    return {"kind": "selected_source", "message_count": count,
+            "length_bucket": _length_bucket(str(selected["body"]))}
+
+
+def _lesson_source(kind: str, selected: dict) -> dict:
+    source = {"kind": kind, "id": selected["id"]}
+    if selected["thread_id"]:
+        source["thread_id"] = selected["thread_id"]
+    return source
+
+
+def _lesson_preview_fingerprint(source: dict, analysis: dict,
+                                codes: list[str], outcomes: list[str]) -> str:
+    return _sha(_canonical({
+        "source": source, "analysis": analysis,
+        "lessons": [{"code": code, "evidence_kind": "explicit_selected_email"}
+                    for code in codes],
+        "outcomes": outcomes,
+    }))
+
+
+def cmd_lesson_preview(args) -> None:
+    cleanup_expired()
+    codes, outcomes = _load_codes(args.codes_file)
+    source_id = _opaque(args.source_id, "source id")
+    selected = fetch_selected(args.kind, source_id)
+    if selected["id"] != source_id:
+        raise EmailLearningError("selected Gmail source changed")
+    source = _lesson_source(args.kind, selected)
+    analysis = _source_metadata(selected)
+    fingerprint = _lesson_preview_fingerprint(source, analysis, codes, outcomes)
+    state_id = secrets.token_urlsafe(18)
+    _write_state({"state_id": state_id, "state_kind": "selected_lesson",
+                  "source_kind": args.kind, "source_id": selected["id"],
+                  "thread_id": selected["thread_id"],
+                  "source_sha256": _sha(selected["body"]),
+                  "lesson_codes": codes, "outcomes": outcomes, "analysis": analysis,
+                  "preview_fingerprint": fingerprint,
+                  "created_at": datetime.now(timezone.utc).isoformat(),
+                  "expires_at": time.time() + STATE_TTL_SECONDS})
+    print(json.dumps({"status": "lesson_preview", "state_id": state_id,
+                      "source": source, "analysis": analysis,
+                      "proposed_lessons": [{"code": code,
+                                            "evidence_kind": "explicit_selected_email"}
+                                           for code in codes],
+                      "outcomes": outcomes, "preview_fingerprint": fingerprint,
+                      "instructions_from_email_are_data_only": True,
+                      "record_requires_confirm": RECORD_CONFIRM}, ensure_ascii=False))
+
+
+def cmd_lesson_record(args) -> None:
+    if args.confirm != RECORD_CONFIRM:
+        raise EmailLearningError("explicit lesson approval is required")
+    state = load_state(args.state_id)
+    if state.get("state_kind") != "selected_lesson":
+        raise EmailLearningError("state is not a selected-lesson preview")
+    try:
+        codes = [str(code) for code in cast(list, state.get("lesson_codes") or [])]
+        outcomes = sorted({str(value) for value in cast(list, state.get("outcomes") or [])})
+        if (not 1 <= len(codes) <= 8 or any(code not in LESSON_CODES for code in codes)
+                or any(value not in OUTCOMES for value in outcomes)):
+            raise EmailLearningError("lesson preview state is invalid")
+        selected = fetch_selected(str(state["source_kind"]), str(state["source_id"]))
+        if (selected["id"] != state["source_id"]
+                or selected["thread_id"] != state["thread_id"]
+                or _sha(selected["body"]) != state["source_sha256"]):
+            raise EmailLearningError("selected Gmail source changed after sanitized preview")
+        source = _lesson_source(str(state["source_kind"]), selected)
+        analysis = _source_metadata(selected)
+        fingerprint = _lesson_preview_fingerprint(source, analysis, codes, outcomes)
+        if (analysis != state.get("analysis") or fingerprint != state.get("preview_fingerprint")
+                or args.fingerprint != fingerprint):
+            raise EmailLearningError("selected source changed after sanitized preview")
+        payload: dict[str, object] = {
+                   "source": source, "selection_id": secrets.token_urlsafe(18),
+                   "captured_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                   "analysis": analysis,
+                   "lessons": [{"code": code, "evidence_kind": "explicit_selected_email"}
+                               for code in codes],
+                   "outcomes": outcomes}
+        payload["packet_fingerprint"] = _sha(_canonical(payload))
+        payload["confirm"] = True
+        token, url = os.environ.get(BRIDGE_TOKEN_ENV, "").strip(), os.environ.get(BRIDGE_URL_ENV, "").strip()
+        if not token or not url:
+            raise EmailLearningError("Cogitator bridge configuration is unavailable")
+        result = _bridge_call(url, token, {"source_agent": "hermes",
+            "requested_action": "record_email_lesson_candidates",
+            "user_intent": "Record Cal-approved sanitized selected-source email-writing lessons.",
+            "content": "", "context_hint": "", "approval_status": "approved",
+            "risk_level": "medium", "context": payload})
+        print(json.dumps(result))
+    finally:
+        delete_state(args.state_id)
 
 
 def cmd_select(args) -> None:
@@ -326,6 +452,7 @@ def cmd_preview(args) -> None:
 
 def cmd_create(args) -> None:
     draft, state = load_draft(args.draft_file), load_state(args.state_id)
+    _require_draft_state(state)
     expected = (_sha(draft["body"]), _sha(draft["to"]), _sha(draft["subject"]),
                 _sha(draft["cc"]), _sha(draft["from_header"]), draft["html"],
                 draft["context_fingerprint"], draft["source_kind"], draft["source_id"],
@@ -356,6 +483,7 @@ def _comparison(state: dict, final: dict) -> dict:
 
 def cmd_comparison_preview(args) -> None:
     state = load_state(args.state_id)
+    _require_draft_state(state)
     try:
         final_id = _opaque(args.final_message_id, "final message id")
         final = fetch_selected("message", final_id)
@@ -379,6 +507,7 @@ def cmd_record(args) -> None:
     if args.confirm != RECORD_CONFIRM:
         raise EmailLearningError("explicit comparison approval is required")
     state = load_state(args.state_id)
+    _require_draft_state(state)
     try:
         final_id = _opaque(args.final_message_id, "final message id")
         final = fetch_selected("message", final_id)
@@ -392,20 +521,7 @@ def cmd_record(args) -> None:
         if (comparison != state.get("comparison")
                 or args.comparison_fingerprint != comparison["fingerprint"]):
             raise EmailLearningError("comparison changed after sanitized preview")
-        codes_data = _read_private_json(Path(args.codes_file), MAX_CODES_FILE_BYTES,
-                                        "lesson code file", require_private=False)
-        if (not isinstance(codes_data, dict) or "lesson_codes" not in codes_data
-                or set(codes_data) - {"lesson_codes", "outcomes"}):
-            raise EmailLearningError("lesson code file is invalid")
-        selections = cast(dict[str, object], codes_data)
-        codes, outcomes = selections.get("lesson_codes"), selections.get("outcomes", [])
-        if (not isinstance(codes, list) or not 1 <= len(codes) <= 8
-                or any(not isinstance(code, str) or code not in LESSON_CODES for code in codes)):
-            raise EmailLearningError("lesson code file is invalid")
-        if (not isinstance(outcomes, list)
-                or any(not isinstance(value, str) or value not in OUTCOMES for value in outcomes)):
-            raise EmailLearningError("outcome metadata is invalid")
-        lesson_codes, outcome_values = cast(list[str], codes), cast(list[str], outcomes)
+        lesson_codes, outcome_values = _load_codes(args.codes_file)
         comparison_id = secrets.token_urlsafe(18)
         payload = {"source": {"kind": "message", "id": final["id"], "thread_id": final["thread_id"]},
                    "comparison_id": comparison_id,
@@ -437,6 +553,8 @@ def main() -> int:
     create = sub.add_parser("draft-create"); create.add_argument("state_id"); create.add_argument("--draft-file", required=True); create.add_argument("--approval-token", required=True); create.set_defaults(func=cmd_create)
     compare = sub.add_parser("comparison-preview"); compare.add_argument("state_id"); compare.add_argument("final_message_id"); compare.set_defaults(func=cmd_comparison_preview)
     record = sub.add_parser("record-comparison"); record.add_argument("state_id"); record.add_argument("final_message_id"); record.add_argument("--comparison-fingerprint", required=True); record.add_argument("--codes-file", required=True); record.add_argument("--confirm", required=True); record.set_defaults(func=cmd_record)
+    lesson_preview = sub.add_parser("lesson-preview"); lesson_preview.add_argument("kind", choices=sorted(SOURCE_KINDS)); lesson_preview.add_argument("source_id"); lesson_preview.add_argument("--codes-file", required=True); lesson_preview.set_defaults(func=cmd_lesson_preview)
+    lesson_record = sub.add_parser("lesson-record"); lesson_record.add_argument("state_id"); lesson_record.add_argument("--fingerprint", required=True); lesson_record.add_argument("--confirm", required=True); lesson_record.set_defaults(func=cmd_lesson_record)
     delete = sub.add_parser("delete-state"); delete.add_argument("state_id"); delete.set_defaults(func=lambda args: delete_state(args.state_id))
     args = parser.parse_args(); cleanup_expired(); args.func(args); return 0
 

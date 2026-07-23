@@ -107,6 +107,13 @@ Use `scripts/email_learning.py`; never search or ingest the mailbox for learning
 4. After Cal edits/approves and manually sends the email, Cal explicitly selects that Gmail message. `comparison-preview STATE_ID FINAL_MESSAGE_ID` requires its Gmail `SENT` label, then computes and displays a sanitized deterministic diff and fingerprint before any lesson interpretation. Hermes never sends it.
 5. Only after review, `record-comparison STATE_ID FINAL_MESSAGE_ID --comparison-fingerprint FINGERPRINT --codes-file SANITIZED_CODES_JSON --confirm RECORD-APPROVED-EMAIL-LESSONS` recomputes the diff, rejects any mismatch, sends only closed lesson codes/counts/provenance to Cogitator, and deletes temporary body state on success or failure.
 
+#### Save a writing lesson from one selected message or thread
+
+When Cal says "save a writing lesson from this thread/email", no draft-versus-final comparison is required:
+
+1. `lesson-preview message MESSAGE_ID --codes-file SANITIZED_CODES_JSON` (or `lesson-preview thread THREAD_ID ...`) reads exactly the selected source, treats its body as untrusted memory-only data, and shows a sanitized preview: closed lesson codes, closed outcomes, and bounded deterministic source metadata (`message_count`, `length_bucket`) only — never the body, addresses, or a source hash.
+2. Cal reviews the preview. Only then `lesson-record STATE_ID --fingerprint PREVIEW_FINGERPRINT --confirm RECORD-APPROVED-EMAIL-LESSONS` refetches the selected source, rejects any change since preview, hands the sanitized fingerprinted packet to Cogitator's existing review workflow once, and deletes the private state on success or failure. Nothing is auto-promoted; Cogitator's candidate review, conflict, and Cal-gated promotion rules apply unchanged.
+
 The private draft JSON has exactly these fields (optional `cc`, `from_header`, and `html` may also be present):
 
 ```json
