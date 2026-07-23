@@ -167,7 +167,7 @@ _EMAIL_RE = re.compile(
 )
 _PHONE_RE = re.compile(r"(?<![A-Za-z0-9])(?:\+?\d[\d(). -]{6,}\d)(?![A-Za-z0-9])")
 _EMAIL_CONTENT_FIELD_RE = re.compile(
-    r'("(?:body|snippet)"\s*:\s*)"(?:\\.|[^"\\])*"',
+    r'("(?:body|snippet|untrusted_email_body)"\s*:\s*)"(?:\\.|[^"\\])*"',
     re.IGNORECASE,
 )
 _SENSITIVE_CLI_ARG_RE = re.compile(

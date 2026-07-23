@@ -9,8 +9,8 @@ Usage:
   python google_api.py gmail search "is:unread" [--max 10]
   python google_api.py gmail get MESSAGE_ID
   python google_api.py gmail thread THREAD_ID
-  python google_api.py gmail draft-create --to user@example.com --subject "Hi" --body "Hello"
-  python google_api.py gmail draft-reply MESSAGE_ID --body "Thanks"
+  python email_learning.py draft-preview --draft-file PRIVATE_DRAFT_JSON
+  python email_learning.py draft-create STATE_ID --draft-file PRIVATE_DRAFT_JSON --approval-token TOKEN
   python google_api.py calendar list [--from DATE] [--to DATE] [--calendar primary]
   python google_api.py calendar create --summary "Meeting" --start DATETIME --end DATETIME
   python google_api.py drive search "budget report" [--max 10]
@@ -19,6 +19,7 @@ Usage:
 
 import argparse
 import base64
+import hashlib
 import json
 import os
 import secrets
@@ -47,6 +48,7 @@ from google_auth import (
 TOKEN_PATH = oauth_token_path()
 CLIENT_SECRET_PATH = oauth_client_path()
 APPROVAL_PATH = private_state_path("google_calendar_approval.json")
+GMAIL_APPROVAL_PATH = private_state_path("google_gmail_draft_approval.json")
 SCOPES = list(SERVICE_PROFILES["linxio"])
 APPROVAL_TTL_SECONDS = 10 * 60
 
@@ -201,19 +203,39 @@ def _calendar_plan(args) -> dict:
     return {"operation": "calendar.create", "calendar": args.calendar, "event": event}
 
 
-def _issue_approval(plan: dict) -> str:
+def _issue_approval(plan: dict, *, path: Path = APPROVAL_PATH) -> str:
     token = secrets.token_urlsafe(32)
     write_private_json(
-        APPROVAL_PATH,
+        path,
         {"token": token, "plan": plan, "expires_at": time.time() + APPROVAL_TTL_SECONDS},
     )
     return token
 
 
-def _consume_approval(token: str, plan: dict) -> None:
+def _lock_approval(stream) -> None:
+    if os.name == "nt":
+        import msvcrt
+        stream.seek(0)
+        msvcrt.locking(stream.fileno(), msvcrt.LK_LOCK, 1)
+    else:
+        import fcntl
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+
+
+def _consume_approval(token: str, plan: dict, *, path: Path = APPROVAL_PATH) -> None:
+    stream = None
     try:
-        approval = json.loads(APPROVAL_PATH.read_text())
-    except Exception:
+        flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(path, flags)
+        stream = os.fdopen(fd, "r+", encoding="utf-8")
+        _lock_approval(stream)
+        raw = stream.read(1_000_001)
+        if len(raw) > 1_000_000:
+            raise ValueError("approval is too large")
+        approval = json.loads(raw)
+    except (OSError, ValueError, json.JSONDecodeError):
+        if stream is not None:
+            stream.close()
         print("ERROR: no pending approval; run the command with --dry-run first", file=sys.stderr)
         raise SystemExit(2)
     valid = (
@@ -222,9 +244,22 @@ def _consume_approval(token: str, plan: dict) -> None:
         and float(approval.get("expires_at", 0)) >= time.time()
     )
     if not valid:
+        stream.close()
         print("ERROR: invalid, expired, or mismatched approval token", file=sys.stderr)
         raise SystemExit(2)
-    APPROVAL_PATH.unlink(missing_ok=True)
+    opened = os.fstat(stream.fileno())
+    stream.seek(0)
+    stream.truncate()
+    stream.flush()
+    os.fsync(stream.fileno())
+    try:
+        current = path.stat(follow_symlinks=False)
+        if (opened.st_dev, opened.st_ino) == (current.st_dev, current.st_ino):
+            path.unlink(missing_ok=True)
+    except FileNotFoundError:
+        pass
+    finally:
+        stream.close()
 
 
 def get_credentials():
@@ -395,32 +430,10 @@ def gmail_thread_get(args):
 
 
 def gmail_draft_create(args):
-    if _gws_binary():
-        message = MIMEText(args.body, "html" if args.html else "plain")
-        message["To"] = args.to
-        message["Subject"] = args.subject
-        if args.cc:
-            message["Cc"] = args.cc
-        if args.from_header:
-            message["From"] = args.from_header
-
-        raw = base64.urlsafe_b64encode(message.as_bytes()).decode()
-        body = {"raw": raw}
-        if args.thread_id:
-            body["threadId"] = args.thread_id
-
-        result = _run_gws(
-            ["gmail", "users", "drafts", "create"],
-            params={"userId": "me"},
-            body={"message": body},
-        )
-        message_result = result.get("message", {})
-        print(json.dumps({
-            "status": "drafted",
-            "draftId": result["id"],
-            "messageId": message_result.get("id", ""),
-            "threadId": message_result.get("threadId", ""),
-        }, indent=2))
+    plan = _gmail_draft_plan(args, recipient=args.to, subject=args.subject,
+                             thread_id=getattr(args, "thread_id", ""),
+                             source_kind=args.source_kind, source_id=args.source_id)
+    if not _approve_gmail_draft(args, plan):
         return
 
     service = build_service("gmail", "v1")
@@ -452,40 +465,6 @@ def gmail_draft_create(args):
 
 
 def gmail_draft_reply(args):
-    if _gws_binary():
-        original = _run_gws(
-            ["gmail", "users", "messages", "get"],
-            params={
-                "userId": "me",
-                "id": args.message_id,
-                "format": "metadata",
-                "metadataHeaders": ["From", "Subject", "Message-ID"],
-            },
-        )
-        headers = _headers_dict(original)
-
-        subject = headers.get("subject", "")
-        if not subject.startswith("Re:"):
-            subject = f"Re: {subject}"
-
-        message = MIMEText(args.body)
-        message["To"] = headers.get("from", "")
-        message["Subject"] = subject
-        if args.from_header:
-            message["From"] = args.from_header
-        if headers.get("message-id"):
-            message["In-Reply-To"] = headers["message-id"]
-            message["References"] = headers["message-id"]
-
-        raw = base64.urlsafe_b64encode(message.as_bytes()).decode()
-        result = _run_gws(
-            ["gmail", "users", "drafts", "create"],
-            params={"userId": "me"},
-            body={"message": {"raw": raw, "threadId": original["threadId"]}},
-        )
-        print(json.dumps({"status": "drafted", "draftId": result["id"], "threadId": original["threadId"]}, indent=2))
-        return
-
     service = build_service("gmail", "v1")
     original = service.users().messages().get(
         userId="me", id=args.message_id, format="metadata",
@@ -496,6 +475,12 @@ def gmail_draft_reply(args):
     subject = headers.get("subject", "")
     if not subject.startswith("Re:"):
         subject = f"Re: {subject}"
+
+    plan = _gmail_draft_plan(args, recipient=headers.get("from", ""),
+                             subject=subject, thread_id=original["threadId"],
+                             source_kind="message", source_id=args.message_id)
+    if not _approve_gmail_draft(args, plan):
+        return
 
     message = MIMEText(args.body)
     message["To"] = headers.get("from", "")
@@ -513,6 +498,38 @@ def gmail_draft_reply(args):
         userId="me", body={"message": body}
     ).execute()
     print(json.dumps({"status": "drafted", "draftId": result["id"], "threadId": original["threadId"]}, indent=2))
+
+
+def _gmail_draft_plan(args, *, recipient: str, subject: str, thread_id: str,
+                      source_kind: str, source_id: str) -> dict:
+    digest = lambda value: hashlib.sha256(str(value or "").encode("utf-8")).hexdigest()
+    return {
+        "operation": "gmail.draft.create",
+        "recipient_sha256": digest(recipient),
+        "subject_sha256": digest(subject),
+        "body_sha256": digest(args.body),
+        "cc_sha256": digest(getattr(args, "cc", "")),
+        "from_header_sha256": digest(getattr(args, "from_header", "")),
+        "source_kind": source_kind,
+        "source_id": source_id,
+        "thread_id": thread_id,
+        "context_fingerprint": str(getattr(args, "context_fingerprint", "") or ""),
+        "html": bool(getattr(args, "html", False)),
+    }
+
+
+def _approve_gmail_draft(args, plan: dict) -> bool:
+    if bool(getattr(args, "dry_run", False)):
+        token = _issue_approval(plan, path=GMAIL_APPROVAL_PATH)
+        print(json.dumps({"status": "approval_required", "approval_token": token,
+                          "plan": plan, "expires_in": APPROVAL_TTL_SECONDS}, indent=2))
+        return False
+    token = str(getattr(args, "approval_token", "") or "")
+    if not token:
+        print("ERROR: --approval-token is required; run with --dry-run first", file=sys.stderr)
+        raise SystemExit(2)
+    _consume_approval(token, plan, path=GMAIL_APPROVAL_PATH)
+    return True
 
 
 
@@ -1223,12 +1240,20 @@ def main():
     p.add_argument("--from", dest="from_header", default="", help="Custom From header (e.g. '\"Agent Name\" <user@example.com>')")
     p.add_argument("--html", action="store_true")
     p.add_argument("--thread-id", default="", help="Thread ID for threading")
+    p.add_argument("--source-kind", required=True, choices=("message", "thread"))
+    p.add_argument("--source-id", required=True)
+    p.add_argument("--context-fingerprint", required=True)
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--approval-token", default="")
     p.set_defaults(func=gmail_draft_create)
 
     p = gmail_sub.add_parser("draft-reply")
     p.add_argument("message_id", help="Message ID to reply to")
     p.add_argument("--body", required=True)
     p.add_argument("--from", dest="from_header", default="", help="Custom From header (e.g. '\"Agent Name\" <user@example.com>')")
+    p.add_argument("--context-fingerprint", required=True)
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--approval-token", default="")
     p.set_defaults(func=gmail_draft_reply)
 
     p = gmail_sub.add_parser("draft-delete")

@@ -76,6 +76,35 @@ def test_default_and_override_paths_are_private(monkeypatch, tmp_path):
     assert stat.S_IMODE(token.stat().st_mode) == 0o600
 
 
+def test_private_json_write_is_atomic_and_rejects_symlinked_directory(monkeypatch, tmp_path):
+    auth = _load(SCRIPTS / "google_auth.py", "google_auth_atomic_test")
+    path = tmp_path / "private/token.json"
+    auth.write_private_json(path, {"version": "old"})
+    monkeypatch.setattr(auth.json, "dump", MagicMock(side_effect=OSError("interrupted")))
+    with pytest.raises(OSError):
+        auth.write_private_json(path, {"version": "new"})
+    assert json.loads(path.read_text()) == {"version": "old"}
+    assert not list(path.parent.glob(f".{path.name}.*"))
+
+    target = tmp_path / "target"
+    target.mkdir()
+    linked = tmp_path / "linked"
+    linked.symlink_to(target, target_is_directory=True)
+    with pytest.raises(ValueError, match="symlink"):
+        auth.write_private_json(linked / "secret.json", {})
+
+
+def test_approval_lock_has_windows_stdlib_path(api, monkeypatch, tmp_path):
+    windows_lock = types.SimpleNamespace(LK_LOCK=1, locking=MagicMock())
+    monkeypatch.setitem(sys.modules, "msvcrt", windows_lock)
+    monkeypatch.setattr(api.os, "name", "nt")
+    path = tmp_path / "approval.json"
+    path.write_text("{}")
+    with path.open("r+") as stream:
+        api._lock_approval(stream)
+        windows_lock.locking.assert_called_once_with(stream.fileno(), 1, 1)
+
+
 def test_pending_oauth_state_is_private(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
     setup = _load(SETUP_PATH, "google_setup_permissions_test")
@@ -144,6 +173,11 @@ def test_gmail_thread_reads_complete_messages(api, capsys):
 
 def test_gmail_draft_create_and_delete_never_send(api, capsys):
     calls = []
+    gmail = MagicMock()
+    gmail.users.return_value.drafts.return_value.create.return_value.execute.return_value = {
+        "id": "draft-1", "message": {"id": "message-1"}}
+    api.build_service = lambda *_args: gmail
+    api._approve_gmail_draft = lambda *_args: True
 
     def run(parts, *, params=None, body=None):
         calls.append((parts, params, body))
@@ -154,14 +188,22 @@ def test_gmail_draft_create_and_delete_never_send(api, capsys):
     api._run_gws = run
     api.gmail_draft_create(api.argparse.Namespace(
         to="recipient@example.com", subject="subject", body="body", html=False,
-        cc="", from_header="", thread_id="",
+        cc="", from_header="", thread_id="", source_kind="message", source_id="message-1",
     ))
     api.gmail_draft_delete(api.argparse.Namespace(draft_id="draft-1"))
     assert [call[0] for call in calls] == [
-        ["gmail", "users", "drafts", "create"],
         ["gmail", "users", "drafts", "delete"],
     ]
+    gmail.users.return_value.drafts.return_value.create.assert_called_once()
     assert "drafted" in capsys.readouterr().out
+
+
+def test_draft_cli_help_requires_source_and_approval_contract():
+    result = subprocess.run([sys.executable, str(API_PATH), "gmail", "draft-create", "--help"],
+                            capture_output=True, text=True, check=True)
+    for flag in ("--source-kind", "--source-id", "--context-fingerprint",
+                 "--dry-run", "--approval-token"):
+        assert flag in result.stdout
 
 
 def _event_args(api, **overrides):
@@ -262,6 +304,7 @@ def test_persistent_redaction_preserves_memory_content():
         'customer@example.com +1 (555) 867-5309 '
         'https://localhost/callback?code=secret-code '
         '{"refresh_token":"refresh-secret","body":"raw customer request"} '
+        '{"untrusted_email_body":"arbitrary private customer prose"} '
         '--auth-code 4/authorizationcode --approval-token approval-secret '
         '--body "another raw customer body" ya29.accesstoken'
     )
@@ -270,7 +313,7 @@ def test_persistent_redaction_preserves_memory_content():
     for secret in (
         "customer@example.com", "555", "secret-code", "refresh-secret",
         "raw customer request", "authorizationcode", "approval-secret",
-        "another raw customer body", "accesstoken",
+        "another raw customer body", "arbitrary private customer prose", "accesstoken",
     ):
         assert secret not in persisted
     record = logging.LogRecord("test", logging.INFO, "", 0, raw, (), None)
