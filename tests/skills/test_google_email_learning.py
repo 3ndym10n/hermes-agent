@@ -8,7 +8,7 @@ import time
 from pathlib import Path
 from unittest.mock import MagicMock
 
-import pytest
+import pytest  # ty: ignore[unresolved-import]
 
 
 SCRIPTS = Path(__file__).resolve().parents[2] / "skills/productivity/google-workspace/scripts"
