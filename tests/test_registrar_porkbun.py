@@ -10,7 +10,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
-import pytest
+import pytest  # ty: ignore[unresolved-import]
 
 import registrar_porkbun as porkbun
 

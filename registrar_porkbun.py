@@ -24,7 +24,7 @@ import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from urllib.parse import quote, urlsplit
 
 DEFAULT_API_BASE = "https://api.porkbun.com/api/json/v3"
@@ -195,11 +195,12 @@ def _object(
     where: str,
     required: set[str],
     optional: set[str] | frozenset[str] = frozenset(),
-) -> dict:
+) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise PorkbunResponseError(f"{where} must be an object")
-    missing = required - value.keys()
-    unknown = value.keys() - required - optional
+    data = cast(dict[str, Any], value)
+    missing = required - data.keys()
+    unknown = data.keys() - required - optional
     if missing:
         raise PorkbunResponseError(
             f"{where} missing fields: {', '.join(sorted(missing))}"
@@ -208,13 +209,13 @@ def _object(
         raise PorkbunResponseError(
             f"{where} has unknown fields: {', '.join(sorted(unknown))}"
         )
-    return value
+    return data
 
 
-def _mapping(value: object, where: str) -> dict:
+def _mapping(value: object, where: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise PorkbunResponseError(f"{where} must be an object")
-    return value
+    return cast(dict[str, Any], value)
 
 
 def _string(value: object, where: str, *, values: set[str] | None = None) -> str:
