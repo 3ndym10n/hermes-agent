@@ -112,6 +112,16 @@ def plan(style, monkeypatch, capsys, messages, **overrides):
     return service, json.loads(capsys.readouterr().out)
 
 
+def approve(style, capsys, output, *, token=None, fingerprint=None):
+    style.cmd_approve(style.argparse.Namespace(
+        job_id=output["job_id"],
+        approval_token=token if token is not None else output["approval_token"],
+        plan_fingerprint=(fingerprint if fingerprint is not None
+                          else output["plan_fingerprint"]),
+    ))
+    return json.loads(capsys.readouterr().out)
+
+
 def test_brisbane_local_dates_convert_to_exact_utc_epoch(style):
     result = style.date_boundaries(
         "2026-01-01", "2026-01-31",
@@ -157,7 +167,8 @@ def test_plan_fingerprint_binds_every_approval_field(style, monkeypatch, capsys)
     for field, changed in (
         ("query", "after:1 before:2"), ("label", "INBOX"), ("message_cap", 1),
         ("batch_size", 1), ("exclude_internal", False),
-        ("processing_version", "changed"), ("account_fingerprint", "0" * 64),
+        ("exclusion_policy", []), ("processing_version", "changed"),
+        ("account_fingerprint", "0" * 64),
     ):
         assert style._sha({**state["plan"], field: changed}) != base
 
@@ -286,7 +297,7 @@ def test_prompt_injection_is_inert_deterministic_data(style):
     assert "single_clear_call_to_action" in result["codes"]
 
 
-def test_run_requires_once_only_token_refetches_account_and_writes_no_raw_text(
+def test_approve_is_atomic_once_only_and_run_writes_no_raw_text(
     style, monkeypatch, capsys,
 ):
     private = (
@@ -299,11 +310,28 @@ def test_run_requires_once_only_token_refetches_account_and_writes_no_raw_text(
                       to="team@linxio.com.au", when=2),
     }
     service, output = plan(style, monkeypatch, capsys, messages)
+    calls_before_approval = list(service.user_api.message_api.calls)
+    profile_calls_before_approval = list(service.user_api.profile_calls)
+    with pytest.raises(style.SentStyleError, match="plan fingerprint"):
+        approve(style, capsys, output, fingerprint="0" * 64)
     with pytest.raises(style.SentStyleError, match="approval token"):
-        style.cmd_run(style.argparse.Namespace(job_id=output["job_id"], approval_token="wrong"))
-    style.cmd_run(style.argparse.Namespace(
-        job_id=output["job_id"], approval_token=output["approval_token"],
-    ))
+        approve(style, capsys, output, token="wrong")
+    confirmation = approve(style, capsys, output)
+    assert confirmation["status"] == "approved"
+    assert output["approval_token"] not in json.dumps(confirmation)
+    approved = style._load_state(output["job_id"])
+    assert approved["status"] == "approved"
+    assert approved["approved_plan_fingerprint"] == output["plan_fingerprint"]
+    assert "approval_token_sha256" not in approved
+    assert "approval_expires_at" not in approved
+    assert output["approval_token"] not in style._state_path(output["job_id"]).read_text()
+    assert service.user_api.message_api.calls == calls_before_approval
+    assert service.user_api.profile_calls == profile_calls_before_approval
+    with pytest.raises(style.SentStyleError, match="not awaiting approval"):
+        approve(style, capsys, output)
+
+    service.user_api.message_api.calls.clear()
+    style.cmd_run(style.argparse.Namespace(job_id=output["job_id"]))
     rendered = capsys.readouterr().out
     assert "Jane" not in rendered and "customer secret" not in rendered
     state = style._load_state(output["job_id"])
@@ -311,52 +339,144 @@ def test_run_requires_once_only_token_refetches_account_and_writes_no_raw_text(
     assert state["status"] == "complete"
     assert state["included_count"] == 1
     assert state["excluded_counts"]["internal_only"] == 1
-    assert "approval_token_sha256" not in state
     assert "customer secret" not in persisted
     assert "jane@" not in persisted
     assert len(state["processed_ids"]) == 2
+    list_calls = [
+        value for name, value in service.user_api.message_api.calls if name == "list"
+    ]
+    assert list_calls and all(value["labelIds"] == ["SENT"] for value in list_calls)
     full_ids = [
         value["id"] for name, value in service.user_api.message_api.calls
         if name == "get" and value["format"] == "full"
     ]
     assert full_ids == ["m1"]  # internal-only metadata never causes a body fetch
     with pytest.raises(style.SentStyleError, match="not runnable"):
-        style.cmd_run(style.argparse.Namespace(
-            job_id=output["job_id"], approval_token=output["approval_token"],
-        ))
+        style.cmd_run(style.argparse.Namespace(job_id=output["job_id"]))
     assert all(name in {"list", "get"} for name, _value in service.user_api.message_api.calls)
 
 
-def test_token_expiry_plan_mutation_and_account_substitution_fail_closed(
-    style, monkeypatch, capsys,
-):
-    service, output = plan(
+def test_token_expiry_and_plan_mutation_fail_closed(style, monkeypatch, capsys):
+    _service, output = plan(
         style, monkeypatch, capsys, {"m1": message("m1", "Private body")},
     )
     state = style._load_state(output["job_id"])
     state["approval_expires_at"] = 0
     style._write_state(state)
     with pytest.raises(style.SentStyleError, match="approval token"):
-        style.cmd_run(style.argparse.Namespace(
-            job_id=output["job_id"], approval_token=output["approval_token"],
-        ))
+        approve(style, capsys, output)
 
     state = style._load_state(output["job_id"])
     state["approval_expires_at"] = time.time() + 60
     state["plan"]["batch_size"] = 1
     style._write_state(state)
     with pytest.raises(style.SentStyleError, match="plan binding"):
-        style.cmd_run(style.argparse.Namespace(
-            job_id=output["job_id"], approval_token=output["approval_token"],
-        ))
+        approve(style, capsys, output)
 
-    state["plan"]["batch_size"] = style.BATCH_SIZE
+
+def test_approved_state_survives_token_window_and_module_restart(
+    style, monkeypatch, capsys,
+):
+    service, output = plan(
+        style, monkeypatch, capsys, {"m1": message("m1", "Private body")},
+    )
+    approve(style, capsys, output)
+    spec = importlib.util.spec_from_file_location(
+        f"sent_style_restart_{time.time_ns()}", MODULE,
+    )
+    assert spec is not None and spec.loader is not None
+    restarted = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(restarted)
+    assert restarted._load_state(output["job_id"])["status"] == "approved"
+    monkeypatch.setattr(restarted.google_api, "build_service", lambda *_args: service)
+    future = time.time() + style.APPROVAL_TTL_SECONDS + 1
+    monkeypatch.setattr(restarted.time, "time", lambda: future)
+    restarted.cmd_run(restarted.argparse.Namespace(job_id=output["job_id"]))
+    capsys.readouterr()
+    assert restarted._load_state(output["job_id"])["status"] == "complete"
+
+
+def test_transient_verification_failure_retries_without_reapproval_or_body_read(
+    style, monkeypatch, capsys,
+):
+    service, output = plan(
+        style, monkeypatch, capsys,
+        {"m1": message("m1", "Please confirm the next proposal step with enough words")},
+    )
+    approve(style, capsys, output)
+    service.user_api.message_api.calls.clear()
+    original = style._verify_plan_snapshot
+
+    def transient(_service, state):
+        current = style._load_state(state["job_id"])
+        assert current["status"] == "approved"
+        assert "approval_token_sha256" not in current
+        raise style.SentStyleError("safe Gmail read failed")
+
+    monkeypatch.setattr(style, "_verify_plan_snapshot", transient)
+    with pytest.raises(style.SentStyleError, match="safe Gmail read failed"):
+        style.cmd_run(style.argparse.Namespace(job_id=output["job_id"]))
+    assert style._load_state(output["job_id"])["status"] == "approved"
+    assert not service.user_api.message_api.calls
+
+    monkeypatch.setattr(style, "_verify_plan_snapshot", original)
+    style.cmd_run(style.argparse.Namespace(job_id=output["job_id"]))
+    capsys.readouterr()
+    assert style._load_state(output["job_id"])["status"] == "complete"
+
+
+@pytest.mark.parametrize(
+    ("drift", "reason"),
+    (("snapshot", "message_snapshot_changed"),
+     ("account", "connected_account_changed")),
+)
+def test_material_snapshot_or_account_drift_requires_reapproval_before_body_read(
+    style, monkeypatch, capsys, drift, reason,
+):
+    service, output = plan(
+        style, monkeypatch, capsys, {"m1": message("m1", "PRIVATE BODY")},
+    )
+    approve(style, capsys, output)
+    service.user_api.message_api.calls.clear()
+    if drift == "snapshot":
+        service.user_api.message_api.messages["m2"] = message("m2", "OTHER PRIVATE BODY")
+    else:
+        service.user_api.account = "other@example.com"
+    with pytest.raises(style.PlanDriftError, match="new approval"):
+        style.cmd_run(style.argparse.Namespace(job_id=output["job_id"]))
+    state = style._load_state(output["job_id"])
+    assert state["status"] == "reapproval_required"
+    assert state["drift"]["reason"] == reason
+    assert set(state["drift"]) == {"reason", "detected_at"}
+    style.cmd_status(style.argparse.Namespace(job_id=output["job_id"]))
+    status = json.loads(capsys.readouterr().out)
+    assert status["drift"] == state["drift"]
+    assert "PRIVATE BODY" not in json.dumps(state)
+    assert not [
+        value for name, value in service.user_api.message_api.calls
+        if name == "get" and value["format"] == "full"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("field", "changed"),
+    (("start_date", "2026-01-02"), ("query", "after:1 before:2"),
+     ("message_cap", 1), ("batch_size", 1), ("exclusion_policy", [])),
+)
+def test_changed_material_plan_values_fail_before_body_read(
+    style, monkeypatch, capsys, field, changed,
+):
+    service, output = plan(
+        style, monkeypatch, capsys, {"m1": message("m1", "PRIVATE BODY")},
+    )
+    approve(style, capsys, output)
+    state = style._load_state(output["job_id"])
+    state["plan"][field] = changed
     style._write_state(state)
-    service.user_api.account = "other@example.com"
-    with pytest.raises(style.SentStyleError, match="connected Gmail account changed"):
-        style.cmd_run(style.argparse.Namespace(
-            job_id=output["job_id"], approval_token=output["approval_token"],
-        ))
+    service.user_api.message_api.calls.clear()
+    with pytest.raises(style.SentStyleError, match="plan binding"):
+        style.cmd_run(style.argparse.Namespace(job_id=output["job_id"]))
+    assert not service.user_api.message_api.calls
 
 
 def test_fifty_message_batches_resume_without_duplicate_processing(
@@ -371,6 +491,7 @@ def test_fifty_message_batches_resume_without_duplicate_processing(
         for index in range(51)
     }
     _service, output = plan(style, monkeypatch, capsys, messages)
+    approve(style, capsys, output)
     original = style._process_message
     failed = False
 
@@ -383,13 +504,11 @@ def test_fifty_message_batches_resume_without_duplicate_processing(
 
     monkeypatch.setattr(style, "_process_message", fail_once)
     with pytest.raises(style.SentStyleError, match="synthetic safe failure"):
-        style.cmd_run(style.argparse.Namespace(
-            job_id=output["job_id"], approval_token=output["approval_token"],
-        ))
+        style.cmd_run(style.argparse.Namespace(job_id=output["job_id"]))
     partial = style._load_state(output["job_id"])
     assert partial["status"] == "running"
     assert partial["batch_number"] == 1 and len(partial["processed_ids"]) == 50
-    style.cmd_run(style.argparse.Namespace(job_id=output["job_id"], approval_token=""))
+    style.cmd_run(style.argparse.Namespace(job_id=output["job_id"]))
     complete = style._load_state(output["job_id"])
     assert complete["status"] == "complete"
     assert complete["batch_number"] == 2
@@ -403,13 +522,16 @@ def test_duplicate_messages_are_processed_once(style, monkeypatch, capsys):
         "m2": message("m2", body, when=2),
     }
     _service, output = plan(style, monkeypatch, capsys, messages)
-    style.cmd_run(style.argparse.Namespace(
-        job_id=output["job_id"], approval_token=output["approval_token"],
-    ))
+    approve(style, capsys, output)
+    style.cmd_run(style.argparse.Namespace(job_id=output["job_id"]))
     capsys.readouterr()
     state = style._load_state(output["job_id"])
     assert state["included_count"] == 1
     assert state["excluded_counts"]["duplicate"] == 1
+    state.pop("approved_at")
+    state.pop("verified_at")
+    style._write_state(state)
+    assert style._load_state(output["job_id"])["status"] == "complete"
 
 
 def test_state_tampering_cancellation_and_delete_cleanup(style, monkeypatch, capsys):
@@ -444,9 +566,8 @@ def test_preview_and_record_send_only_sanitized_aggregate_packet(
         ),
     }
     _service, output = plan(style, monkeypatch, capsys, messages)
-    style.cmd_run(style.argparse.Namespace(
-        job_id=output["job_id"], approval_token=output["approval_token"],
-    ))
+    approve(style, capsys, output)
+    style.cmd_run(style.argparse.Namespace(job_id=output["job_id"]))
     capsys.readouterr()
     style.cmd_preview(style.argparse.Namespace(job_id=output["job_id"], patterns_file=""))
     preview = json.loads(capsys.readouterr().out)
