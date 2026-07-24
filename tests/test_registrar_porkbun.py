@@ -106,21 +106,33 @@ def test_all_read_only_methods_against_fake(monkeypatch):
             assert (api_key, secret_key) == (FAKE_API_KEY, FAKE_SECRET_KEY)
 
 
+def test_public_pricing_requires_no_credentials(monkeypatch):
+    routes = {("GET", "/pricing/get"): (200, fixture("pricing.json"))}
+    with fake_server(monkeypatch, routes):
+        monkeypatch.delenv("PORKBUN_API_KEY")
+        monkeypatch.delenv("PORKBUN_SECRET_KEY")
+        client = porkbun.PorkbunClient(timeout=2)
+        assert client.get_default_pricing()["pricing"]["com"]["registration"] == "11.08"
+    assert FakePorkbunHandler.requests == [
+        ("GET", "/pricing/get", None, None),
+    ]
+
+
 def test_mode_0600_credential_file(monkeypatch, tmp_path):
     credentials = tmp_path / "porkbun.json"
     credentials.write_text(
         json.dumps({"apikey": FAKE_API_KEY, "secretapikey": FAKE_SECRET_KEY})
     )
     credentials.chmod(0o600)
-    monkeypatch.setenv("PORKBUN_CREDENTIALS_FILE", str(credentials))
-    monkeypatch.delenv("PORKBUN_API_KEY", raising=False)
-    monkeypatch.delenv("PORKBUN_SECRET_KEY", raising=False)
-    monkeypatch.setenv("PORKBUN_API_BASE", "http://127.0.0.1:1")
-    assert porkbun.PorkbunClient().base_url == "http://127.0.0.1:1"
-
-    credentials.chmod(0o640)
-    with pytest.raises(porkbun.PorkbunConfigurationError, match="mode-0600"):
-        porkbun.PorkbunClient()
+    routes = {("GET", "/ping"): (200, fixture("ping.json"))}
+    with fake_server(monkeypatch, routes):
+        monkeypatch.setenv("PORKBUN_CREDENTIALS_FILE", str(credentials))
+        monkeypatch.delenv("PORKBUN_API_KEY")
+        monkeypatch.delenv("PORKBUN_SECRET_KEY")
+        assert porkbun.PorkbunClient(timeout=2).ping()["credentialsValid"] is True
+        credentials.chmod(0o640)
+        with pytest.raises(porkbun.PorkbunConfigurationError, match="mode-0600"):
+            porkbun.PorkbunClient(timeout=2).ping()
 
 
 def test_authentication_failure_is_typed(monkeypatch):
@@ -283,3 +295,21 @@ def test_private_transport_refuses_mutation_route(monkeypatch):
         with pytest.raises(porkbun.PorkbunConfigurationError, match="read-only route"):
             client._request("domain/create/example.com", method="POST")
     assert FakePorkbunHandler.requests == []
+
+
+def test_domain_list_exposes_validated_pagination(monkeypatch):
+    routes = {
+        ("GET", "/domain/listAll?start=1000"): (
+            200,
+            fixture("domains.json"),
+        )
+    }
+    with fake_server(monkeypatch, routes) as client:
+        assert client.list_domains(start=1000)["count"] == 1
+        with pytest.raises(porkbun.PorkbunConfigurationError, match="non-negative"):
+            client.list_domains(start=-1)
+        with pytest.raises(porkbun.PorkbunConfigurationError, match="non-negative"):
+            client.list_domains(start=True)
+    assert [request[:2] for request in FakePorkbunHandler.requests] == [
+        ("GET", "/domain/listAll?start=1000")
+    ]

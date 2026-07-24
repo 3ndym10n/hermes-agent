@@ -53,7 +53,7 @@ _READ_ONLY_ROUTES = (
     ("GET", True, re.compile(r"^domain/getRegistrationRequirements/[a-z0-9.-]+$")),
     ("GET", True, re.compile(r"^dns/retrieve/[a-z0-9.-]+$")),
     ("GET", True, re.compile(r"^domain/getNs/[a-z0-9.-]+$")),
-    ("GET", True, re.compile(r"^domain/listAll$")),
+    ("GET", True, re.compile(r"^domain/listAll(?:\?start=\d+)?$")),
 )
 
 
@@ -569,7 +569,7 @@ class PorkbunClient:
     """Single-attempt client exposing only the S1 read operations."""
 
     def __init__(self, *, timeout: float = TIMEOUT_SECONDS):
-        self._api_key, self._secret_key = _credentials()
+        self._credentials: tuple[str, str] | None = None
         self._base = _api_base()
         self._timeout = timeout
         self._opener = urllib.request.build_opener(
@@ -626,9 +626,12 @@ class PorkbunClient:
             raise PorkbunConfigurationError("unsupported Porkbun read-only route")
         headers = {"Accept": "application/json"}
         if authenticated:
+            if self._credentials is None:
+                self._credentials = _credentials()
+            api_key, secret_key = self._credentials
             headers.update({
-                "X-API-Key": self._api_key,
-                "X-Secret-API-Key": self._secret_key,
+                "X-API-Key": api_key,
+                "X-Secret-API-Key": secret_key,
             })
         data = b"{}" if method == "POST" else None
         if data is not None:
@@ -654,7 +657,7 @@ class PorkbunClient:
             self._provider_error(payload, error.code)
             raise AssertionError("unreachable")
         except (urllib.error.URLError, OSError, ValueError) as error:
-            safe = redact(str(error), (self._api_key, self._secret_key))
+            safe = redact(str(error), self._credentials or ())
             raise PorkbunTransportError(
                 f"Porkbun transport failure for {path}: {safe}"
             ) from None
@@ -696,8 +699,13 @@ class PorkbunClient:
         name = quote(_domain(domain), safe="")
         return _validate_nameservers(self._request(f"domain/getNs/{name}"))
 
-    def list_domains(self) -> dict:
-        return _validate_domains(self._request("domain/listAll"))
+    def list_domains(self, *, start: int = 0) -> dict:
+        if isinstance(start, bool) or not isinstance(start, int) or start < 0:
+            raise PorkbunConfigurationError(
+                "domain-list start must be a non-negative integer"
+            )
+        path = "domain/listAll" if start == 0 else f"domain/listAll?start={start}"
+        return _validate_domains(self._request(path))
 
 
 _CHECK_RESPONSES = {
