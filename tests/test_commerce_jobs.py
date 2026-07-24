@@ -371,6 +371,20 @@ def test_terminal_states_cannot_transition(tmp_path, terminal):
         )
 
 
+def test_generated_job_id_is_never_payload_redacted(tmp_path, monkeypatch):
+    generated = "4242424242424242abcdefabcdefabcd"
+    monkeypatch.setattr(
+        commerce.uuid,
+        "uuid4",
+        lambda: type("SyntheticUuid", (), {"hex": generated})(),
+    )
+    store = make_store(tmp_path)
+    job = make_job(store)
+    assert job["job_id"] == f"cj_{generated}"
+    assert store.get_job(job["job_id"])["job_id"] == f"cj_{generated}"
+    assert len(store.list_events(job["job_id"])) == 1
+
+
 def test_rolling_back_requires_matching_approval_and_action(tmp_path):
     store = make_store(tmp_path)
     job = make_job(store)
