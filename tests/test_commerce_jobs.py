@@ -535,6 +535,21 @@ def test_forbidden_keys_are_rejected_recursively(payload):
         commerce.canonical_json(payload)
 
 
+def test_short_sensitive_key_matching_does_not_block_normal_commerce_fields():
+    payload = {
+        "company": "Linxio",
+        "company_name": "Linxio Pty Ltd",
+        "expansion_plan": "reviewed",
+        "hotplate": "not an OTP field",
+    }
+    assert json.loads(commerce.canonical_json(payload)) == payload
+    for key in ("pan", "pan-number", "cardCvv", "mfa_code", "3ds-value"):
+        with pytest.raises(
+            commerce.CommerceForbiddenDataError, match="forbidden_sensitive_field"
+        ):
+            commerce.canonical_json({key: "redacted"})
+
+
 @pytest.mark.parametrize(
     "value",
     [
@@ -697,6 +712,84 @@ def test_material_plan_change_invalidates_only_matching_bindings(tmp_path):
         }
     assert statuses[matching_gate["gate_id"]] == "invalidated"
     assert statuses[other_gate["gate_id"]] == "open"
+
+
+def test_stale_action_approval_cannot_transition_or_dispatch(tmp_path):
+    store = make_store(tmp_path)
+    job = make_job(store)
+    first = store.set_plan(
+        job["job_id"], sample_plan(), expected_version=0, actor="planner", now=NOW
+    )
+    seed_state(store, job["job_id"], "ready_to_execute", version=1)
+    action = record_action(
+        store,
+        job["job_id"],
+        effect_class="consequential",
+        target_state="registering_domain",
+        action_type="register_domain",
+        approval_reference="approval-old",
+        approval_fingerprint=first["plan_fingerprint"],
+    )
+    store.set_plan(
+        job["job_id"],
+        {**sample_plan(), "domain": "changed.example"},
+        expected_version=1,
+        actor="planner",
+        now=NOW,
+    )
+    with pytest.raises(
+        commerce.CommerceInvalidTransitionError, match="stale_action_approval"
+    ):
+        store.transition(
+            job["job_id"],
+            "registering_domain",
+            expected_state="ready_to_execute",
+            expected_version=2,
+            actor="worker",
+            reason_code="dispatch",
+            action_id=action["action_id"],
+        )
+    with pytest.raises(commerce.CommerceActionError, match="stale_action_approval"):
+        store.dispatch_action(action["action_id"])
+
+    rollback_job = make_job(store, objective="Rollback changed launch")
+    rollback_plan = store.set_plan(
+        rollback_job["job_id"],
+        sample_plan(),
+        expected_version=0,
+        actor="planner",
+        now=NOW,
+    )
+    rollback_action = record_action(
+        store,
+        rollback_job["job_id"],
+        key="rollback",
+        effect_class="consequential",
+        target_state="rolling_back",
+        action_type="rollback",
+        approval_reference="rollback-approval-old",
+        approval_fingerprint=rollback_plan["plan_fingerprint"],
+    )
+    store.set_plan(
+        rollback_job["job_id"],
+        {**sample_plan(), "domain": "rollback-changed.example"},
+        expected_version=1,
+        actor="planner",
+        now=NOW,
+    )
+    with pytest.raises(
+        commerce.CommerceInvalidTransitionError, match="stale_action_approval"
+    ):
+        store.transition(
+            rollback_job["job_id"],
+            "rolling_back",
+            expected_state="requested",
+            expected_version=2,
+            actor="operator",
+            reason_code="rollback",
+            action_id=rollback_action["action_id"],
+            approval_reference="rollback-approval-old",
+        )
 
 
 def test_equivalent_objective_attaches_but_requesters_are_isolated(tmp_path):
