@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import subprocess
 import sys
 import threading
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest  # ty: ignore[unresolved-import]
 
@@ -24,7 +25,10 @@ def fixture(name: str) -> bytes:
 
 
 class FakePorkbunHandler(BaseHTTPRequestHandler):
-    routes: dict[tuple[str, str], tuple[int, bytes]] = {}
+    routes: dict[
+        tuple[str, str],
+        tuple[int, bytes] | tuple[int, bytes, dict[str, str]],
+    ] = {}
     requests: list[tuple[str, str, str | None, str | None]] = []
 
     def log_message(self, format: str, *args: Any) -> None:
@@ -37,10 +41,15 @@ class FakePorkbunHandler(BaseHTTPRequestHandler):
             self.headers.get("X-API-Key"),
             self.headers.get("X-Secret-API-Key"),
         ))
-        status, body = self.routes.get((self.command, self.path), (404, b"not found"))
+        route = self.routes.get((self.command, self.path), (404, b"not found"))
+        status, body = route[:2]
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
+        if len(route) == 3:
+            response_headers = cast(tuple[int, bytes, dict[str, str]], route)[2]
+            for name, value in response_headers.items():
+                self.send_header(name, value)
         self.end_headers()
         self.wfile.write(body)
 
@@ -135,6 +144,36 @@ def test_mode_0600_credential_file(monkeypatch, tmp_path):
             porkbun.PorkbunClient(timeout=2).ping()
 
 
+def test_symlink_credential_file_is_rejected(monkeypatch, tmp_path):
+    credentials = tmp_path / "porkbun.json"
+    credentials.write_text(
+        json.dumps({"apikey": FAKE_API_KEY, "secretapikey": FAKE_SECRET_KEY})
+    )
+    credentials.chmod(0o600)
+    symlink = tmp_path / "porkbun-link.json"
+    symlink.symlink_to(credentials)
+    with fake_server(monkeypatch, {("GET", "/ping"): (200, fixture("ping.json"))}):
+        monkeypatch.setenv("PORKBUN_CREDENTIALS_FILE", str(symlink))
+        monkeypatch.delenv("PORKBUN_API_KEY")
+        monkeypatch.delenv("PORKBUN_SECRET_KEY")
+        with pytest.raises(porkbun.PorkbunConfigurationError):
+            porkbun.PorkbunClient(timeout=2).ping()
+    assert FakePorkbunHandler.requests == []
+
+
+def test_env_and_file_credentials_conflict(monkeypatch, tmp_path):
+    credentials = tmp_path / "porkbun.json"
+    credentials.write_text(
+        json.dumps({"apikey": FAKE_API_KEY, "secretapikey": FAKE_SECRET_KEY})
+    )
+    credentials.chmod(0o600)
+    with fake_server(monkeypatch, {("GET", "/ping"): (200, fixture("ping.json"))}):
+        monkeypatch.setenv("PORKBUN_CREDENTIALS_FILE", str(credentials))
+        with pytest.raises(porkbun.PorkbunConfigurationError):
+            porkbun.PorkbunClient(timeout=2).ping()
+    assert FakePorkbunHandler.requests == []
+
+
 def test_authentication_failure_is_typed(monkeypatch):
     routes = {("GET", "/ping"): (400, fixture("auth_error.json"))}
     with fake_server(monkeypatch, routes) as client:
@@ -186,6 +225,52 @@ def test_http_failure_is_typed(monkeypatch):
     with fake_server(monkeypatch, routes) as client:
         with pytest.raises(porkbun.PorkbunTransportError, match="HTTP failure.*503"):
             client.ping()
+
+
+def test_redirect_is_refused(monkeypatch):
+    routes = {
+        ("GET", "/ping"): (302, b"", {"Location": "/redirect-target"}),
+        ("GET", "/redirect-target"): (200, fixture("ping.json")),
+    }
+    with fake_server(monkeypatch, routes) as client:
+        with pytest.raises(porkbun.PorkbunTransportError):
+            client.ping()
+    assert [request[:2] for request in FakePorkbunHandler.requests] == [
+        ("GET", "/ping")
+    ]
+
+
+def test_ambient_proxy_is_ignored(monkeypatch):
+    for name in ("http_proxy", "HTTP_PROXY", "https_proxy", "HTTPS_PROXY"):
+        monkeypatch.setenv(name, "http://192.0.2.1:9")
+    with fake_server(
+        monkeypatch, {("GET", "/ping"): (200, fixture("ping.json"))}
+    ) as client:
+        assert client.ping()["credentialsValid"] is True
+    assert [request[:2] for request in FakePorkbunHandler.requests] == [
+        ("GET", "/ping")
+    ]
+
+
+def test_oversized_response_is_rejected(monkeypatch):
+    routes = {("GET", "/ping"): (200, b"x" * (porkbun.MAX_RESPONSE_BYTES + 1))}
+    with fake_server(monkeypatch, routes) as client:
+        with pytest.raises(porkbun.PorkbunResponseError, match="too large"):
+            client.ping()
+
+
+def test_connection_failure_is_typed(monkeypatch):
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    monkeypatch.setenv("PORKBUN_API_BASE", f"http://127.0.0.1:{port}")
+    monkeypatch.setenv("PORKBUN_API_KEY", FAKE_API_KEY)
+    monkeypatch.setenv("PORKBUN_SECRET_KEY", FAKE_SECRET_KEY)
+    monkeypatch.delenv("PORKBUN_CREDENTIALS_FILE", raising=False)
+    with pytest.raises(porkbun.PorkbunTransportError) as error:
+        porkbun.PorkbunClient(timeout=0.2).ping()
+    assert FAKE_API_KEY not in str(error.value)
+    assert FAKE_SECRET_KEY not in str(error.value)
 
 
 def test_credentials_are_redacted_from_errors_and_output(monkeypatch, capsys):
