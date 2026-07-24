@@ -694,12 +694,11 @@ class CommerceJobStore:
         result = dict(row)
         result["active"] = bool(result["active"])
         raw_plan = result.pop("plan_json")
-        for key, value in tuple(result.items()):
-            if isinstance(value, str):
-                try:
-                    reject_forbidden_data(value, key)
-                except CommerceForbiddenDataError:
-                    result[key] = "[REDACTED_UNSAFE_VALUE]"
+        for key in ("requester", "original_objective", "normalized_objective"):
+            try:
+                reject_forbidden_data(result[key], key)
+            except CommerceForbiddenDataError:
+                result[key] = "[REDACTED_UNSAFE_VALUE]"
         result["plan"] = _display_json(raw_plan)
         return result
 
