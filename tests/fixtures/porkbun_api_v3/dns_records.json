@@ -1,0 +1,16 @@
+{
+  "status": "SUCCESS",
+  "cloudflare": "disabled",
+  "records": [
+    {
+      "id": "123456789",
+      "name": "www.example.com",
+      "type": "A",
+      "content": "192.0.2.10",
+      "ttl": "600",
+      "prio": null,
+      "notes": null
+    }
+  ],
+  "requestId": "019e04fa-0000-7000-8000-000000000005"
+}

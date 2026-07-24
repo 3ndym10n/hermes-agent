@@ -1,0 +1,16 @@
+{
+  "status": "SUCCESS",
+  "pricing": {
+    "com": {
+      "registration": "11.08",
+      "renewal": "11.08",
+      "transfer": "11.08"
+    },
+    "net": {
+      "registration": "12.50",
+      "renewal": "12.50",
+      "transfer": "12.50"
+    }
+  },
+  "requestId": "019e04fa-0000-7000-8000-000000000002"
+}
