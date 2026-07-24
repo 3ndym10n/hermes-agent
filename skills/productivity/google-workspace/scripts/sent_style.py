@@ -112,6 +112,7 @@ CONFLICTS = {
 }
 
 _ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,160}$")
+_HASH_RE = re.compile(r"^[a-f0-9]{64}$")
 _EMAIL_RE = re.compile(r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b")
 _PHONE_RE = re.compile(r"(?<!\w)(?:\+?\d[\d(). -]{6,}\d)(?!\w)")
 _URL_RE = re.compile(r"(?i)\b(?:https?://|www\.)\S+")
@@ -142,6 +143,14 @@ _EMPTY_ACK_RE = re.compile(
 
 class SentStyleError(RuntimeError):
     """Fail-closed workflow error."""
+
+
+class PlanDriftError(SentStyleError):
+    """Sanitized material drift detected before body analysis."""
+
+    def __init__(self, reason: str):
+        self.reason = reason
+        super().__init__("approved plan changed; new approval is required")
 
 
 def _canonical(value: object) -> str:
@@ -228,7 +237,10 @@ def _load_state(job_id: str) -> dict:
             and (not isinstance(state.get("plan"), dict)
                  or state.get("plan_fingerprint") != _sha(state["plan"]))):
         raise SentStyleError("approved plan binding check failed")
-    if (state.get("status") in {"running", "complete", "previewed", "recorded"}
+    if (state.get("status") in {
+            "approved", "running", "complete", "previewed", "recorded",
+            "reapproval_required",
+    }
             and state.get("approved_plan_fingerprint") != state.get("plan_fingerprint")):
         raise SentStyleError("approved plan binding check failed")
     if float(state.get("expires_at", 0)) < time.time():
@@ -311,6 +323,37 @@ def date_boundaries(start_value: str = "", end_value: str = "",
         "start_epoch": int(start_local.timestamp()),
         "end_epoch_exclusive": int(end_exclusive.timestamp()),
     }
+
+
+def _verify_plan_contract(plan: Mapping) -> None:
+    try:
+        boundaries = date_boundaries(
+            str(plan["start_date"]), str(plan["end_date_inclusive"]),
+        )
+        message_ids = plan["message_ids"]
+    except (KeyError, TypeError, SentStyleError) as exc:
+        raise PlanDriftError("plan_contract_changed") from exc
+    if (
+        not isinstance(message_ids, list)
+        or any(not isinstance(item, str) or not _ID_RE.fullmatch(item)
+               for item in message_ids)
+        or len(message_ids) != len(set(message_ids))
+        or any(plan.get(key) != value for key, value in boundaries.items())
+        or plan.get("query")
+        != f"after:{boundaries['start_epoch'] - 1} before:{boundaries['end_epoch_exclusive']}"
+        or plan.get("label") != LABEL
+        or plan.get("message_cap") != MAX_MESSAGES
+        or plan.get("batch_size") != BATCH_SIZE
+        or type(plan.get("exclude_internal")) is not bool
+        or plan.get("exclusion_policy") != list(EXCLUSION_REASONS)
+        or plan.get("processing_version") != PROCESSING_VERSION
+        or not _HASH_RE.fullmatch(str(plan.get("account_fingerprint") or ""))
+        or plan.get("total_found") != len(message_ids)
+        or plan.get("eligible_estimate") not in range(len(message_ids) + 1)
+        or plan.get("batch_count") != (len(message_ids) + BATCH_SIZE - 1) // BATCH_SIZE
+        or plan.get("message_snapshot") != _sha(message_ids)
+    ):
+        raise PlanDriftError("plan_contract_changed")
 
 
 def _list_ids(service, query: str) -> list[str]:
@@ -409,6 +452,7 @@ def cmd_plan(args) -> None:
     plan = {
         **boundaries, "query": query, "label": LABEL, "message_cap": MAX_MESSAGES,
         "batch_size": BATCH_SIZE, "exclude_internal": not args.include_internal,
+        "exclusion_policy": list(EXCLUSION_REASONS),
         "processing_version": PROCESSING_VERSION,
         "account_fingerprint": account_fingerprint,
         "total_found": len(ordered_ids),
@@ -438,7 +482,7 @@ def cmd_plan(args) -> None:
         "estimated_eligible_count": plan["eligible_estimate"],
         "maximum_message_cap": MAX_MESSAGES, "batch_size": BATCH_SIZE,
         "batch_count": plan["batch_count"],
-        "exclusions": list(EXCLUSION_REASONS),
+        "exclusions": plan["exclusion_policy"],
         "internal_only_excluded": plan["exclude_internal"],
     }))
 
@@ -715,18 +759,19 @@ def _process_message(state: dict, service, message_id: str, own_domain: str,
 
 
 def _verify_plan_snapshot(service, state: Mapping) -> tuple[str, str, dict[str, str]]:
+    _verify_plan_contract(state["plan"])
     account, fingerprint = _profile(service)
     if fingerprint != state["plan"]["account_fingerprint"]:
-        raise SentStyleError("connected Gmail account changed after approval")
+        raise PlanDriftError("connected_account_changed")
     ids = _list_ids(service, state["plan"]["query"])
     metadata = [_message_metadata(service, message_id) for message_id in ids]
     if any(not state["plan"]["start_epoch"] * 1_000 <= item["internal_date"]
            < state["plan"]["end_epoch_exclusive"] * 1_000 for item in metadata):
-        raise SentStyleError("Gmail returned a message outside the approved date range")
+        raise PlanDriftError("date_boundary_changed")
     metadata.sort(key=lambda item: (item["internal_date"], item["id"]))
     ordered = [item["id"] for item in metadata]
     if ordered != state["plan"]["message_ids"] or _sha(ordered) != state["plan"]["message_snapshot"]:
-        raise SentStyleError("approved Gmail range changed after planning")
+        raise PlanDriftError("message_snapshot_changed")
     own_domain = account.rsplit("@", 1)[1]
     exclusions = {
         item["id"]: reason for item in metadata
@@ -737,22 +782,50 @@ def _verify_plan_snapshot(service, state: Mapping) -> tuple[str, str, dict[str, 
     return account, own_domain, exclusions
 
 
+def cmd_approve(args) -> None:
+    with _job_lock(args.job_id):
+        state = _load_state(args.job_id)
+        if state["status"] != "planned":
+            raise SentStyleError("job is not awaiting approval")
+        _verify_plan_contract(state["plan"])
+        if args.plan_fingerprint != state["plan_fingerprint"]:
+            raise SentStyleError("exact plan fingerprint is required")
+        if (not args.approval_token
+                or _sha(args.approval_token) != state.get("approval_token_sha256")
+                or time.time() > float(state.get("approval_expires_at", 0))):
+            raise SentStyleError("exact unexpired plan approval token is required")
+        state.pop("approval_token_sha256", None)
+        state.pop("approval_expires_at", None)
+        state["approved_plan_fingerprint"] = state["plan_fingerprint"]
+        state["approved_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        state["status"] = "approved"
+        _write_state(state)
+        print(json.dumps({
+            "status": "approved", "job_id": state["job_id"],
+            "plan_fingerprint": state["plan_fingerprint"],
+            "approved_at": state["approved_at"],
+        }))
+
+
 def cmd_run(args) -> None:
     with _job_lock(args.job_id):
         state = _load_state(args.job_id)
-        if state["status"] not in {"planned", "running"}:
+        if state["status"] not in {"approved", "running"}:
             raise SentStyleError("job is not runnable")
         service = google_api.build_service("gmail", "v1")
-        _account, own_domain, metadata_exclusions = _verify_plan_snapshot(service, state)
-        if state["status"] == "planned":
-            if (not args.approval_token
-                    or _sha(args.approval_token) != state.get("approval_token_sha256")
-                    or time.time() > float(state.get("approval_expires_at", 0))):
-                raise SentStyleError("exact unexpired plan approval token is required")
-            state.pop("approval_token_sha256", None)
-            state.pop("approval_expires_at", None)
-            state["approved_plan_fingerprint"] = state["plan_fingerprint"]
+        try:
+            _account, own_domain, metadata_exclusions = _verify_plan_snapshot(service, state)
+        except PlanDriftError as exc:
+            state["status"] = "reapproval_required"
+            state["drift"] = {
+                "reason": exc.reason,
+                "detected_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            }
+            _write_state(state)
+            raise
+        if state["status"] == "approved":
             state["status"] = "running"
+            state["verified_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
             _write_state(state)
         processed = set(state["processed_ids"])
         remaining = [item for item in state["plan"]["message_ids"] if item not in processed]
@@ -954,6 +1027,7 @@ def _status(state: Mapping) -> dict:
         "excluded": sum((state.get("excluded_counts") or {}).values()),
         "exclusion_reasons": state.get("excluded_counts") or {},
         "batch_number": state.get("batch_number", 0),
+        "drift": state.get("drift") or {},
         "expires_at": state["expires_at"],
     }
 
@@ -993,8 +1067,13 @@ def main() -> int:
     plan.add_argument("--end", default="", help="inclusive local date YYYY-MM-DD")
     plan.add_argument("--include-internal", action="store_true")
     plan.set_defaults(func=cmd_plan)
+    approve = sub.add_parser("sent-style-approve")
+    approve.add_argument("job_id")
+    approve.add_argument("--approval-token", required=True)
+    approve.add_argument("--plan-fingerprint", required=True)
+    approve.set_defaults(func=cmd_approve)
     run = sub.add_parser("sent-style-run")
-    run.add_argument("job_id"); run.add_argument("--approval-token", default="")
+    run.add_argument("job_id")
     run.set_defaults(func=cmd_run)
     preview = sub.add_parser("sent-style-preview")
     preview.add_argument("job_id"); preview.add_argument("--patterns-file", default="")
