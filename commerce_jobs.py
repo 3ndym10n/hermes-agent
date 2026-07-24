@@ -137,20 +137,27 @@ _ACTION_RUNTIME_FIELDS = frozenset({
     "timestamp",
     "updated_at",
 })
+_SHORT_FORBIDDEN_KEYS = frozenset({"pan", "cvv", "cvc", "otp", "mfa", "3ds"})
+_SHORT_FORBIDDEN_ALIASES = frozenset({
+    "pannumber",
+    "paymentpan",
+    "primaryaccountnumber",
+    "cardpan",
+    "cardcvv",
+    "cardcvc",
+    "onetimepassword",
+    "mfacode",
+    "3dscode",
+    "3dsvalue",
+})
 _FORBIDDEN_KEY_PARTS = frozenset({
-    "pan",
     "cardnumber",
     "expiry",
     "expiration",
     "expdate",
-    "cvv",
-    "cvc",
     "securitycode",
     "password",
     "passcode",
-    "otp",
-    "mfa",
-    "3ds",
     "bankingcredential",
     "bankcredential",
     "banktoken",
@@ -369,7 +376,11 @@ def reject_forbidden_data(value: Any, field: str = "payload") -> None:
     if isinstance(value, Mapping):
         for key, child in value.items():
             compact = _key_compact(key)
-            if any(token in compact for token in _FORBIDDEN_KEY_PARTS):
+            if (
+                compact in _SHORT_FORBIDDEN_KEYS
+                or compact in _SHORT_FORBIDDEN_ALIASES
+                or any(token in compact for token in _FORBIDDEN_KEY_PARTS)
+            ):
                 _fail(
                     CommerceForbiddenDataError,
                     "forbidden_sensitive_field",
@@ -896,6 +907,12 @@ class CommerceJobStore:
                     "action_id",
                 )
             bound_action = self._action_row(connection, action_id)
+            if bound_action["approval_status"] == "stale":
+                _fail(
+                    CommerceInvalidTransitionError,
+                    "stale_action_approval",
+                    "action_id",
+                )
             if (
                 bound_action["job_id"] != row["job_id"]
                 or bound_action["target_state"] != to_state
@@ -920,6 +937,12 @@ class CommerceJobStore:
                     "action_id",
                 )
             bound_action = self._action_row(connection, action_id)
+            if bound_action["approval_status"] == "stale":
+                _fail(
+                    CommerceInvalidTransitionError,
+                    "stale_action_approval",
+                    "action_id",
+                )
             if (
                 bound_action["job_id"] != row["job_id"]
                 or bound_action["action_type"] != "rollback"
@@ -1301,6 +1324,12 @@ class CommerceJobStore:
         timestamp = iso_utc(now)
         with self._write() as connection:
             row = self._action_row(connection, action_id)
+            if row["approval_status"] == "stale":
+                _fail(
+                    CommerceActionError,
+                    "stale_action_approval",
+                    "action_id",
+                )
             if row["action_status"] != "planned":
                 _fail(
                     CommerceActionError,
