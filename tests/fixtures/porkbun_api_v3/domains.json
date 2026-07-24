@@ -1,0 +1,19 @@
+{
+  "status": "SUCCESS",
+  "count": 1,
+  "domains": [
+    {
+      "domain": "example.com",
+      "status": "ACTIVE",
+      "tld": "com",
+      "createDate": "2026-01-15 10:00:00",
+      "expireDate": "2027-01-15 10:00:00",
+      "securityLock": 1,
+      "whoisPrivacy": 1,
+      "autoRenew": 1,
+      "apiAccess": 1,
+      "notLocal": 0
+    }
+  ],
+  "requestId": "019e04fa-0000-7000-8000-000000000007"
+}

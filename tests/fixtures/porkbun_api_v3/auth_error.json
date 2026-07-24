@@ -1,0 +1,10 @@
+{
+  "status": "ERROR",
+  "message": "Invalid API keys.",
+  "code": "INVALID_API_KEYS_001",
+  "next_action": {
+    "type": "authenticate",
+    "hint": "Check the API key and secret."
+  },
+  "requestId": "019e04fa-0000-7000-8000-000000000008"
+}

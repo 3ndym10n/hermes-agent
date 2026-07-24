@@ -1,0 +1,18 @@
+{
+  "status": "SUCCESS",
+  "tld": "com",
+  "apiRegisterable": true,
+  "registrationDurationYears": 1,
+  "maxRegistrationYears": 10,
+  "whoisPrivacySupported": true,
+  "requiresValidatedAddress": false,
+  "registrantOnly": false,
+  "requestSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "required": ["apikey", "secretapikey", "cost", "agreeToTerms"],
+    "additionalProperties": false
+  },
+  "registryRequirements": null,
+  "requestId": "019e04fa-0000-7000-8000-000000000004"
+}

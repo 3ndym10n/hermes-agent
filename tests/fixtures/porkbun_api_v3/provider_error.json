@@ -1,0 +1,10 @@
+{
+  "status": "ERROR",
+  "message": "Invalid domain.",
+  "code": "INVALID_DOMAIN",
+  "next_action": {
+    "type": "fix_request",
+    "hint": "Use a valid domain."
+  },
+  "requestId": "019e04fa-0000-7000-8000-000000000009"
+}
