@@ -157,6 +157,10 @@ $GSTYLE sent-style-approve JOB_ID --approval-token ONE_TIME_TOKEN \
 $GSTYLE sent-style-run JOB_ID
 $GSTYLE sent-style-status JOB_ID
 $GSTYLE sent-style-preview JOB_ID
+
+# Combine completed contiguous jobs in explicit chronological order.
+$GSTYLE sent-style-consolidate-preview JOB_ID_1 JOB_ID_2 [JOB_ID_3 ...]
+# Record the returned consolidated job ID only after approving its exact fingerprint.
 $GSTYLE sent-style-record JOB_ID --preview-fingerprint FINGERPRINT \
   --confirm RECORD-APPROVED-SENT-STYLE
 
@@ -165,7 +169,7 @@ $GSTYLE sent-style-cancel JOB_ID
 $GSTYLE sent-style-delete JOB_ID
 ```
 
-The plan is metadata-only. More than 2,000 messages stops before approval and requires explicit chronological sub-ranges. Internal-only messages are excluded by default; `--include-internal` changes the plan and therefore its approval fingerprint. The operator consumes the hidden short-lived token with `sent-style-approve` immediately after Cal's plain-language approval; that atomic transition is durable across slow verification, transient failures, and restarts. `sent-style-run` requires the durable approved state, revalidates the exact SENT snapshot before reading any body, and requires a new plan only for material drift. The run strips quoted chains, signatures, disclaimers, trackers, calendar payloads, attachments, automated mail, acknowledgements, duplicates, and near-duplicate templates locally. It stores only opaque message IDs, hashed source references, counts, closed style codes, and resumable aggregate state.
+The plan is metadata-only. More than 2,000 messages stops before approval and requires explicit chronological sub-ranges. Internal-only messages are excluded by default; `--include-internal` changes the plan and therefore its approval fingerprint. The operator consumes the hidden short-lived token with `sent-style-approve` immediately after Cal's plain-language approval; that atomic transition is durable across slow verification, transient failures, and restarts. `sent-style-run` requires the durable approved state, revalidates the exact SENT snapshot before reading any body, and requires a new plan only for material drift. The run strips quoted chains, signatures, disclaimers, trackers, calendar payloads, attachments, automated mail, and acknowledgements locally, then stores only opaque/hashes, deterministic chronology, closed category/pattern codes, counts, and resumable state. Consolidation validates compatible contiguous jobs, removes exact duplicates globally before near-duplicate templates, and recomputes all evidence from the earliest retained contributions. Legacy completed states without those contributions return `reanalyze_required_for_trustworthy_consolidation`; aggregates are never guessed.
 
 The first version intentionally sends no email text to an LLM: deterministic local features and closed pattern codes are enough for the reviewed bootstrap. A pattern-selection file may retain or remove codes and mark a code `candidate` or `tentative` before a new preview is approved:
 
