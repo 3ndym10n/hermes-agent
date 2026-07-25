@@ -29,7 +29,7 @@ from google_auth import ensure_private_directory, private_state_path
 
 TIMEZONE = "Australia/Brisbane"
 LABEL = "SENT"
-PROCESSING_VERSION = "linxio-sent-style-v1"
+PROCESSING_VERSION = "linxio-sent-style-v2"
 MAX_MESSAGES = 2_000
 BATCH_SIZE = 50
 MAX_LIST_MESSAGES = 10_000
@@ -44,62 +44,93 @@ STATE_TTL_SECONDS = 7 * 24 * 60 * 60
 APPROVAL_TTL_SECONDS = 15 * 60
 MAX_STATE_BYTES = 4_000_000
 RECORD_CONFIRM = "RECORD-APPROVED-SENT-STYLE"
+REANALYZE_REQUIRED = "reanalyze_required_for_trustworthy_consolidation"
 STATE_DIR = private_state_path("linxio_sent_style")
 
 EXCLUSION_REASONS = (
-    "internal_only", "recipient_scope_unknown", "automated", "machine_generated",
+    "internal_only",
+    "recipient_scope_unknown",
+    "automated",
+    "machine_generated",
     "empty_acknowledgement",
-    "too_little_authored_text", "duplicate", "near_duplicate_template",
-    "missing_body", "unsafe_mime", "not_sent",
+    "too_little_authored_text",
+    "duplicate",
+    "near_duplicate_template",
+    "missing_body",
+    "unsafe_mime",
+    "not_sent",
 )
 CATEGORIES = (
-    "initial_outreach", "follow_up", "proposal_quote", "pricing",
-    "product_explanation", "installation", "information_request",
-    "objection_handling", "scheduling", "deal_progression",
-    "customer_support", "closing_next_step", "other",
+    "initial_outreach",
+    "follow_up",
+    "proposal_quote",
+    "pricing",
+    "product_explanation",
+    "installation",
+    "information_request",
+    "objection_handling",
+    "scheduling",
+    "deal_progression",
+    "customer_support",
+    "closing_next_step",
+    "other",
 )
 PATTERNS = {
     "warm_direct_tone": ("tone_voice", "tone", "Use a warm, direct tone."),
     "formal_direct_tone": ("tone_voice", "tone", "Use a formal, direct tone."),
     "concise_email": ("email_length", "length", "Keep the email concise."),
     "detailed_when_needed": (
-        "email_length", "length", "Include detail when the decision requires it.",
+        "email_length",
+        "length",
+        "Include detail when the decision requires it.",
     ),
     "short_paragraphs": ("paragraph_structure", "formatting", "Use short paragraphs."),
     "contextual_paragraphs": (
-        "paragraph_structure", "formatting",
+        "paragraph_structure",
+        "formatting",
         "Use fuller paragraphs when context is complex.",
     ),
     "brief_greeting": ("greeting", "greeting", "Use a brief greeting."),
     "brief_closing": ("closing", "closing", "Use a brief closing."),
     "structured_quote": (
-        "proposal_quote", "proposal_quote",
+        "proposal_quote",
+        "proposal_quote",
         "Structure quotes around scope, price, terms, and next step.",
     ),
     "clear_follow_up": (
-        "follow_up", "follow_up", "State the follow-up purpose and one clear next step.",
+        "follow_up",
+        "follow_up",
+        "State the follow-up purpose and one clear next step.",
     ),
     "group_information_requests": (
-        "information_request", "information_request",
+        "information_request",
+        "information_request",
         "Group information requests into a short checklist.",
     ),
     "explain_pricing_basis": (
-        "pricing", "pricing", "Explain the pricing basis without inventing commercial facts.",
+        "pricing",
+        "pricing",
+        "Explain the pricing basis without inventing commercial facts.",
     ),
     "separate_payment_terms": (
-        "payment_terms", "payment_terms",
+        "payment_terms",
+        "payment_terms",
         "Keep approved payment terms separate from style guidance.",
     ),
     "explain_installation_sequence": (
-        "installation", "installation",
+        "installation",
+        "installation",
         "Explain the approved installation sequence clearly.",
     ),
     "acknowledge_objection": (
-        "objection_handling", "objection_handling",
+        "objection_handling",
+        "objection_handling",
         "Acknowledge the objection before answering it.",
     ),
     "single_clear_call_to_action": (
-        "call_to_action", "call_to_action", "End with one clear call to action.",
+        "call_to_action",
+        "call_to_action",
+        "End with one clear call to action.",
     ),
 }
 CONFLICTS = {
@@ -113,7 +144,20 @@ CONFLICTS = {
 
 _ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,160}$")
 _HASH_RE = re.compile(r"^[a-f0-9]{64}$")
+_SIMHASH_RE = re.compile(r"^[a-f0-9]{16}$")
+_SOURCE_REF_RE = re.compile(r"^sha256:[a-f0-9]{64}$")
 _EMAIL_RE = re.compile(r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b")
+_CONTRIBUTION_FIELDS = frozenset({
+    "source_ref",
+    "normalized_content_sha256",
+    "simhash",
+    "internal_timestamp_ms",
+    "message_category",
+    "style_pattern_codes",
+    "origin_job_ref",
+    "origin_range_ref",
+    "extraction_version",
+})
 _PHONE_RE = re.compile(r"(?<!\w)(?:\+?\d[\d(). -]{6,}\d)(?!\w)")
 _URL_RE = re.compile(r"(?i)\b(?:https?://|www\.)\S+")
 _AUTH_RE = re.compile(
@@ -184,13 +228,18 @@ def _state_path(job_id: str) -> Path:
 
 
 def _integrity(state: Mapping) -> str:
-    return _sha({key: value for key, value in state.items() if key != "state_integrity"})
+    return _sha({
+        key: value for key, value in state.items() if key != "state_integrity"
+    })
 
 
 def _write_state(state: dict) -> None:
     state = dict(state)
     state["state_integrity"] = _integrity(state)
     path = _state_path(state["job_id"])
+    payload = json.dumps(state, separators=(",", ":"))
+    if len(payload.encode("utf-8")) > MAX_STATE_BYTES:
+        raise SentStyleError("private job state is too large")
     if path.is_symlink():
         raise SentStyleError("private state path is unsafe")
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
@@ -200,7 +249,7 @@ def _write_state(state: dict) -> None:
         os.fchmod(fd, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as stream:
             fd = -1
-            json.dump(state, stream, separators=(",", ":"))
+            stream.write(payload)
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, path)
@@ -217,8 +266,11 @@ def _load_state(job_id: str) -> dict:
     try:
         fd = os.open(path, flags)
         metadata = os.fstat(fd)
-        if (not stat.S_ISREG(metadata.st_mode) or metadata.st_mode & 0o077
-                or metadata.st_size > MAX_STATE_BYTES):
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_mode & 0o077
+            or metadata.st_size > MAX_STATE_BYTES
+        ):
             raise SentStyleError("private job state is unsafe")
         with os.fdopen(fd, "r", encoding="utf-8") as stream:
             fd = -1
@@ -230,18 +282,25 @@ def _load_state(job_id: str) -> dict:
     finally:
         if fd >= 0:
             os.close(fd)
-    if (not isinstance(state, dict) or state.get("job_id") != job_id
-            or state.get("state_integrity") != _integrity(state)):
+    if (
+        not isinstance(state, dict)
+        or state.get("job_id") != job_id
+        or state.get("state_integrity") != _integrity(state)
+    ):
         raise SentStyleError("job state integrity check failed")
-    if (state.get("status") != "cancelled"
-            and (not isinstance(state.get("plan"), dict)
-                 or state.get("plan_fingerprint") != _sha(state["plan"]))):
+    if state.get("status") != "cancelled" and (
+        not isinstance(state.get("plan"), dict)
+        or state.get("plan_fingerprint") != _sha(state["plan"])
+    ):
         raise SentStyleError("approved plan binding check failed")
-    if (state.get("status") in {
-            "approved", "running", "complete", "previewed", "recorded",
-            "reapproval_required",
-    }
-            and state.get("approved_plan_fingerprint") != state.get("plan_fingerprint")):
+    if state.get("status") in {
+        "approved",
+        "running",
+        "complete",
+        "previewed",
+        "recorded",
+        "reapproval_required",
+    } and state.get("approved_plan_fingerprint") != state.get("plan_fingerprint"):
         raise SentStyleError("approved plan binding check failed")
     if float(state.get("expires_at", 0)) < time.time():
         raise SentStyleError("job state is expired")
@@ -262,9 +321,11 @@ def _job_lock(job_id: str):
         try:
             if os.name == "nt":
                 import msvcrt
+
                 msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
             else:
                 import fcntl
+
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError as exc:
             raise SentStyleError("job is already running") from exc
@@ -281,7 +342,7 @@ def _execute(request):
             status = getattr(getattr(exc, "resp", None), "status", None)
             if attempt == 2 or (status is not None and status != 429 and status < 500):
                 raise SentStyleError("safe Gmail read failed") from exc
-            time.sleep(0.1 * (2 ** attempt))
+            time.sleep(0.1 * (2**attempt))
     raise AssertionError("unreachable")
 
 
@@ -300,21 +361,29 @@ def _default_start(today: date) -> date:
         return today.replace(year=today.year - 1, day=28)
 
 
-def date_boundaries(start_value: str = "", end_value: str = "",
-                    *, now: datetime | None = None) -> dict:
+def date_boundaries(
+    start_value: str = "", end_value: str = "", *, now: datetime | None = None
+) -> dict:
     zone = ZoneInfo(TIMEZONE)
     local_today = (now or datetime.now(zone)).astimezone(zone).date()
     try:
-        start_day = date.fromisoformat(start_value) if start_value else _default_start(local_today)
+        start_day = (
+            date.fromisoformat(start_value)
+            if start_value
+            else _default_start(local_today)
+        )
         end_day = date.fromisoformat(end_value) if end_value else local_today
     except ValueError as exc:
         raise SentStyleError("dates must use YYYY-MM-DD") from exc
     if start_day > end_day:
         raise SentStyleError("start date must not be after end date")
     start_local = datetime.combine(start_day, datetime_time.min, zone)
-    end_exclusive = datetime.combine(end_day + timedelta(days=1), datetime_time.min, zone)
+    end_exclusive = datetime.combine(
+        end_day + timedelta(days=1), datetime_time.min, zone
+    )
     return {
-        "timezone": TIMEZONE, "start_date": start_day.isoformat(),
+        "timezone": TIMEZONE,
+        "start_date": start_day.isoformat(),
         "end_date_inclusive": end_day.isoformat(),
         "start_local": start_local.isoformat(),
         "end_local_exclusive": end_exclusive.isoformat(),
@@ -328,15 +397,18 @@ def date_boundaries(start_value: str = "", end_value: str = "",
 def _verify_plan_contract(plan: Mapping) -> None:
     try:
         boundaries = date_boundaries(
-            str(plan["start_date"]), str(plan["end_date_inclusive"]),
+            str(plan["start_date"]),
+            str(plan["end_date_inclusive"]),
         )
         message_ids = plan["message_ids"]
     except (KeyError, TypeError, SentStyleError) as exc:
         raise PlanDriftError("plan_contract_changed") from exc
     if (
         not isinstance(message_ids, list)
-        or any(not isinstance(item, str) or not _ID_RE.fullmatch(item)
-               for item in message_ids)
+        or any(
+            not isinstance(item, str) or not _ID_RE.fullmatch(item)
+            for item in message_ids
+        )
         or len(message_ids) != len(set(message_ids))
         or any(plan.get(key) != value for key, value in boundaries.items())
         or plan.get("query")
@@ -360,14 +432,21 @@ def _list_ids(service, query: str) -> list[str]:
     ids, page_token = [], None
     for _page in range(MAX_LIST_PAGES):
         kwargs = {
-            "userId": "me", "labelIds": [LABEL], "q": query, "maxResults": 500,
+            "userId": "me",
+            "labelIds": [LABEL],
+            "q": query,
+            "maxResults": 500,
         }
         if page_token:
             kwargs["pageToken"] = page_token
         result = _execute(service.users().messages().list(**kwargs))
-        ids.extend(_opaque(item.get("id"), "message id") for item in result.get("messages", []))
+        ids.extend(
+            _opaque(item.get("id"), "message id") for item in result.get("messages", [])
+        )
         if len(ids) > MAX_LIST_MESSAGES:
-            raise SentStyleError("range is too large to count safely; use chronological sub-ranges")
+            raise SentStyleError(
+                "range is too large to count safely; use chronological sub-ranges"
+            )
         page_token = result.get("nextPageToken")
         if not page_token:
             if len(set(ids)) != len(ids):
@@ -390,12 +469,14 @@ def _recipient_domains(headers: Mapping[str, str]) -> set[str]:
     ])
     return {
         address.rsplit("@", 1)[1].lower()
-        for _name, address in addresses if "@" in address
+        for _name, address in addresses
+        if "@" in address
     }
 
 
-def _metadata_exclusion(headers: Mapping[str, str], own_domain: str,
-                        exclude_internal: bool) -> str:
+def _metadata_exclusion(
+    headers: Mapping[str, str], own_domain: str, exclude_internal: bool
+) -> str:
     domains = _recipient_domains(headers)
     if not domains:
         return "recipient_scope_unknown"
@@ -403,17 +484,34 @@ def _metadata_exclusion(headers: Mapping[str, str], own_domain: str,
         return "internal_only"
     auto = headers.get("auto-submitted", "").lower()
     precedence = headers.get("precedence", "").lower()
-    if ((auto and auto != "no") or precedence in {"bulk", "junk", "list"}
-            or headers.get("list-unsubscribe")):
+    if (
+        (auto and auto != "no")
+        or precedence in {"bulk", "junk", "list"}
+        or headers.get("list-unsubscribe")
+    ):
         return "automated"
     return ""
 
 
 def _message_metadata(service, message_id: str) -> dict:
-    message = _execute(service.users().messages().get(
-        userId="me", id=message_id, format="metadata",
-        metadataHeaders=["To", "Cc", "Bcc", "Auto-Submitted", "Precedence", "List-Unsubscribe"],
-    ))
+    message = _execute(
+        service
+        .users()
+        .messages()
+        .get(
+            userId="me",
+            id=message_id,
+            format="metadata",
+            metadataHeaders=[
+                "To",
+                "Cc",
+                "Bcc",
+                "Auto-Submitted",
+                "Precedence",
+                "List-Unsubscribe",
+            ],
+        )
+    )
     response_id = _opaque(message.get("id"), "message id")
     if response_id != message_id:
         raise SentStyleError("Gmail metadata response id changed")
@@ -432,59 +530,100 @@ def cmd_plan(args) -> None:
     own_domain = account.rsplit("@", 1)[1]
     ids = _list_ids(service, query)
     if len(ids) > MAX_MESSAGES:
-        print(json.dumps({
-            "status": "range_too_large", "verified_connected_account": account,
-            **boundaries, "gmail_label": LABEL, "gmail_query": query,
-            "total_sent_message_count": len(ids), "maximum_message_cap": MAX_MESSAGES,
-            "required_action": "choose explicit chronological sub-ranges",
-        }))
+        print(
+            json.dumps({
+                "status": "range_too_large",
+                "verified_connected_account": account,
+                **boundaries,
+                "gmail_label": LABEL,
+                "gmail_query": query,
+                "total_sent_message_count": len(ids),
+                "maximum_message_cap": MAX_MESSAGES,
+                "required_action": "choose explicit chronological sub-ranges",
+            })
+        )
         return
     metadata = [_message_metadata(service, message_id) for message_id in ids]
-    if any(not boundaries["start_epoch"] * 1_000 <= item["internal_date"]
-           < boundaries["end_epoch_exclusive"] * 1_000 for item in metadata):
-        raise SentStyleError("Gmail returned a message outside the requested date range")
+    if any(
+        not boundaries["start_epoch"] * 1_000
+        <= item["internal_date"]
+        < boundaries["end_epoch_exclusive"] * 1_000
+        for item in metadata
+    ):
+        raise SentStyleError(
+            "Gmail returned a message outside the requested date range"
+        )
     metadata.sort(key=lambda item: (item["internal_date"], item["id"]))
     exclusions = Counter(
-        reason for item in metadata
-        if (reason := _metadata_exclusion(item["headers"], own_domain, not args.include_internal))
+        reason
+        for item in metadata
+        if (
+            reason := _metadata_exclusion(
+                item["headers"], own_domain, not args.include_internal
+            )
+        )
     )
     ordered_ids = [item["id"] for item in metadata]
     plan = {
-        **boundaries, "query": query, "label": LABEL, "message_cap": MAX_MESSAGES,
-        "batch_size": BATCH_SIZE, "exclude_internal": not args.include_internal,
+        **boundaries,
+        "query": query,
+        "label": LABEL,
+        "message_cap": MAX_MESSAGES,
+        "batch_size": BATCH_SIZE,
+        "exclude_internal": not args.include_internal,
         "exclusion_policy": list(EXCLUSION_REASONS),
         "processing_version": PROCESSING_VERSION,
         "account_fingerprint": account_fingerprint,
         "total_found": len(ordered_ids),
         "eligible_estimate": len(ordered_ids) - sum(exclusions.values()),
         "batch_count": (len(ordered_ids) + BATCH_SIZE - 1) // BATCH_SIZE,
-        "message_ids": ordered_ids, "message_snapshot": _sha(ordered_ids),
+        "message_ids": ordered_ids,
+        "message_snapshot": _sha(ordered_ids),
     }
     plan_fingerprint = _sha(plan)
-    token, job_id, now = secrets.token_urlsafe(24), secrets.token_urlsafe(18), time.time()
+    token, job_id, now = (
+        secrets.token_urlsafe(24),
+        secrets.token_urlsafe(18),
+        time.time(),
+    )
     state = {
-        "job_id": job_id, "status": "planned", "plan": plan,
-        "plan_fingerprint": plan_fingerprint, "approval_token_sha256": _sha(token),
+        "job_id": job_id,
+        "status": "planned",
+        "plan": plan,
+        "plan_fingerprint": plan_fingerprint,
+        "approval_token_sha256": _sha(token),
         "approval_expires_at": now + APPROVAL_TTL_SECONDS,
         "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "expires_at": now + STATE_TTL_SECONDS, "processed_ids": [],
-        "batch_number": 0, "included_count": 0, "excluded_counts": {},
-        "category_counts": {}, "patterns": {}, "seen_exact": [], "seen_simhash": [],
+        "expires_at": now + STATE_TTL_SECONDS,
+        "processed_ids": [],
+        "batch_number": 0,
+        "included_count": 0,
+        "excluded_counts": {},
+        "category_counts": {},
+        "patterns": {},
+        "contributions": [],
     }
     _write_state(state)
-    print(json.dumps({
-        "status": "approval_required", "job_id": job_id,
-        "approval_token": token, "plan_fingerprint": plan_fingerprint,
-        "approval_expires_in_seconds": APPROVAL_TTL_SECONDS,
-        "verified_connected_account": account,
-        **boundaries, "gmail_label": LABEL, "gmail_query": query,
-        "total_sent_message_count": len(ordered_ids),
-        "estimated_eligible_count": plan["eligible_estimate"],
-        "maximum_message_cap": MAX_MESSAGES, "batch_size": BATCH_SIZE,
-        "batch_count": plan["batch_count"],
-        "exclusions": plan["exclusion_policy"],
-        "internal_only_excluded": plan["exclude_internal"],
-    }))
+    print(
+        json.dumps({
+            "status": "approval_required",
+            "job_id": job_id,
+            "approval_token": token,
+            "plan_fingerprint": plan_fingerprint,
+            "approval_expires_in_seconds": APPROVAL_TTL_SECONDS,
+            "verified_connected_account": account,
+            **boundaries,
+            "gmail_label": LABEL,
+            "gmail_query": query,
+            "total_sent_message_count": len(ordered_ids),
+            "estimated_eligible_count": plan["eligible_estimate"],
+            "maximum_message_cap": MAX_MESSAGES,
+            "batch_size": BATCH_SIZE,
+            "batch_count": plan["batch_count"],
+            "exclusions": plan["exclusion_policy"],
+            "internal_only_excluded": plan["exclude_internal"],
+        })
+    )
 
 
 class _TextExtractor(HTMLParser):
@@ -538,12 +677,20 @@ def extract_message_body(message: Mapping) -> str:
         parts += 1
         if depth > MAX_MIME_DEPTH or parts > MAX_MIME_PARTS:
             raise SentStyleError("unsafe MIME nesting")
-        disposition = next((
-            str(item.get("value") or "").lower()
-            for item in part.get("headers", []) if str(item.get("name") or "").lower() == "content-disposition"
-        ), "")
+        disposition = next(
+            (
+                str(item.get("value") or "").lower()
+                for item in part.get("headers", [])
+                if str(item.get("name") or "").lower() == "content-disposition"
+            ),
+            "",
+        )
         mime_type = str(part.get("mimeType") or "").lower()
-        if not part.get("filename") and "attachment" not in disposition and mime_type in {"text/plain", "text/html", ""}:
+        if (
+            not part.get("filename")
+            and "attachment" not in disposition
+            and mime_type in {"text/plain", "text/html", ""}
+        ):
             encoded = str(part.get("body", {}).get("data") or "")
             if encoded:
                 if len(encoded) > (MAX_DECODED_BYTES * 4 // 3) + 4:
@@ -556,7 +703,10 @@ def extract_message_body(message: Mapping) -> str:
                 total += len(decoded)
                 if total > MAX_DECODED_BYTES:
                     raise SentStyleError("Gmail message body is too large")
-                candidates.append((mime_type, decoded.decode("utf-8", errors="replace")))
+                candidates.append((
+                    mime_type,
+                    decoded.decode("utf-8", errors="replace"),
+                ))
         for child in part.get("parts", []) or []:
             if not isinstance(child, Mapping):
                 raise SentStyleError("invalid Gmail MIME part")
@@ -566,30 +716,39 @@ def extract_message_body(message: Mapping) -> str:
     if not isinstance(payload, Mapping):
         raise SentStyleError("invalid Gmail MIME payload")
     walk(payload, 0)
-    plain = "\n".join(value for mime, value in candidates if mime in {"text/plain", ""}).strip()
+    plain = "\n".join(
+        value for mime, value in candidates if mime in {"text/plain", ""}
+    ).strip()
     if plain:
         return plain
-    return "\n".join(_html_text(value) for mime, value in candidates if mime == "text/html").strip()
+    return "\n".join(
+        _html_text(value) for mime, value in candidates if mime == "text/html"
+    ).strip()
 
 
 def isolate_authored_text(value: str) -> str:
     text = value.replace("\r\n", "\n").replace("\r", "\n")
     cutoffs = [
-        match.start() for pattern in (_QUOTE_CUTOFF_RE, _SIGNATURE_CUTOFF_RE)
+        match.start()
+        for pattern in (_QUOTE_CUTOFF_RE, _SIGNATURE_CUTOFF_RE)
         if (match := pattern.search(text))
     ]
     if cutoffs:
-        text = text[:min(cutoffs)]
+        text = text[: min(cutoffs)]
     lines = [
-        line.strip() for line in text.splitlines()
-        if not line.lstrip().startswith(">") and not line.strip().startswith(("cid:", "data:image/"))
+        line.strip()
+        for line in text.splitlines()
+        if not line.lstrip().startswith(">")
+        and not line.strip().startswith(("cid:", "data:image/"))
     ]
     return re.sub(r"\n{3,}", "\n\n", "\n".join(lines).strip())[:MAX_ANALYSIS_CHARS]
 
 
 def sanitize_text(value: str, private_names: Iterable[str] = ()) -> str:
     text = value
-    names: list[str] = list({item.strip() for item in private_names if len(item.strip()) >= 3})
+    names: list[str] = list({
+        item.strip() for item in private_names if len(item.strip()) >= 3
+    })
     for name in sorted(names, key=len, reverse=True):
         text = re.sub(re.escape(str(name)), "[NAME]", text, flags=re.I)
     text = _EMAIL_RE.sub("[EMAIL]", text)
@@ -602,7 +761,9 @@ def sanitize_text(value: str, private_names: Iterable[str] = ()) -> str:
 
 def _simhash(text: str) -> int:
     words = re.findall(r"[a-z]+", text.lower())
-    features = [" ".join(words[index:index + 3]) for index in range(max(1, len(words) - 2))]
+    features = [
+        " ".join(words[index : index + 3]) for index in range(max(1, len(words) - 2))
+    ]
     vector = [0] * 64
     for feature in features:
         value = int(hashlib.sha256(feature.encode()).hexdigest()[:16], 16)
@@ -617,7 +778,10 @@ def _category(subject: str, body: str) -> str:
         ("proposal_quote", ("quote", "proposal", "scope of work")),
         ("pricing", ("price", "pricing", "cost", "rate")),
         ("installation", ("install", "installation", "technician")),
-        ("information_request", ("could you provide", "please send", "need the following")),
+        (
+            "information_request",
+            ("could you provide", "please send", "need the following"),
+        ),
         ("objection_handling", ("concern", "however", "understand your", "objection")),
         ("scheduling", ("meeting", "calendar", "available", "schedule")),
         ("follow_up", ("follow up", "following up", "checking in", "touching base")),
@@ -627,7 +791,10 @@ def _category(subject: str, body: str) -> str:
         ("closing_next_step", ("next step", "ready to", "confirm by")),
         ("initial_outreach", ("introduction", "reaching out", "noticed that")),
     )
-    return next((category for category, terms in table if any(term in text for term in terms)), "other")
+    return next(
+        (category for category, terms in table if any(term in text for term in terms)),
+        "other",
+    )
 
 
 def deterministic_features(body: str, category: str) -> dict:
@@ -636,8 +803,12 @@ def deterministic_features(body: str, category: str) -> dict:
     paragraphs = [item for item in re.split(r"\n\s*\n", body) if item.strip()]
     lines = [line.strip() for line in body.splitlines() if line.strip()]
     first, tail = (lines[0].lower() if lines else ""), " ".join(lines[-3:]).lower()
-    greeting = bool(re.match(r"^(?:hi|hello|hey|good (?:morning|afternoon|evening))\b", first))
-    closing = bool(re.search(r"\b(?:thanks|thank you|kind regards|regards|cheers)\b", tail))
+    greeting = bool(
+        re.match(r"^(?:hi|hello|hey|good (?:morning|afternoon|evening))\b", first)
+    )
+    closing = bool(
+        re.search(r"\b(?:thanks|thank you|kind regards|regards|cheers)\b", tail)
+    )
     bullets = sum(bool(re.match(r"^(?:[-*•]|\d+[.)])\s+", line)) for line in lines)
     questions = body.count("?")
     cta_re = re.compile(
@@ -646,11 +817,20 @@ def deterministic_features(body: str, category: str) -> dict:
     )
     ctas = [sentence for sentence in sentences if cta_re.search(sentence)]
     lower = body.lower()
-    pricing = any(term in lower for term in ("price", "pricing", "cost", "rate", "quote"))
+    pricing = any(
+        term in lower for term in ("price", "pricing", "cost", "rate", "quote")
+    )
     payment = any(term in lower for term in ("payment", "deposit", "invoice", "terms"))
-    installation = any(term in lower for term in ("install", "installation", "technician"))
-    objection = any(term in lower for term in ("understand your concern", "appreciate your concern", "however"))
-    contractions = bool(re.search(r"(?i)\b(?:we're|i'm|you'll|can't|don't|it's|that's)\b", body))
+    installation = any(
+        term in lower for term in ("install", "installation", "technician")
+    )
+    objection = any(
+        term in lower
+        for term in ("understand your concern", "appreciate your concern", "however")
+    )
+    contractions = bool(
+        re.search(r"(?i)\b(?:we're|i'm|you'll|can't|don't|it's|that's)\b", body)
+    )
     average_paragraph = len(words) / max(len(paragraphs), 1)
     codes = {
         "concise_email" if len(words) <= 150 else "detailed_when_needed",
@@ -671,30 +851,43 @@ def deterministic_features(body: str, category: str) -> dict:
         codes.add("explain_pricing_basis")
     if payment and len(paragraphs) >= 2:
         codes.add("separate_payment_terms")
-    if installation and any(term in lower for term in ("first", "then", "next", "after")):
+    if installation and any(
+        term in lower for term in ("first", "then", "next", "after")
+    ):
         codes.add("explain_installation_sequence")
     if category == "objection_handling" and objection:
         codes.add("acknowledge_objection")
     if len(ctas) == 1:
         codes.add("single_clear_call_to_action")
     return {
-        "word_count": len(words), "paragraph_count": len(paragraphs),
-        "sentence_count": len(sentences), "question_count": questions,
-        "bullet_count": bullets, "codes": sorted(codes),
+        "word_count": len(words),
+        "paragraph_count": len(paragraphs),
+        "sentence_count": len(sentences),
+        "question_count": questions,
+        "bullet_count": bullets,
+        "codes": sorted(codes),
     }
 
 
 def _full_message(service, message_id: str) -> Mapping:
-    message = _execute(service.users().messages().get(
-        userId="me", id=message_id, format="full",
-    ))
+    message = _execute(
+        service
+        .users()
+        .messages()
+        .get(
+            userId="me",
+            id=message_id,
+            format="full",
+        )
+    )
     if _opaque(message.get("id"), "message id") != message_id:
         raise SentStyleError("Gmail full response id changed")
     return message
 
 
-def _process_message(state: dict, service, message_id: str, own_domain: str,
-                     metadata_exclusion: str = "") -> None:
+def _process_message(
+    state: dict, service, message_id: str, own_domain: str, metadata_exclusion: str = ""
+) -> None:
     excluded = Counter(state.get("excluded_counts") or {})
     if metadata_exclusion:
         excluded[metadata_exclusion] += 1
@@ -707,7 +900,9 @@ def _process_message(state: dict, service, message_id: str, own_domain: str,
     headers = _headers(message)
     if not reason:
         reason = _metadata_exclusion(
-            headers, own_domain, bool(state["plan"]["exclude_internal"]),
+            headers,
+            own_domain,
+            bool(state["plan"]["exclude_internal"]),
         )
     subject = str(headers.get("subject") or "")
     try:
@@ -717,45 +912,212 @@ def _process_message(state: dict, service, message_id: str, own_domain: str,
         body = ""
     if not reason and not body:
         reason = "missing_body"
-    if not reason and (_AUTOMATED_RE.search(subject) or _AUTOMATED_RE.search(body[:2_000])):
+    if not reason and (
+        _AUTOMATED_RE.search(subject) or _AUTOMATED_RE.search(body[:2_000])
+    ):
         reason = "machine_generated"
     authored = isolate_authored_text(body) if not reason else ""
     if not reason and _EMPTY_ACK_RE.fullmatch(authored.strip()):
         reason = "empty_acknowledgement"
-    private_names = [name for name, _address in getaddresses([
-        headers.get("from", ""), headers.get("to", ""), headers.get("cc", ""),
-    ])]
+    private_names = [
+        name
+        for name, _address in getaddresses([
+            headers.get("from", ""),
+            headers.get("to", ""),
+            headers.get("cc", ""),
+        ])
+    ]
     sanitized = sanitize_text(authored, private_names)
-    if not reason and (len(sanitized) < 40 or len(re.findall(r"\b\w+\b", sanitized)) < 8):
+    if not reason and (
+        len(sanitized) < 40 or len(re.findall(r"\b\w+\b", sanitized)) < 8
+    ):
         reason = "too_little_authored_text"
-    normalized = re.sub(r"\W+", " ", sanitized.lower()).strip()
-    exact, simhash = _sha(normalized), _simhash(normalized)
-    if not reason and exact in state["seen_exact"]:
-        reason = "duplicate"
-    if not reason and any((simhash ^ int(value, 16)).bit_count() <= 3
-                          for value in state["seen_simhash"]):
-        reason = "near_duplicate_template"
     if reason:
         excluded[reason] += 1
         state["excluded_counts"] = dict(excluded)
         return
-    state["seen_exact"].append(exact)
-    state["seen_simhash"].append(f"{simhash:016x}")
+    normalized = re.sub(r"\W+", " ", sanitized.lower()).strip()
+    exact, simhash = _sha(normalized), _simhash(normalized)
+    try:
+        internal_timestamp = int(message.get("internalDate") or 0)
+    except (TypeError, ValueError) as exc:
+        raise SentStyleError("Gmail full response timestamp changed") from exc
+    if not (
+        state["plan"]["start_epoch"] * 1_000
+        <= internal_timestamp
+        < state["plan"]["end_epoch_exclusive"] * 1_000
+    ):
+        raise SentStyleError("Gmail full response timestamp changed")
     category = _category(subject, sanitized)
     features = deterministic_features(sanitized, category)
-    state["included_count"] += 1
-    category_counts = Counter(state.get("category_counts") or {})
-    category_counts[category] += 1
-    state["category_counts"] = dict(category_counts)
     source_ref = f"sha256:{_sha(message_id)}"
-    for code in features["codes"]:
-        pattern_id = f"{code}@{category}"
-        pattern = state["patterns"].setdefault(pattern_id, {
-            "code": code, "message_category": category, "count": 0, "source_refs": [],
-        })
-        pattern["count"] += 1
-        if len(pattern["source_refs"]) < MAX_SOURCE_REFS:
-            pattern["source_refs"].append(source_ref)
+    contributions = state.setdefault("contributions", [])
+    if any(item.get("source_ref") == source_ref for item in contributions):
+        raise SentStyleError("duplicate contribution source reference")
+    contributions.append({
+        "source_ref": source_ref,
+        "normalized_content_sha256": exact,
+        "simhash": f"{simhash:016x}",
+        "internal_timestamp_ms": internal_timestamp,
+        "message_category": category,
+        "style_pattern_codes": features["codes"],
+        "origin_job_ref": f"sha256:{_sha(state['job_id'])}",
+        "origin_range_ref": f"sha256:{state['plan_fingerprint']}",
+        "extraction_version": PROCESSING_VERSION,
+    })
+
+
+def _validated_contributions(state: Mapping) -> list[dict]:
+    records = state.get("contributions")
+    if not isinstance(records, list):
+        raise SentStyleError(REANALYZE_REQUIRED)
+    expected_job = f"sha256:{_sha(state['job_id'])}"
+    expected_range = f"sha256:{state['plan_fingerprint']}"
+    start = int(state["plan"]["start_epoch"]) * 1_000
+    end = int(state["plan"]["end_epoch_exclusive"]) * 1_000
+    seen_sources: set[str] = set()
+    for record in records:
+        if not isinstance(record, Mapping) or set(record) != _CONTRIBUTION_FIELDS:
+            raise SentStyleError("contribution state is invalid")
+        source_ref = record.get("source_ref")
+        timestamp = record.get("internal_timestamp_ms")
+        codes = record.get("style_pattern_codes")
+        if (
+            not isinstance(source_ref, str)
+            or not _SOURCE_REF_RE.fullmatch(source_ref)
+            or source_ref in seen_sources
+            or not isinstance(record.get("normalized_content_sha256"), str)
+            or not _HASH_RE.fullmatch(record["normalized_content_sha256"])
+            or not isinstance(record.get("simhash"), str)
+            or not _SIMHASH_RE.fullmatch(record["simhash"])
+            or isinstance(timestamp, bool)
+            or not isinstance(timestamp, int)
+            or not start <= timestamp < end
+            or record.get("message_category") not in CATEGORIES
+            or not isinstance(codes, list)
+            or codes != sorted(set(codes))
+            or not codes
+            or any(code not in PATTERNS for code in codes)
+            or record.get("origin_job_ref") != expected_job
+            or record.get("origin_range_ref") != expected_range
+            or record.get("extraction_version")
+            != state["plan"].get("processing_version")
+        ):
+            raise SentStyleError("contribution state is invalid")
+        seen_sources.add(source_ref)
+    return cast(list[dict], records)
+
+
+def _aggregate_contributions(
+    records: Iterable[Mapping], exclusions: Mapping[str, int]
+) -> dict:
+    excluded = Counter({
+        key: value
+        for key, value in exclusions.items()
+        if key not in {"duplicate", "near_duplicate_template"}
+    })
+    ordered = sorted(
+        records,
+        key=lambda item: (
+            int(item["internal_timestamp_ms"]),
+            str(item["source_ref"]),
+            str(item["origin_job_ref"]),
+        ),
+    )
+    exact_seen: set[str] = set()
+    exact_kept = []
+    for record in ordered:
+        exact = str(record["normalized_content_sha256"])
+        if exact in exact_seen:
+            excluded["duplicate"] += 1
+        else:
+            exact_seen.add(exact)
+            exact_kept.append(record)
+
+    retained = []
+    retained_simhashes: list[int] = []
+    for record in exact_kept:
+        simhash = int(str(record["simhash"]), 16)
+        # ponytail: O(n²) is bounded by approved job caps; use simhash bands if caps grow.
+        if any((simhash ^ prior).bit_count() <= 3 for prior in retained_simhashes):
+            excluded["near_duplicate_template"] += 1
+        else:
+            retained.append(record)
+            retained_simhashes.append(simhash)
+
+    categories = Counter(str(record["message_category"]) for record in retained)
+    patterns: dict[str, dict] = {}
+    for record in retained:
+        category = str(record["message_category"])
+        for code in record["style_pattern_codes"]:
+            pattern_id = f"{code}@{category}"
+            pattern = patterns.setdefault(
+                pattern_id,
+                {
+                    "code": code,
+                    "message_category": category,
+                    "count": 0,
+                    "source_refs": [],
+                },
+            )
+            pattern["count"] += 1
+            if len(pattern["source_refs"]) < MAX_SOURCE_REFS:
+                pattern["source_refs"].append(record["source_ref"])
+    return {
+        "included_count": len(retained),
+        "excluded_counts": dict(sorted(excluded.items())),
+        "category_counts": dict(sorted(categories.items())),
+        "patterns": patterns,
+    }
+
+
+def _apply_contribution_aggregates(state: dict) -> None:
+    summary = _aggregate_contributions(
+        state.get("contributions") or [],
+        state.get("excluded_counts") or {},
+    )
+    state.update(summary)
+
+
+def _validate_completed_job(state: Mapping) -> list[dict]:
+    if state.get("status") not in {"complete", "previewed"}:
+        raise SentStyleError("only completed unrecorded jobs can be consolidated")
+    if "contributions" not in state:
+        raise SentStyleError(REANALYZE_REQUIRED)
+    plan = state["plan"]
+    if plan.get("processing_version") != PROCESSING_VERSION:
+        raise SentStyleError("processing version mismatch")
+    _verify_plan_contract(plan)
+    records = _validated_contributions(state)
+    exclusions = state.get("excluded_counts")
+    if not isinstance(exclusions, Mapping) or any(
+        key not in EXCLUSION_REASONS
+        or isinstance(value, bool)
+        or not isinstance(value, int)
+        or value < 0
+        for key, value in exclusions.items()
+    ):
+        raise SentStyleError("completed job counts are invalid")
+    base_excluded = sum(
+        value
+        for key, value in exclusions.items()
+        if key not in {"duplicate", "near_duplicate_template"}
+    )
+    processed = state.get("processed_ids")
+    if (
+        not isinstance(processed, list)
+        or len(processed) != len(set(processed))
+        or len(processed) != plan["total_found"]
+        or len(records) + base_excluded != plan["total_found"]
+    ):
+        raise SentStyleError("completed job counts are invalid")
+    summary = _aggregate_contributions(records, exclusions)
+    if any(
+        state.get(key) != summary[key]
+        for key in ("included_count", "excluded_counts", "category_counts", "patterns")
+    ):
+        raise SentStyleError("completed job aggregates are invalid")
+    return records
 
 
 def _verify_plan_snapshot(service, state: Mapping) -> tuple[str, str, dict[str, str]]:
@@ -765,19 +1127,31 @@ def _verify_plan_snapshot(service, state: Mapping) -> tuple[str, str, dict[str, 
         raise PlanDriftError("connected_account_changed")
     ids = _list_ids(service, state["plan"]["query"])
     metadata = [_message_metadata(service, message_id) for message_id in ids]
-    if any(not state["plan"]["start_epoch"] * 1_000 <= item["internal_date"]
-           < state["plan"]["end_epoch_exclusive"] * 1_000 for item in metadata):
+    if any(
+        not state["plan"]["start_epoch"] * 1_000
+        <= item["internal_date"]
+        < state["plan"]["end_epoch_exclusive"] * 1_000
+        for item in metadata
+    ):
         raise PlanDriftError("date_boundary_changed")
     metadata.sort(key=lambda item: (item["internal_date"], item["id"]))
     ordered = [item["id"] for item in metadata]
-    if ordered != state["plan"]["message_ids"] or _sha(ordered) != state["plan"]["message_snapshot"]:
+    if (
+        ordered != state["plan"]["message_ids"]
+        or _sha(ordered) != state["plan"]["message_snapshot"]
+    ):
         raise PlanDriftError("message_snapshot_changed")
     own_domain = account.rsplit("@", 1)[1]
     exclusions = {
-        item["id"]: reason for item in metadata
-        if (reason := _metadata_exclusion(
-            item["headers"], own_domain, bool(state["plan"]["exclude_internal"]),
-        ))
+        item["id"]: reason
+        for item in metadata
+        if (
+            reason := _metadata_exclusion(
+                item["headers"],
+                own_domain,
+                bool(state["plan"]["exclude_internal"]),
+            )
+        )
     }
     return account, own_domain, exclusions
 
@@ -790,9 +1164,11 @@ def cmd_approve(args) -> None:
         _verify_plan_contract(state["plan"])
         if args.plan_fingerprint != state["plan_fingerprint"]:
             raise SentStyleError("exact plan fingerprint is required")
-        if (not args.approval_token
-                or _sha(args.approval_token) != state.get("approval_token_sha256")
-                or time.time() > float(state.get("approval_expires_at", 0))):
+        if (
+            not args.approval_token
+            or _sha(args.approval_token) != state.get("approval_token_sha256")
+            or time.time() > float(state.get("approval_expires_at", 0))
+        ):
             raise SentStyleError("exact unexpired plan approval token is required")
         state.pop("approval_token_sha256", None)
         state.pop("approval_expires_at", None)
@@ -800,11 +1176,14 @@ def cmd_approve(args) -> None:
         state["approved_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
         state["status"] = "approved"
         _write_state(state)
-        print(json.dumps({
-            "status": "approved", "job_id": state["job_id"],
-            "plan_fingerprint": state["plan_fingerprint"],
-            "approved_at": state["approved_at"],
-        }))
+        print(
+            json.dumps({
+                "status": "approved",
+                "job_id": state["job_id"],
+                "plan_fingerprint": state["plan_fingerprint"],
+                "approved_at": state["approved_at"],
+            })
+        )
 
 
 def cmd_run(args) -> None:
@@ -814,7 +1193,9 @@ def cmd_run(args) -> None:
             raise SentStyleError("job is not runnable")
         service = google_api.build_service("gmail", "v1")
         try:
-            _account, own_domain, metadata_exclusions = _verify_plan_snapshot(service, state)
+            _account, own_domain, metadata_exclusions = _verify_plan_snapshot(
+                service, state
+            )
         except PlanDriftError as exc:
             state["status"] = "reapproval_required"
             state["drift"] = {
@@ -825,28 +1206,39 @@ def cmd_run(args) -> None:
             raise
         if state["status"] == "approved":
             state["status"] = "running"
-            state["verified_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            state["verified_at"] = datetime.now(timezone.utc).isoformat(
+                timespec="seconds"
+            )
             _write_state(state)
         processed = set(state["processed_ids"])
-        remaining = [item for item in state["plan"]["message_ids"] if item not in processed]
+        remaining = [
+            item for item in state["plan"]["message_ids"] if item not in processed
+        ]
         for offset in range(0, len(remaining), BATCH_SIZE):
-            batch = remaining[offset:offset + BATCH_SIZE]
+            batch = remaining[offset : offset + BATCH_SIZE]
             for message_id in batch:
                 _process_message(
-                    state, service, message_id, own_domain,
+                    state,
+                    service,
+                    message_id,
+                    own_domain,
                     metadata_exclusions.get(message_id, ""),
                 )
                 state["processed_ids"].append(message_id)
             state["batch_number"] += 1
             _write_state(state)
-            print(json.dumps({
-                "status": "running", "job_id": state["job_id"],
-                "batch_number": state["batch_number"],
-                "processed": len(state["processed_ids"]),
-                "total": state["plan"]["total_found"],
-                "included": state["included_count"],
-                "excluded": sum(state["excluded_counts"].values()),
-            }))
+            print(
+                json.dumps({
+                    "status": "running",
+                    "job_id": state["job_id"],
+                    "batch_number": state["batch_number"],
+                    "processed": len(state["processed_ids"]),
+                    "total": state["plan"]["total_found"],
+                    "included": state["included_count"],
+                    "excluded": sum(state["excluded_counts"].values()),
+                })
+            )
+        _apply_contribution_aggregates(state)
         state["status"] = "complete"
         state["completed_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
         _write_state(state)
@@ -861,7 +1253,10 @@ def _load_pattern_selection(path: str, available: set[str]) -> dict[str, str]:
     if not path:
         return {pattern_id: "candidate" for pattern_id in sorted(available)}
     value = email_learning._read_private_json(
-        Path(path), 32_000, "pattern selection", require_private=False,
+        Path(path),
+        32_000,
+        "pattern selection",
+        require_private=False,
     )
     if not isinstance(value, dict) or set(value) != {"patterns"}:
         raise SentStyleError("pattern selection is invalid")
@@ -876,9 +1271,13 @@ def _load_pattern_selection(path: str, available: set[str]) -> dict[str, str]:
             raise SentStyleError("pattern selection is invalid")
         record = cast(dict[str, object], item)
         pattern_id, status = record.get("pattern_id"), record.get("status")
-        if (set(record) != {"pattern_id", "status"} or not isinstance(pattern_id, str)
-                or pattern_id not in available or not isinstance(status, str)
-                or status not in {"candidate", "tentative"}):
+        if (
+            set(record) != {"pattern_id", "status"}
+            or not isinstance(pattern_id, str)
+            or pattern_id not in available
+            or not isinstance(status, str)
+            or status not in {"candidate", "tentative"}
+        ):
             raise SentStyleError("pattern selection is invalid")
         selected[pattern_id] = status
     if not selected:
@@ -895,26 +1294,37 @@ def _preview_packet(state: Mapping, selection: Mapping[str, str]) -> dict:
         _rule_key, category, description = PATTERNS[code]
         conflict = CONFLICTS.get(code, "")
         patterns.append({
-            "pattern_id": pattern_id, "code": code, "description": description,
-            "email_category": evidence["message_category"], "style_category": category,
-            "evidence_count": evidence["count"], "eligible_message_denominator": included,
+            "pattern_id": pattern_id,
+            "code": code,
+            "description": description,
+            "email_category": evidence["message_category"],
+            "style_category": category,
+            "evidence_count": evidence["count"],
+            "eligible_message_denominator": included,
             "confidence": _confidence(evidence["count"]),
             "date_range": {
                 "start_local": state["plan"]["start_local"],
                 "end_local_exclusive": state["plan"]["end_local_exclusive"],
             },
             "supporting_source_refs": evidence["source_refs"],
-            "conflicts": ([conflict] if f"{conflict}@{evidence['message_category']}" in selection
-                          else []),
-            "extraction_version": PROCESSING_VERSION, "review_status": review_status,
+            "conflicts": (
+                [conflict]
+                if f"{conflict}@{evidence['message_category']}" in selection
+                else []
+            ),
+            "extraction_version": PROCESSING_VERSION,
+            "review_status": review_status,
         })
     return {
-        "asset_title": "Cal's Linxio Email Writing Profile",
+        "asset_title": state.get("asset_title", "Cal's Linxio Email Writing Profile"),
         "overall_voice_and_tone": [
             item for item in patterns if item["style_category"] == "tone"
         ],
-        "patterns": patterns, "message_category_counts": state["category_counts"],
-        "omitted_tentative_pattern_count": max(0, len(state["patterns"]) - len(selection)),
+        "patterns": patterns,
+        "message_category_counts": state["category_counts"],
+        "omitted_tentative_pattern_count": max(
+            0, len(state["patterns"]) - len(selection)
+        ),
         "confidence_and_evidence_summary": Counter(
             item["confidence"] for item in patterns
         ),
@@ -924,13 +1334,176 @@ def _preview_packet(state: Mapping, selection: Mapping[str, str]) -> dict:
             "timezone": TIMEZONE,
         },
         "counts": {
-            "found": state["plan"]["total_found"], "included": included,
+            "found": state["plan"]["total_found"],
+            "included": included,
             "excluded": sum(state["excluded_counts"].values()),
             "exclusion_reasons": state["excluded_counts"],
         },
-        "last_reviewed_date": None, "contains_raw_email": False,
-        "contains_customer_pii": False, "automatic_promotion": False,
+        "last_reviewed_date": None,
+        "contains_raw_email": False,
+        "contains_customer_pii": False,
+        "automatic_promotion": False,
     }
+
+
+def _consolidation_sources(job_ids: list[str]) -> tuple[list[dict], list[str]]:
+    if len(job_ids) < 2 or len(job_ids) != len(set(job_ids)):
+        raise SentStyleError("an explicit ordered set of distinct jobs is required")
+    states = [_load_state(job_id) for job_id in job_ids]
+    if any(state.get("status") not in {"complete", "previewed"} for state in states):
+        raise SentStyleError("only completed unrecorded jobs can be consolidated")
+    missing = [state["job_id"] for state in states if "contributions" not in state]
+    if missing:
+        return states, missing
+
+    first = states[0]["plan"]
+    for state in states:
+        plan = state["plan"]
+        if plan.get("account_fingerprint") != first.get("account_fingerprint"):
+            raise SentStyleError("completed job account mismatch")
+        if any(
+            plan.get(key) != first.get(key)
+            for key in (
+                "timezone",
+                "label",
+                "exclude_internal",
+                "exclusion_policy",
+                "processing_version",
+                "message_cap",
+                "batch_size",
+            )
+        ):
+            raise SentStyleError("completed job policy or version mismatch")
+        _validate_completed_job(state)
+    for previous, current in zip(states, states[1:]):
+        previous_end = int(previous["plan"]["end_epoch_exclusive"])
+        current_start = int(current["plan"]["start_epoch"])
+        if current_start < previous_end:
+            raise SentStyleError("completed job ranges overlap or are out of order")
+        if current_start > previous_end:
+            raise SentStyleError("completed job ranges contain a gap")
+    return states, []
+
+
+def cmd_consolidate_preview(args) -> None:
+    states, missing = _consolidation_sources(args.job_ids)
+    if missing:
+        print(
+            json.dumps({
+                "status": REANALYZE_REQUIRED,
+                "source_job_count": len(states),
+                "jobs_requiring_reanalysis": missing,
+            })
+        )
+        return
+
+    contributions = sorted(
+        (record for state in states for record in state["contributions"]),
+        key=lambda item: (
+            item["internal_timestamp_ms"],
+            item["source_ref"],
+            item["origin_job_ref"],
+        ),
+    )
+    base_exclusions = Counter()
+    for state in states:
+        base_exclusions.update({
+            key: value
+            for key, value in state["excluded_counts"].items()
+            if key not in {"duplicate", "near_duplicate_template"}
+        })
+    summary = _aggregate_contributions(contributions, base_exclusions)
+    total_found = sum(int(state["plan"]["total_found"]) for state in states)
+    if (
+        summary["included_count"] + sum(summary["excluded_counts"].values())
+        != total_found
+    ):
+        raise SentStyleError("consolidated counts are invalid")
+
+    first, last = states[0]["plan"], states[-1]["plan"]
+    source_jobs = [
+        {
+            "job_id": state["job_id"],
+            "plan_fingerprint": state["plan_fingerprint"],
+            "total_found": state["plan"]["total_found"],
+        }
+        for state in states
+    ]
+    plan = {
+        "kind": "sent_style_consolidation",
+        "timezone": TIMEZONE,
+        "start_date": first["start_date"],
+        "end_date_inclusive": last["end_date_inclusive"],
+        "start_local": first["start_local"],
+        "end_local_exclusive": last["end_local_exclusive"],
+        "start_epoch": first["start_epoch"],
+        "end_epoch_exclusive": last["end_epoch_exclusive"],
+        "account_fingerprint": first["account_fingerprint"],
+        "label": LABEL,
+        "exclude_internal": first["exclude_internal"],
+        "exclusion_policy": list(EXCLUSION_REASONS),
+        "processing_version": PROCESSING_VERSION,
+        "total_found": total_found,
+        "source_jobs": source_jobs,
+    }
+    plan_fingerprint = _sha(plan)
+    job_id = f"consolidated_{_sha(source_jobs)[:24]}"
+    now = time.time()
+    state: dict = {
+        "job_id": job_id,
+        "state_kind": "consolidation",
+        "status": "previewed",
+        "plan": plan,
+        "plan_fingerprint": plan_fingerprint,
+        "approved_plan_fingerprint": plan_fingerprint,
+        "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "completed_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "expires_at": now + STATE_TTL_SECONDS,
+        "processed_ids": [],
+        "batch_number": sum(int(state.get("batch_number", 0)) for state in states),
+        "contributions": contributions,
+        "asset_title": (
+            f"Cal’s Linxio Email Writing Profile — {first['start_date']} "
+            f"to {last['end_date_inclusive']}"
+        ),
+        **summary,
+    }
+    ranked = sorted(
+        state["patterns"],
+        key=lambda key: (-state["patterns"][key]["count"], key),
+    )[:MAX_PROFILE_PATTERNS]
+    selection = _load_pattern_selection(args.patterns_file, set(ranked))
+    packet = _preview_packet(state, selection)
+    state["preview_packet"] = packet
+    state["preview_fingerprint"] = _sha(packet)
+    with _job_lock(job_id):
+        path = _state_path(job_id)
+        if path.exists():
+            existing = _load_state(job_id)
+            if existing.get("status") == "recorded":
+                if existing.get("preview_fingerprint") != state["preview_fingerprint"]:
+                    raise SentStyleError("recorded consolidation cannot be changed")
+                print(
+                    json.dumps({
+                        "status": "already_recorded",
+                        "job_id": job_id,
+                        "preview_fingerprint": state["preview_fingerprint"],
+                        "candidate_ids": existing.get("candidate_ids") or [],
+                        "profile": packet,
+                    })
+                )
+                return
+        _write_state(state)
+    print(
+        json.dumps({
+            "status": "profile_preview",
+            "job_id": job_id,
+            "source_job_count": len(states),
+            "preview_fingerprint": state["preview_fingerprint"],
+            "record_requires_confirm": RECORD_CONFIRM,
+            "profile": packet,
+        })
+    )
 
 
 def cmd_preview(args) -> None:
@@ -938,8 +1511,13 @@ def cmd_preview(args) -> None:
         state = _load_state(args.job_id)
         if state["status"] not in {"complete", "previewed"}:
             raise SentStyleError("job must complete before preview")
+        if "contributions" not in state:
+            raise SentStyleError(REANALYZE_REQUIRED)
+        if state.get("state_kind") != "consolidation":
+            _validate_completed_job(state)
         ranked = sorted(
-            state["patterns"], key=lambda key: (-state["patterns"][key]["count"], key),
+            state["patterns"],
+            key=lambda key: (-state["patterns"][key]["count"], key),
         )[:MAX_PROFILE_PATTERNS]
         selection = _load_pattern_selection(args.patterns_file, set(ranked))
         packet = _preview_packet(state, selection)
@@ -948,11 +1526,15 @@ def cmd_preview(args) -> None:
         state["preview_packet"] = packet
         state["preview_fingerprint"] = fingerprint
         _write_state(state)
-        print(json.dumps({
-            "status": "profile_preview", "job_id": state["job_id"],
-            "preview_fingerprint": fingerprint,
-            "record_requires_confirm": RECORD_CONFIRM, "profile": packet,
-        }))
+        print(
+            json.dumps({
+                "status": "profile_preview",
+                "job_id": state["job_id"],
+                "preview_fingerprint": fingerprint,
+                "record_requires_confirm": RECORD_CONFIRM,
+                "profile": packet,
+            })
+        )
 
 
 def cmd_record(args) -> None:
@@ -962,21 +1544,44 @@ def cmd_record(args) -> None:
         state = _load_state(args.job_id)
         if state["status"] not in {"previewed", "recorded"}:
             raise SentStyleError("reviewed profile preview is required")
+        if "contributions" not in state:
+            raise SentStyleError(REANALYZE_REQUIRED)
         packet = state.get("preview_packet")
-        if (not isinstance(packet, dict) or args.preview_fingerprint != state.get("preview_fingerprint")
-                or _sha(packet) != state.get("preview_fingerprint")):
+        if (
+            not isinstance(packet, dict)
+            or args.preview_fingerprint != state.get("preview_fingerprint")
+            or _sha(packet) != state.get("preview_fingerprint")
+        ):
             raise SentStyleError("profile preview changed after approval")
-        lessons = [{
-            "code": item["code"], "evidence_kind": "aggregate_sent_style",
-            "evidence_count": item["evidence_count"],
-            "eligible_denominator": item["eligible_message_denominator"],
-            "confidence": item["confidence"], "status": item["review_status"],
-            "source_refs": item["supporting_source_refs"],
-            "message_category": item["email_category"],
-        } for item in packet["patterns"]]
+        if state["status"] == "recorded":
+            print(
+                json.dumps({
+                    "status": "already_recorded",
+                    "mutation_performed": False,
+                    "candidate_ids": state.get("candidate_ids") or [],
+                })
+            )
+            return
+        if state.get("state_kind") != "consolidation":
+            _validate_completed_job(state)
+
+        lessons = [
+            {
+                "code": item["code"],
+                "evidence_kind": "aggregate_sent_style",
+                "evidence_count": item["evidence_count"],
+                "eligible_denominator": item["eligible_message_denominator"],
+                "confidence": item["confidence"],
+                "status": item["review_status"],
+                "source_refs": item["supporting_source_refs"],
+                "message_category": item["email_category"],
+            }
+            for item in packet["patterns"]
+        ]
         context = {
             "source": {"kind": "sent_style_job", "id": state["job_id"]},
-            "bootstrap_id": state["job_id"], "captured_at": state["completed_at"],
+            "bootstrap_id": state["job_id"],
+            "captured_at": state["completed_at"],
             "analysis": {
                 "kind": "bulk_sent_style",
                 "account_fingerprint": state["plan"]["account_fingerprint"],
@@ -991,43 +1596,76 @@ def cmd_record(args) -> None:
                 "message_category_counts": state["category_counts"],
                 "extraction_version": PROCESSING_VERSION,
             },
-            "lessons": lessons, "outcomes": [],
+            "lessons": lessons,
+            "outcomes": [],
         }
+        if state.get("state_kind") == "consolidation":
+            context["analysis"]["source_job_message_counts"] = [
+                item["total_found"] for item in state["plan"]["source_jobs"]
+            ]
         context["packet_fingerprint"] = _sha(context)
         context["confirm"] = True
         token = os.environ.get(email_learning.BRIDGE_TOKEN_ENV, "").strip()
         url = os.environ.get(email_learning.BRIDGE_URL_ENV, "").strip()
         if not token or not url:
             raise SentStyleError("Cogitator bridge configuration is unavailable")
-        result = email_learning._bridge_call(url, token, {
-            "source_agent": "hermes",
-            "requested_action": "record_email_lesson_candidates",
-            "user_intent": "Record Cal-approved sanitized aggregate Sent-mail style candidates.",
-            "content": "", "context_hint": "", "approval_status": "approved",
-            "risk_level": "medium", "context": context,
-        })
-        candidate_ids = [_opaque(item, "candidate id") for item in result.get("candidate_ids", [])]
+        result = email_learning._bridge_call(
+            url,
+            token,
+            {
+                "source_agent": "hermes",
+                "requested_action": "record_email_lesson_candidates",
+                "user_intent": "Record Cal-approved sanitized aggregate Sent-mail style candidates.",
+                "content": "",
+                "context_hint": "",
+                "approval_status": "approved",
+                "risk_level": "medium",
+                "context": context,
+            },
+        )
+        candidate_ids = [
+            _opaque(item, "candidate id") for item in result.get("candidate_ids", [])
+        ]
         state["status"] = "recorded"
+        if not candidate_ids:
+            raise SentStyleError("Cogitator did not return a candidate")
         state["recorded_packet_fingerprint"] = context["packet_fingerprint"]
         state["candidate_ids"] = candidate_ids
         _write_state(state)
-        print(json.dumps({
-            "status": "recorded", "mutation_performed": bool(result.get("mutation_performed", True)),
-            "candidate_ids": candidate_ids,
-        }))
+        print(
+            json.dumps({
+                "status": "recorded",
+                "mutation_performed": bool(result.get("mutation_performed", True)),
+                "candidate_ids": candidate_ids,
+            })
+        )
 
 
 def _status(state: Mapping) -> dict:
+    complete = state.get("status") in {"complete", "previewed", "recorded"}
+    trust_status = (
+        "ready"
+        if isinstance(state.get("contributions"), list)
+        else REANALYZE_REQUIRED
+        if complete
+        else "not_completed"
+    )
     return {
-        "status": state["status"], "job_id": state["job_id"],
+        "status": state["status"],
+        "job_id": state["job_id"],
         "plan_fingerprint": state["plan_fingerprint"],
         "total_found": state["plan"]["total_found"],
-        "processed": len(state.get("processed_ids") or []),
+        "processed": (
+            state["plan"]["total_found"]
+            if state.get("state_kind") == "consolidation"
+            else len(state.get("processed_ids") or [])
+        ),
         "included": state.get("included_count", 0),
         "excluded": sum((state.get("excluded_counts") or {}).values()),
         "exclusion_reasons": state.get("excluded_counts") or {},
         "batch_number": state.get("batch_number", 0),
         "drift": state.get("drift") or {},
+        "trustworthy_consolidation_status": trust_status,
         "expires_at": state["expires_at"],
     }
 
@@ -1040,12 +1678,20 @@ def cmd_cancel(args) -> None:
     with _job_lock(args.job_id):
         state = _load_state(args.job_id)
         if state["status"] == "recorded":
-            raise SentStyleError("recorded candidates must be reviewed or deleted in Cogitator")
+            raise SentStyleError(
+                "recorded candidates must be reviewed or deleted in Cogitator"
+            )
         state.update(
-            status="cancelled", processed_ids=[], patterns={}, seen_exact=[],
-            seen_simhash=[], category_counts={}, included_count=0,
+            status="cancelled",
+            processed_ids=[],
+            patterns={},
+            contributions=[],
+            category_counts={},
+            included_count=0,
+            excluded_counts={},
         )
-        state["plan"]["message_ids"] = []
+        if "message_ids" in state["plan"]:
+            state["plan"]["message_ids"] = []
         _write_state(state)
         print(json.dumps(_status(state)))
 
@@ -1060,7 +1706,9 @@ def cmd_delete(args) -> None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Private Linxio SENT-mail style bootstrap")
+    parser = argparse.ArgumentParser(
+        description="Private Linxio SENT-mail style bootstrap"
+    )
     sub = parser.add_subparsers(dest="command", required=True)
     plan = sub.add_parser("sent-style-plan")
     plan.add_argument("--start", default="", help="inclusive local date YYYY-MM-DD")
@@ -1076,17 +1724,27 @@ def main() -> int:
     run.add_argument("job_id")
     run.set_defaults(func=cmd_run)
     preview = sub.add_parser("sent-style-preview")
-    preview.add_argument("job_id"); preview.add_argument("--patterns-file", default="")
+    consolidate = sub.add_parser("sent-style-consolidate-preview")
+    consolidate.add_argument("job_ids", nargs="+")
+    consolidate.add_argument("--patterns-file", default="")
+    consolidate.set_defaults(func=cmd_consolidate_preview)
+    preview.add_argument("job_id")
+    preview.add_argument("--patterns-file", default="")
     preview.set_defaults(func=cmd_preview)
     record = sub.add_parser("sent-style-record")
-    record.add_argument("job_id"); record.add_argument("--preview-fingerprint", required=True)
-    record.add_argument("--confirm", required=True); record.set_defaults(func=cmd_record)
+    record.add_argument("job_id")
+    record.add_argument("--preview-fingerprint", required=True)
+    record.add_argument("--confirm", required=True)
+    record.set_defaults(func=cmd_record)
     cancel = sub.add_parser("sent-style-cancel")
-    cancel.add_argument("job_id"); cancel.set_defaults(func=cmd_cancel)
+    cancel.add_argument("job_id")
+    cancel.set_defaults(func=cmd_cancel)
     status_cmd = sub.add_parser("sent-style-status")
-    status_cmd.add_argument("job_id"); status_cmd.set_defaults(func=cmd_status)
+    status_cmd.add_argument("job_id")
+    status_cmd.set_defaults(func=cmd_status)
     delete = sub.add_parser("sent-style-delete")
-    delete.add_argument("job_id"); delete.set_defaults(func=cmd_delete)
+    delete.add_argument("job_id")
+    delete.set_defaults(func=cmd_delete)
     args = parser.parse_args()
     args.func(args)
     return 0
@@ -1095,6 +1753,10 @@ def main() -> int:
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
-    except (SentStyleError, email_learning.EmailLearningError, json.JSONDecodeError) as exc:
+    except (
+        SentStyleError,
+        email_learning.EmailLearningError,
+        json.JSONDecodeError,
+    ) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         raise SystemExit(2)
