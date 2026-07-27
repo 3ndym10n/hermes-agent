@@ -56,6 +56,14 @@ MAX_HISTORY_EVENTS = 1_000
 RETENTION_SECONDS = 30 * 86400
 MAX_RETRIES = 3
 ALERT_COOLDOWN = 6 * 3600
+SHADOW_DURATION_SECONDS = 24 * 3600
+SHADOW_CANDIDATE_LIMIT = 10
+_SHADOW_COUNTERS = (
+    "external_human_candidates",
+    "duplicate_events_suppressed",
+    "prompt_injection_attempts_ignored",
+)
+
 
 CATEGORIES = frozenset(
     {
@@ -222,6 +230,13 @@ _AUTOMATED_SUBJECT_RE = re.compile(
     r"delivery (?:status|notification)|out for delivery|shipped|bounce|"
     r"undeliverable|automatic report|daily report|weekly report|system alert|"
     r"calendar invitation|invitation:|accepted:|declined:|tentative:)\b"
+)
+_PROMPT_INJECTION_RE = re.compile(
+    r"(?i)\b(?:ignore (?:all |any |the )?(?:previous|prior|system) instructions|"
+    r"reveal .{0,40}(?:secret|token|password|system prompt)|"
+    r"(?:run|call|invoke|use) (?:a |the )?tool|"
+    r"(?:send|forward) (?:this )?email automatically|"
+    r"(?:browse|open|click) (?:the |this |a )?(?:website|link|url))\b"
 )
 _DISCLAIMER_RE = re.compile(
     r"(?im)^\s*(?:confidentiality notice|this (?:email|message) and any attachments|"
@@ -443,6 +458,45 @@ def _bump(conn: sqlite3.Connection, key: str, amount: int = 1) -> None:
 def _mode(conn: sqlite3.Connection) -> str:
     value = _meta(conn, "mode", "disabled")
     return value if value in {"disabled", "shadow", "draft"} else "disabled"
+
+def _counter(conn: sqlite3.Connection, key: str) -> int:
+    try:
+        return int(_meta(conn, key, "0"))
+    except ValueError:
+        return 0
+
+
+def _pause_shadow(
+    conn: sqlite3.Connection, reason: str, *, safety_hold: bool
+) -> None:
+    if _mode(conn) != "shadow":
+        return
+    _set_meta(conn, "resume_mode", "shadow")
+    _set_meta(conn, "mode", "disabled")
+    _set_meta(conn, "shadow_stopped_at", str(_now()))
+    _set_meta(conn, "shadow_stop_reason", reason)
+    if safety_hold:
+        _set_meta(conn, "shadow_safety_hold", reason)
+
+
+def _shadow_limit_reason(conn: sqlite3.Connection) -> str:
+    if _mode(conn) != "shadow":
+        return ""
+    try:
+        deadline = float(_meta(conn, "shadow_deadline", "0"))
+        limit = int(
+            _meta(conn, "shadow_candidate_limit", str(SHADOW_CANDIDATE_LIMIT))
+        )
+    except ValueError:
+        return "state_corruption"
+    candidates = _counter(conn, "external_human_candidates") - _counter(
+        conn, "shadow_base_external_human_candidates"
+    )
+    if deadline and _now() >= deadline:
+        return "duration_limit"
+    if candidates >= limit:
+        return "candidate_limit"
+    return ""
 
 
 def _prune(conn: sqlite3.Connection) -> None:
@@ -1628,11 +1682,20 @@ def _process_event(
         if exclusion:
             _finish(conn, message_id, state="ignored", reason=exclusion)
             return True
+        if not existing:
+            _bump(conn, "external_human_candidates")
         thread = _thread(service, event_thread_id)
         entries = _thread_entries(thread)
+        target_text = next(
+            (item["text"] for item in entries if item["id"] == message_id), ""
+        )
+        if not existing and _PROMPT_INJECTION_RE.search(target_text):
+            _bump(conn, "prompt_injection_attempts_ignored")
         target_reason = _target_state(entries, message_id)
         if target_reason == "cross_customer_risk":
             _alert(conn, "cross_customer_risk", immediate=True)
+            _pause_shadow(conn, target_reason, safety_hold=True)
+            conn.commit()
             _decision(
                 conn,
                 message_id,
@@ -1982,6 +2045,8 @@ def run_once(*, service=None) -> dict:
             except AutodraftError as exc:
                 if exc.code == "wrong_account":
                     current_mode = _mode(conn)
+                    if current_mode == "shadow":
+                        _pause_shadow(conn, "wrong_account", safety_hold=True)
                     if current_mode != "disabled":
                         _set_meta(conn, "resume_mode", current_mode)
                     _set_meta(conn, "mode", "disabled")
@@ -1990,12 +2055,26 @@ def run_once(*, service=None) -> dict:
                     conn.commit()
                 elif exc.code == "oauth_failure":
                     _set_meta(conn, "authentication_health", "oauth_failure")
+                    _pause_shadow(conn, "oauth_failure", safety_hold=True)
                     conn.commit()
                 if exc.code in {"wrong_account", "oauth_failure"}:
                     _alert(conn, exc.code)
                 raise
             if _meta(conn, "account_intervention_required") == "1":
                 raise AutodraftError("operator_intervention_required")
+            if _meta(conn, "history_gap_intervention_required") == "1":
+                return {
+                    "status": "shadow_safety_hold",
+                    "mode": "disabled",
+                    "reason": "history_gap",
+                }
+            safety_hold = _meta(conn, "shadow_safety_hold")
+            if safety_hold:
+                return {
+                    "status": "shadow_safety_hold",
+                    "mode": "disabled",
+                    "reason": safety_hold,
+                }
             _set_meta(conn, "verified_account_fingerprint", profile["account_fingerprint"])
             _set_meta(conn, "policy_version", str(POLICY_VERSION))
             _set_meta(conn, "processing_version", PROCESSING_VERSION)
@@ -2013,6 +2092,21 @@ def run_once(*, service=None) -> dict:
                     "historical_messages_processed": 0,
                 }
             mode = _mode(conn)
+            limit_reason = _shadow_limit_reason(conn)
+            if limit_reason:
+                if limit_reason == "state_corruption":
+                    raise AutodraftError(limit_reason)
+                _pause_shadow(conn, limit_reason, safety_hold=False)
+                _set_meta(conn, "history_watermark", profile["history_id"])
+                _set_meta(conn, "history_watermark_updated_at", str(_now()))
+                _set_meta(conn, "last_successful_poll", str(_now()))
+                conn.commit()
+                return {
+                    "status": "shadow_complete",
+                    "mode": "disabled",
+                    "reason": limit_reason,
+                    "checkpoint_advanced": True,
+                }
             if mode == "draft" and not _policy_current(conn):
                 _set_meta(conn, "mode", "disabled")
                 conn.commit()
@@ -2038,6 +2132,14 @@ def run_once(*, service=None) -> dict:
                 ).fetchone()[0]
                 if oldest_pending and _now() - oldest_pending > 300:
                     _alert(conn, "queue_stuck")
+                    if mode == "shadow":
+                        _pause_shadow(conn, "queue_stuck", safety_hold=True)
+                        conn.commit()
+                        return {
+                            "status": "shadow_safety_hold",
+                            "mode": "disabled",
+                            "reason": "queue_stuck",
+                        }
             if mode == "disabled":
                 _set_meta(conn, "history_watermark", profile["history_id"])
                 _set_meta(conn, "history_watermark_updated_at", str(_now()))
@@ -2049,14 +2151,51 @@ def run_once(*, service=None) -> dict:
                 events, watermark = collect_history_events(service, checkpoint)
             except AutodraftError as exc:
                 if exc.code == "history_gap":
+                    _set_meta(conn, "history_gap_intervention_required", "1")
+                    if _mode(conn) == "shadow":
+                        _pause_shadow(conn, "history_gap", safety_hold=True)
+                    else:
+                        _set_meta(conn, "mode", "disabled")
+                    conn.commit()
                     _alert(conn, "history_gap")
                 raise
             complete = True
+            shadow_stop = ""
             for event in events:
                 if not _process_event(
                     conn, service, event, profile["account_fingerprint"]
                 ):
                     complete = False
+                if _mode(conn) == "disabled":
+                    shadow_stop = _meta(conn, "shadow_stop_reason")
+                    break
+                limit_reason = _shadow_limit_reason(conn)
+                if limit_reason:
+                    if limit_reason == "state_corruption":
+                        raise AutodraftError(limit_reason)
+                    _pause_shadow(conn, limit_reason, safety_hold=False)
+                    shadow_stop = limit_reason
+                    break
+            if shadow_stop:
+                safety_hold = _meta(conn, "shadow_safety_hold")
+                if not safety_hold:
+                    _set_meta(
+                        conn, "history_watermark", profile["history_id"]
+                    )
+                    _set_meta(
+                        conn, "history_watermark_updated_at", str(_now())
+                    )
+                _set_meta(conn, "last_successful_poll", str(_now()))
+                _prune(conn)
+                conn.commit()
+                return {
+                    "status": (
+                        "shadow_safety_hold" if safety_hold else "shadow_complete"
+                    ),
+                    "mode": "disabled",
+                    "reason": shadow_stop,
+                    "checkpoint_advanced": not bool(safety_hold),
+                }
             if complete:
                 _set_meta(conn, "history_watermark", watermark)
                 _set_meta(conn, "history_watermark_updated_at", str(_now()))
@@ -2147,6 +2286,8 @@ def account_reverify(*, confirm: str, service=None) -> dict:
         if profile["account_fingerprint"] != ACCOUNT_FINGERPRINT:
             raise AutodraftError("wrong_account")
         conn.execute("DELETE FROM meta WHERE key='account_intervention_required'")
+        if _meta(conn, "shadow_safety_hold") == "wrong_account":
+            conn.execute("DELETE FROM meta WHERE key='shadow_safety_hold'")
         _set_meta(conn, "verified_account_fingerprint", ACCOUNT_FINGERPRINT)
         _set_meta(conn, "authentication_health", "ok")
         _set_meta(conn, "mode", "disabled")
@@ -2166,6 +2307,7 @@ def set_mode(mode: str) -> dict:
     try:
         if mode not in {"disabled", "shadow", "draft", "pause", "resume"}:
             raise AutodraftError("invalid_mode")
+        requested = mode
         current = _mode(conn)
         if mode == "pause":
             _set_meta(conn, "resume_mode", current if current != "disabled" else "shadow")
@@ -2174,13 +2316,59 @@ def set_mode(mode: str) -> dict:
             mode = _meta(conn, "resume_mode", "shadow")
             if mode not in {"shadow", "draft"}:
                 mode = "shadow"
+        if (
+            mode != "disabled"
+            and _meta(conn, "history_gap_intervention_required") == "1"
+        ):
+            raise AutodraftError("history_gap")
         if mode != "disabled" and _meta(conn, "account_intervention_required") == "1":
+            raise AutodraftError("operator_intervention_required")
+        if (
+            mode != "disabled"
+            and requested != "shadow"
+            and _meta(conn, "shadow_safety_hold")
+        ):
             raise AutodraftError("operator_intervention_required")
         if mode == "draft" and not _policy_current(conn):
             raise AutodraftError("policy_not_approved")
+        if requested == "shadow" and current != "shadow":
+            now = _now()
+            for key in (
+                "shadow_stopped_at",
+                "shadow_stop_reason",
+                "shadow_safety_hold",
+            ):
+                conn.execute("DELETE FROM meta WHERE key=?", (key,))
+            _set_meta(conn, "shadow_started_at", str(now))
+            _set_meta(conn, "shadow_deadline", str(now + SHADOW_DURATION_SECONDS))
+            _set_meta(conn, "shadow_candidate_limit", str(SHADOW_CANDIDATE_LIMIT))
+            _set_meta(
+                conn, "shadow_start_history_watermark", _meta(conn, "history_watermark")
+            )
+            for counter in _SHADOW_COUNTERS:
+                _set_meta(
+                    conn,
+                    f"shadow_base_{counter}",
+                    str(_counter(conn, counter)),
+                )
+        elif current == "shadow" and mode == "disabled":
+            _pause_shadow(
+                conn,
+                "operator_paused" if requested == "pause" else "operator_disabled",
+                safety_hold=False,
+            )
         _set_meta(conn, "mode", mode)
         conn.commit()
-        return {"status": "updated", "mode": mode}
+        result = {"status": "updated", "mode": mode}
+        if mode == "shadow":
+            result.update(
+                {
+                    "deadline": _iso(float(_meta(conn, "shadow_deadline"))),
+                    "candidate_limit": SHADOW_CANDIDATE_LIMIT,
+                    "draft_policy_approved": _policy_current(conn),
+                }
+            )
+        return result
     finally:
         conn.close()
 
@@ -2194,6 +2382,11 @@ def reset_baseline(*, confirm: str, service=None) -> dict:
         _set_meta(conn, "history_watermark", profile["history_id"])
         _set_meta(conn, "history_watermark_updated_at", str(_now()))
         _set_meta(conn, "last_successful_poll", str(_now()))
+        conn.execute(
+            "DELETE FROM meta WHERE key='history_gap_intervention_required'"
+        )
+        if _meta(conn, "shadow_safety_hold") == "history_gap":
+            conn.execute("DELETE FROM meta WHERE key='shadow_safety_hold'")
         conn.commit()
         return {
             "status": "baseline_reset",
@@ -2244,6 +2437,90 @@ def status() -> dict:
             "WHERE state IN ('processing','reserved','failed')"
         ).fetchone()
         oldest_age = round(_now() - pending[1]) if pending[1] else 0
+        shadow_started = float(_meta(conn, "shadow_started_at", "0"))
+        shadow_rows = (
+            conn.execute(
+                "SELECT state, reason_code, created_at, updated_at "
+                "FROM messages WHERE created_at>=?",
+                (shadow_started,),
+            ).fetchall()
+            if shadow_started
+            else []
+        )
+        shadow_states: dict[str, int] = {}
+        shadow_reasons: dict[str, int] = {}
+        shadow_ignored: dict[str, int] = {}
+        latencies: list[int] = []
+        for row in shadow_rows:
+            shadow_states[row["state"]] = shadow_states.get(row["state"], 0) + 1
+            shadow_reasons[row["reason_code"]] = (
+                shadow_reasons.get(row["reason_code"], 0) + 1
+            )
+            if row["state"] == "ignored":
+                shadow_ignored[row["reason_code"]] = (
+                    shadow_ignored.get(row["reason_code"], 0) + 1
+                )
+            if row["state"] not in {"processing", "reserved"}:
+                latencies.append(
+                    max(0, round((row["updated_at"] - row["created_at"]) * 1000))
+                )
+        stopped_at = float(_meta(conn, "shadow_stopped_at", "0"))
+        shadow_test = {
+            "started_at": _iso(shadow_started),
+            "deadline": _iso(float(_meta(conn, "shadow_deadline", "0"))),
+            "duration_seconds": (
+                round((stopped_at or _now()) - shadow_started)
+                if shadow_started
+                else 0
+            ),
+            "candidate_limit": int(
+                _meta(
+                    conn,
+                    "shadow_candidate_limit",
+                    str(SHADOW_CANDIDATE_LIMIT),
+                )
+            ),
+            "stop_reason": _meta(conn, "shadow_stop_reason"),
+            "new_inbox_messages_examined": len(shadow_rows),
+            "external_human_candidates": _counter(
+                conn, "external_human_candidates"
+            )
+            - _counter(conn, "shadow_base_external_human_candidates"),
+            "would_draft": shadow_states.get("shadowed", 0),
+            "decision_required": shadow_states.get("decision_required", 0),
+            "ignored_by_reason": shadow_ignored,
+            "duplicates_suppressed": _counter(
+                conn, "duplicate_events_suppressed"
+            )
+            - _counter(conn, "shadow_base_duplicate_events_suppressed"),
+            "existing_drafts_detected": sum(
+                shadow_reasons.get(key, 0)
+                for key in ("existing_draft", "stale_existing_draft")
+            ),
+            "later_cal_replies_detected": shadow_reasons.get("later_reply", 0),
+            "unsupported_factual_claims_blocked": shadow_reasons.get(
+                "unsupported_claim", 0
+            ),
+            "conflicting_facts_blocked": shadow_reasons.get(
+                "conflicting_facts", 0
+            ),
+            "prompt_injection_attempts_ignored": _counter(
+                conn, "prompt_injection_attempts_ignored"
+            )
+            - _counter(
+                conn, "shadow_base_prompt_injection_attempts_ignored"
+            ),
+            "processing_failures": sum(
+                1
+                for row in shadow_rows
+                if row["state"] == "failed"
+                or row["reason_code"] == "processing_failure"
+            ),
+            "average_processing_latency_ms": (
+                round(sum(latencies) / len(latencies)) if latencies else 0
+            ),
+            "maximum_processing_latency_ms": max(latencies, default=0),
+        }
         result = {
             "mode": _mode(conn),
             "verified_account": (
@@ -2254,7 +2531,11 @@ def status() -> dict:
             ),
             "policy_version": POLICY_VERSION,
             "policy_approved": _policy_current(conn),
-            "operator_intervention_required": _meta(conn, "account_intervention_required") == "1",
+            "operator_intervention_required": bool(
+                _meta(conn, "account_intervention_required") == "1"
+                or _meta(conn, "history_gap_intervention_required") == "1"
+                or _meta(conn, "shadow_safety_hold")
+            ),
             "processing_version": PROCESSING_VERSION,
             "last_successful_poll": _iso(float(_meta(conn, "last_successful_poll", "0"))),
             "last_history_watermark_update": _iso(
@@ -2293,6 +2574,7 @@ def status() -> dict:
             ),
             "processing_failures_today": by_state.get("failed", 0),
         }
+        result["shadow_test"] = shadow_test
         result.update(_systemd_state())
         return result
     except (TypeError, ValueError) as exc:
@@ -2330,6 +2612,8 @@ def doctor(*, service=None) -> dict:
                 and bool(url and token)
                 and bridge_healthy
                 and _meta(conn, "account_intervention_required") != "1"
+                and _meta(conn, "history_gap_intervention_required") != "1"
+                and not _meta(conn, "shadow_safety_hold")
                 and telegram_ready
                 and db_mode == 0o600
                 and dir_mode == 0o700
@@ -2342,7 +2626,11 @@ def doctor(*, service=None) -> dict:
             "state_directory_mode": oct(dir_mode),
             "state_database_mode": oct(db_mode),
             "policy_approved": _policy_current(conn),
-            "operator_intervention_required": _meta(conn, "account_intervention_required") == "1",
+            "operator_intervention_required": bool(
+                _meta(conn, "account_intervention_required") == "1"
+                or _meta(conn, "history_gap_intervention_required") == "1"
+                or _meta(conn, "shadow_safety_hold")
+            ),
             **_systemd_state(),
         }
     finally:

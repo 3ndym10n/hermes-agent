@@ -79,6 +79,13 @@ $AUTODRAFT explain ignored
 $AUTODRAFT explain decision
 ```
 
+`mode shadow` starts a fresh bounded observation: at most 24 hours or 10 new
+external-human candidates, whichever occurs first. It records only sanitized
+outcomes and aggregate latency, cannot create drafts, and returns to disabled
+mode at the bound. `status.shadow_test` reports the live counters. A
+history-gap, stuck queue, account/auth fault, or cross-customer risk instead
+creates a safety hold without advancing the checkpoint.
+
 Draft mode is a separate two-step Cal gate:
 
 ```bash
@@ -90,9 +97,10 @@ $AUTODRAFT mode draft
 `mode disabled` is the immediate kill switch. `mode pause` remembers the prior
 shadow/draft mode; `mode resume` restores it only when any required draft
 policy approval remains current.
-While disabled or paused, each timer tick advances directly to the current
-profile watermark without listing messages. Resuming therefore never drains an
-old-email queue.
+While ordinarily disabled or paused, each timer tick advances directly to the
+current profile watermark without listing messages. Resuming therefore never
+drains an old-email queue. Safety and history-gap holds are the exception: they
+preserve the existing checkpoint until explicit operator intervention.
 
 A wrong Gmail account latches mode to disabled even after the approved account
 is restored. After investigating the substitution, explicitly verify and clear
@@ -114,9 +122,10 @@ There is intentionally no historical replay command in V1.
 ## Monitoring
 
 `status` is sanitized and reports mode, account/policy health, timer state,
-poll/watermark time, processing latency, pending age/count, daily funnel
-counts, closed ignore reasons, duplicate suppression/prevention, stale drafts,
-Cogitator/Telegram success times, auth health, and failures.
+poll/watermark time, pending age/count, daily funnel counts, closed ignore
+reasons, duplicate suppression/prevention, stale drafts, Cogitator/Telegram
+success times, auth health, failures, and bounded shadow counts with average and
+maximum processing latency.
 
 `doctor` performs read-only profile, configuration, permission, policy, and
 timer checks. Routine healthy runs do not notify. High-signal account, OAuth,
