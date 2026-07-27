@@ -195,6 +195,9 @@ PUBLIC_DOMAINS = frozenset(
         "aol.com",
     }
 )
+POLICY_CONFIDENCE_THRESHOLD = 0.85
+POLICY_MAX_DRAFTS_PER_HOUR = 5
+POLICY_MAX_DRAFTS_PER_DAY = 20
 POLICY_MATERIAL = {
     "policy_version": POLICY_VERSION,
     "processing_version": PROCESSING_VERSION,
@@ -211,9 +214,9 @@ POLICY_MATERIAL = {
     "bcc": False,
     "safe_categories": sorted(SAFE_CATEGORIES),
     "blocked_categories": sorted(BLOCKED_CATEGORIES),
-    "confidence_threshold": 0.85,
-    "max_drafts_per_hour": 5,
-    "max_drafts_per_day": 20,
+    "confidence_threshold": POLICY_CONFIDENCE_THRESHOLD,
+    "max_drafts_per_hour": POLICY_MAX_DRAFTS_PER_HOUR,
+    "max_drafts_per_day": POLICY_MAX_DRAFTS_PER_DAY,
 }
 POLICY_FINGERPRINT = hashlib.sha256(
     json.dumps(POLICY_MATERIAL, sort_keys=True, separators=(",", ":")).encode()
@@ -524,7 +527,7 @@ def _confidence_bucket(value: float) -> str:
 
 def _load_runtime_env() -> None:
     try:
-        from dotenv import load_dotenv
+        from dotenv import load_dotenv  # ty: ignore[unresolved-import]
         from hermes_constants import get_hermes_home
 
         load_dotenv(Path(get_hermes_home()) / ".env", override=False)
@@ -931,7 +934,6 @@ def _llm_json(system: str, payload: dict, *, max_tokens: int) -> dict:
             ],
             temperature=0,
             max_tokens=max_tokens,
-            tools=None,
             timeout=60,
         )
         content = response.choices[0].message.content
@@ -1038,7 +1040,7 @@ closed values), draft_body (always ""). Do not draft prose."""
         result["reason_code"] = "blocked_category"
     if (
         result["decision"] == "draft_reply"
-        and result["confidence"] < POLICY_MATERIAL["confidence_threshold"]
+        and result["confidence"] < POLICY_CONFIDENCE_THRESHOLD
     ):
         result["decision"] = "decision_required"
         result["reason_code"] = "low_confidence"
@@ -1261,7 +1263,7 @@ requested fields. Use only supplied evidence refs; never put refs in the body.""
         result["decision"] != "draft_reply"
         or result["missing_facts"]
         or result["risk_flags"]
-        or result["confidence"] < POLICY_MATERIAL["confidence_threshold"]
+        or result["confidence"] < POLICY_CONFIDENCE_THRESHOLD
     ):
         result["decision"] = "decision_required"
         return result
@@ -1395,10 +1397,10 @@ def _reserve(conn: sqlite3.Connection, message_id: str) -> str:
             "AND created_at >= ?",
             (now - 86400,),
         ).fetchone()[0]
-        if day_count >= int(POLICY_MATERIAL["max_drafts_per_day"]):
+        if day_count >= POLICY_MAX_DRAFTS_PER_DAY:
             conn.rollback()
             return "daily"
-        if hour_count >= int(POLICY_MATERIAL["max_drafts_per_hour"]):
+        if hour_count >= POLICY_MAX_DRAFTS_PER_HOUR:
             conn.rollback()
             return "hourly"
         conn.execute(
@@ -2359,7 +2361,7 @@ def set_mode(mode: str) -> dict:
             )
         _set_meta(conn, "mode", mode)
         conn.commit()
-        result = {"status": "updated", "mode": mode}
+        result: dict[str, object] = {"status": "updated", "mode": mode}
         if mode == "shadow":
             result.update(
                 {

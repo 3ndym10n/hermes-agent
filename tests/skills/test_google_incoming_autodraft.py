@@ -9,7 +9,7 @@ from email import policy
 from email.parser import BytesParser
 from pathlib import Path
 
-import pytest
+import pytest  # ty: ignore[unresolved-import]
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -312,6 +312,7 @@ def test_reply_mime_is_one_recipient_threaded_and_draft_only():
         Service(drafts), target, "t1", "Re: Question", "Thanks."
     )
 
+    assert drafts.created is not None
     payload = drafts.created["body"]["message"]
     parsed = BytesParser(policy=policy.default).parsebytes(
         base64.urlsafe_b64decode(payload["raw"])
@@ -325,6 +326,17 @@ def test_reply_mime_is_one_recipient_threaded_and_draft_only():
     assert list(parsed.iter_attachments()) == []
     assert "messages().send" not in SCRIPT.read_text()
     assert "drafts().send" not in SCRIPT.read_text()
+
+
+def test_systemd_service_uses_stable_checkout():
+    unit = (
+        ROOT
+        / "packaging"
+        / "linxio-incoming-autodraft"
+        / "linxio-incoming-autodraft.service"
+    ).read_text()
+    assert "/home/v0id/.hermes/hermes-agent-linxio-autodraft" not in unit
+    assert "WorkingDirectory=/home/v0id/.hermes/hermes-agent" in unit
 
 
 def test_uncertain_create_reconciles_instead_of_retrying(monkeypatch):

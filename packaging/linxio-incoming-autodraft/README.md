@@ -63,7 +63,7 @@ verifies the account and establishes the no-history baseline.
 Define the operator command:
 
 ```bash
-AUTODRAFT="/home/v0id/.hermes/hermes-agent/venv/bin/python /home/v0id/.hermes/hermes-agent-linxio-autodraft/skills/productivity/google-workspace/scripts/incoming_autodraft.py"
+AUTODRAFT="/home/v0id/.hermes/hermes-agent/venv/bin/python /home/v0id/.hermes/hermes-agent/skills/productivity/google-workspace/scripts/incoming_autodraft.py"
 ```
 
 ## Operate

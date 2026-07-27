@@ -5,9 +5,9 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-WorkingDirectory=/home/v0id/.hermes/hermes-agent-linxio-autodraft
+WorkingDirectory=/home/v0id/.hermes/hermes-agent
 EnvironmentFile=-/home/v0id/.hermes/.env
-ExecStart=/home/v0id/.hermes/hermes-agent/venv/bin/python /home/v0id/.hermes/hermes-agent-linxio-autodraft/skills/productivity/google-workspace/scripts/incoming_autodraft.py run-once
+ExecStart=/home/v0id/.hermes/hermes-agent/venv/bin/python /home/v0id/.hermes/hermes-agent/skills/productivity/google-workspace/scripts/incoming_autodraft.py run-once
 UMask=0077
 NoNewPrivileges=yes
 PrivateTmp=yes
@@ -15,7 +15,6 @@ ProtectSystem=strict
 ProtectHome=read-only
 ReadWritePaths=/home/v0id/.hermes
 ReadOnlyPaths=/home/v0id/.hermes/hermes-agent
-ReadOnlyPaths=/home/v0id/.hermes/hermes-agent-linxio-autodraft
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 RestrictRealtime=yes
 RestrictSUIDSGID=yes
