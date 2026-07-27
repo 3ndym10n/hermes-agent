@@ -1,0 +1,13 @@
+[Unit]
+Description=Poll Linxio Gmail history every minute for draft-only responses
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=60s
+AccuracySec=5s
+RandomizedDelaySec=2s
+Persistent=false
+Unit=linxio-incoming-autodraft.service
+
+[Install]
+WantedBy=timers.target
