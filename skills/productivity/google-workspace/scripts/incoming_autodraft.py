@@ -667,7 +667,7 @@ def _profile(service) -> dict:
 
 
 def collect_history_events(service, checkpoint: str) -> tuple[list[dict], str]:
-    """Return unique messagesAdded-to-INBOX events and the next watermark.
+    """Return unique new Inbox/Sent events and the next watermark.
 
     This small seam is the only trigger-specific code. A future Gmail watch
     consumer can feed the same ``message_id/history_id`` records into the
@@ -683,7 +683,6 @@ def collect_history_events(service, checkpoint: str) -> tuple[list[dict], str]:
             "userId": "me",
             "startHistoryId": checkpoint,
             "historyTypes": ["messageAdded"],
-            "labelId": "INBOX",
             "maxResults": 100,
         }
         if page_token:
@@ -709,11 +708,12 @@ def collect_history_events(service, checkpoint: str) -> tuple[list[dict], str]:
                 labels = set(message.get("labelIds") or [])
                 if not _ID_RE.fullmatch(message_id) or not _ID_RE.fullmatch(thread_id):
                     raise AutodraftError("gmail_response_invalid")
-                if message_id and thread_id and "INBOX" in labels:
+                if message_id and thread_id and labels & {"INBOX", "SENT"}:
                     events[message_id] = {
                         "message_id": message_id,
                         "thread_id": thread_id,
                         "history_id": history_id,
+                        "kind": "sent" if "SENT" in labels else "inbox",
                     }
                     if len(events) > MAX_HISTORY_EVENTS:
                         raise AutodraftError("history_backlog")
@@ -1691,8 +1691,38 @@ def _notify(
             + "Next action: review the Gmail thread and decide the reply."
         )
     try:
+        from gmail_attention import upsert_gmail_outcome
+
+        queued = upsert_gmail_outcome(
+            thread_id=thread_id,
+            message_id=str(metadata.get("id") or ""),
+            kind=kind,
+            subject=subject,
+            sender_name=sender_name,
+            company=company,
+            received_time=_received_time(metadata),
+            category=category or "unclear",
+            reason=(
+                "reply_needed"
+                if kind in {"shadowed", "drafted"}
+                else reason if reason in REASON_CODES else "processing_failure"
+            ),
+            confidence=confidence,
+            processing_version=PROCESSING_VERSION,
+        )
+    except Exception:
+        queued = "failed"
+    if queued != "failed":
+        if queued == "delivered":
+            _set_meta(conn, "last_telegram_success", str(_now()))
+            _recover_attention_alert("telegram_notification_failure")
+        conn.commit()
+        return True
+
+    try:
         _send_telegram(text, shadow=shadow)
         _set_meta(conn, "last_telegram_success", str(_now()))
+        _recover_attention_alert("telegram_notification_failure")
         conn.commit()
         return True
     except AutodraftError:
@@ -1706,6 +1736,13 @@ def _alert(conn: sqlite3.Connection, code: str, *, immediate: bool = False) -> N
         last = float(_meta(conn, key, "0"))
     except ValueError:
         last = 0
+    try:
+        from gmail_attention import upsert_worker_alert
+
+        queued = upsert_worker_alert(code, processing_version=PROCESSING_VERSION)
+    except Exception:
+        queued = "failed"
+
     if not immediate and _now() - last < ALERT_COOLDOWN:
         return
     messages = {
@@ -1726,6 +1763,13 @@ def _alert(conn: sqlite3.Connection, code: str, *, immediate: bool = False) -> N
     text = messages.get(code)
     if not text:
         return
+    if queued != "failed":
+        _set_meta(conn, key, str(_now()))
+        if queued == "delivered":
+            _set_meta(conn, "last_telegram_success", str(_now()))
+        conn.commit()
+        return
+
     try:
         _send_telegram(text, shadow=_shadow_context(conn))
     except AutodraftError:
@@ -1735,6 +1779,14 @@ def _alert(conn: sqlite3.Connection, code: str, *, immediate: bool = False) -> N
     _set_meta(conn, "last_telegram_success", str(_now()))
     conn.commit()
 
+
+def _recover_attention_alert(code: str) -> None:
+    try:
+        from gmail_attention import resolve_worker_alert
+
+        resolve_worker_alert(code, f"{code}-recovered")
+    except Exception:
+        pass
 
 def _apply_overlap_hold(conn: sqlite3.Connection) -> bool:
     if not _marker_exists(_OVERLAP_HOLD_FILE):
@@ -1773,6 +1825,15 @@ def _apply_overlap_hold(conn: sqlite3.Connection) -> bool:
 
 def _handle_worker_overlap() -> None:
     if not _create_overlap_hold():
+        return
+    try:
+        from gmail_attention import upsert_worker_alert
+
+        queued = upsert_worker_alert("worker_overlap", processing_version=PROCESSING_VERSION)
+    except Exception:
+        queued = "failed"
+    if queued != "failed":
+        _create_marker(_OVERLAP_ALERT_SENT_FILE)
         return
     text = (
         "Overlapping worker execution detected.\n"
@@ -1885,7 +1946,6 @@ def _decision_for_changed_thread(
         _bump(conn, "duplicate_drafts_prevented")
         _bump(conn, "stale_existing_drafts")
     if reason == "cross_customer_risk":
-        _alert(conn, "cross_customer_risk", immediate=True)
         _pause_shadow(conn, reason, safety_hold=True)
         conn.commit()
     _decision(
@@ -1940,6 +2000,17 @@ def _process_event(
     event_thread_id = str(event.get("thread_id") or "")
     if not message_id or not event_thread_id:
         raise AutodraftError("gmail_response_invalid")
+    event_kind = str(event.get("kind") or "inbox")
+    if event_kind not in {"inbox", "sent"}:
+        raise AutodraftError("gmail_response_invalid")
+    if event_kind == "sent":
+        try:
+            from gmail_attention import resolve_gmail_thread
+
+            resolve_gmail_thread(event_thread_id, message_id)
+        except Exception:
+            return False
+        return True
     should_process, existing, retry_exhausted = _start_message(
         conn, event, event_thread_id
     )
@@ -2000,7 +2071,6 @@ def _process_event(
             _bump(conn, "prompt_injection_attempts_ignored")
         target_reason = _target_state(entries, message_id)
         if target_reason == "cross_customer_risk":
-            _alert(conn, "cross_customer_risk", immediate=True)
             _pause_shadow(conn, target_reason, safety_hold=True)
             conn.commit()
             _decision(
@@ -2115,6 +2185,7 @@ def _process_event(
             guidance = _writing_guidance(category)
             _set_meta(conn, "last_cogitator_success", str(_now()))
             conn.commit()
+            _recover_attention_alert("cogitator_bridge_failure")
         except AutodraftError:
             if _apply_overlap_hold(conn):
                 return False
@@ -2569,6 +2640,15 @@ def run_once(*, service=None) -> dict:
             if complete:
                 _set_meta(conn, "history_watermark", watermark)
                 _set_meta(conn, "history_watermark_updated_at", str(_now()))
+                for code in (
+                    "oauth_failure",
+                    "polling_delay",
+                    "stale_checkpoint",
+                    "queue_stuck",
+                    "processing_failure",
+                    "gmail_api_failure",
+                ):
+                    _recover_attention_alert(code)
             _set_meta(conn, "last_successful_poll", str(_now()))
             _prune(conn)
             conn.commit()

@@ -133,7 +133,15 @@ def _install_telegram_mock(monkeypatch, bot):
     # MessageEntity needed by #27865 mention-detection path; tests don't
     # inspect it but the import must succeed.
     _MessageEntity = lambda **_kw: SimpleNamespace(**_kw)
-    telegram_mod = SimpleNamespace(Bot=lambda token: bot, MessageEntity=_MessageEntity, constants=constants_mod)
+    _InlineKeyboardButton = lambda text, url: SimpleNamespace(text=text, url=url)
+    _InlineKeyboardMarkup = lambda buttons: SimpleNamespace(inline_keyboard=buttons)
+    telegram_mod = SimpleNamespace(
+        Bot=lambda token: bot,
+        MessageEntity=_MessageEntity,
+        InlineKeyboardButton=_InlineKeyboardButton,
+        InlineKeyboardMarkup=_InlineKeyboardMarkup,
+        constants=constants_mod,
+    )
     monkeypatch.setitem(sys.modules, "telegram", telegram_mod)
     monkeypatch.setitem(sys.modules, "telegram.constants", constants_mod)
 
@@ -877,6 +885,7 @@ class TestSendTelegramHtmlDetection:
         bot.send_voice = AsyncMock()
         bot.send_audio = AsyncMock()
         bot.send_document = AsyncMock()
+        bot.edit_message_text = AsyncMock(return_value=True)
         return bot
 
     def test_html_message_uses_html_parse_mode(self, monkeypatch):
@@ -915,6 +924,44 @@ class TestSendTelegramHtmlDetection:
         kwargs = bot.send_message.await_args.kwargs
         assert kwargs["disable_web_page_preview"] is True
 
+
+    def test_attention_button_uses_fixed_label_and_url(self, monkeypatch):
+        bot = self._make_bot()
+        _install_telegram_mock(monkeypatch, bot)
+
+        url = "https://virgil.example.ts.net:8443/item/" + "a" * 32
+        asyncio.run(
+            _send_telegram("tok", "123", "Needs You", button_url=url)
+        )
+
+        keyboard = bot.send_message.await_args.kwargs["reply_markup"]
+        button = keyboard.inline_keyboard[0][0]
+        assert button.text == "Review in Virgil"
+        assert button.url == url
+
+    def test_attention_update_edits_in_place(self, monkeypatch):
+        bot = self._make_bot()
+        _install_telegram_mock(monkeypatch, bot)
+
+        url = "https://virgil.example.ts.net:8443/item/" + "b" * 32
+        result = asyncio.run(
+            _send_telegram(
+                "tok",
+                "123",
+                "Updated item",
+                thread_id="17585",
+                button_url=url,
+                edit_message_id="42",
+            )
+        )
+
+        bot.send_message.assert_not_awaited()
+        bot.edit_message_text.assert_awaited_once()
+        kwargs = bot.edit_message_text.await_args.kwargs
+        assert kwargs["message_id"] == 42
+        assert kwargs["parse_mode"] is None
+        assert "message_thread_id" not in kwargs
+        assert result["message_id"] == "42"
     def test_html_with_code_and_pre_tags(self, monkeypatch):
         bot = self._make_bot()
         _install_telegram_mock(monkeypatch, bot)
