@@ -7,6 +7,7 @@ import hashlib
 import hmac
 import logging
 import secrets
+import subprocess
 import time
 from collections import defaultdict, deque
 from pathlib import Path
@@ -51,6 +52,26 @@ def _config() -> tuple[str, str]:
 def _audit(action: str, item_id: str = "", outcome: str = "ok") -> None:
     item_ref = hashlib.sha256(item_id.encode()).hexdigest()[:12] if item_id else "-"
     _log.info("attention_audit action=%s item=%s outcome=%s", action, item_ref, outcome)
+
+
+def _gmail_watcher_state() -> str:
+    try:
+        result = subprocess.run(
+            [
+                "systemctl",
+                "--user",
+                "is-active",
+                "--quiet",
+                "linxio-incoming-autodraft.timer",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=2,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return "paused"
+    return "active" if result.returncode == 0 else "paused"
 
 
 def create_app(
@@ -172,7 +193,26 @@ def create_app(
 
     @app.get("/api/session")
     def session():
-        return {"authenticated": True, "app": "Virgil", "csrf_token": csrf_token}
+        latest = next(
+            (
+                event
+                for event in list_activity(limit=200, db_path=db_path)
+                if event["actor"] != "cal"
+            ),
+            None,
+        )
+        return {
+            "authenticated": True,
+            "app": "Virgil",
+            "csrf_token": csrf_token,
+            "connection": {
+                "virgil": "connected",
+                "gmail_watcher": _gmail_watcher_state(),
+                "last_successful_queue_ingestion_at": (
+                    latest["timestamp"] if latest else None
+                ),
+            },
+        }
 
     @app.get("/api/items")
     def items(view: str = "today", project: str = "all", limit: int = 200):

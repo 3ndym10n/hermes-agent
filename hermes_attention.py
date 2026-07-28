@@ -28,7 +28,7 @@ from zoneinfo import ZoneInfo
 from hermes_constants import get_hermes_home
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 BUSY_TIMEOUT_MS = 5_000
 ACTIVE_RETENTION_DAYS = 30
 ACTIVITY_RETENTION_DAYS = 90
@@ -50,6 +50,7 @@ ITEM_TYPES = frozenset({
     "customer_email",
     "automation_failure",
     "approval",
+    "demonstration",
     "decision",
     "task",
     "research",
@@ -101,6 +102,7 @@ REASON_CODES = frozenset({
     "rate_limit",
     "duplicate",
     "processing_failure",
+    "product_verification",
     "oauth_failure",
     "wrong_account",
     "history_gap",
@@ -452,6 +454,10 @@ def _secure_sidecars(path: Path) -> None:
             _secure_file(candidate)
 
 
+_V1_ITEM_TYPES = ITEM_TYPES - {"demonstration"}
+_V1_REASON_CODES = REASON_CODES - {"product_verification"}
+
+
 _MIGRATION_1 = f"""
 CREATE TABLE attention_refs (
     item_id TEXT PRIMARY KEY,
@@ -464,14 +470,14 @@ CREATE TABLE attention_items (
     source_record_id TEXT NOT NULL,
     source_event_id TEXT NOT NULL,
     project TEXT NOT NULL CHECK (project IN ({",".join(repr(v) for v in sorted(PROJECTS))})),
-    item_type TEXT NOT NULL CHECK (item_type IN ({",".join(repr(v) for v in sorted(ITEM_TYPES))})),
+    item_type TEXT NOT NULL CHECK (item_type IN ({",".join(repr(v) for v in sorted(_V1_ITEM_TYPES))})),
     priority TEXT NOT NULL CHECK (priority IN ({",".join(repr(v) for v in sorted(PRIORITIES))})),
     status TEXT NOT NULL CHECK (status IN ({",".join(repr(v) for v in sorted(STATUSES))})),
     title TEXT NOT NULL CHECK (length(title) BETWEEN 1 AND 180),
     safe_summary TEXT NOT NULL CHECK (length(safe_summary) BETWEEN 1 AND 500),
     recommended_action TEXT NOT NULL CHECK (length(recommended_action) BETWEEN 1 AND 300),
     waiting_on TEXT NOT NULL CHECK (waiting_on IN ({",".join(repr(v) for v in sorted(WAITING_ON))})),
-    reason_code TEXT NOT NULL CHECK (reason_code IN ({",".join(repr(v) for v in sorted(REASON_CODES))})),
+    reason_code TEXT NOT NULL CHECK (reason_code IN ({",".join(repr(v) for v in sorted(_V1_REASON_CODES))})),
     confidence REAL CHECK (confidence IS NULL OR (confidence >= 0 AND confidence <= 1)),
     due_at REAL,
     deferred_until REAL,
@@ -519,6 +525,59 @@ CREATE TABLE attention_notifications (
     last_success_at REAL
 );
 """
+_MIGRATION_2 = f"""
+CREATE TEMP TABLE attention_notifications_v1 AS
+SELECT * FROM attention_notifications;
+DROP TABLE attention_notifications;
+CREATE TABLE attention_items_v2 (
+    item_id TEXT PRIMARY KEY REFERENCES attention_refs(item_id) ON DELETE CASCADE,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    source_type TEXT NOT NULL CHECK (source_type IN ({",".join(repr(v) for v in sorted(SOURCE_TYPES))})),
+    source_record_id TEXT NOT NULL,
+    source_event_id TEXT NOT NULL,
+    project TEXT NOT NULL CHECK (project IN ({",".join(repr(v) for v in sorted(PROJECTS))})),
+    item_type TEXT NOT NULL CHECK (item_type IN ({",".join(repr(v) for v in sorted(ITEM_TYPES))})),
+    priority TEXT NOT NULL CHECK (priority IN ({",".join(repr(v) for v in sorted(PRIORITIES))})),
+    status TEXT NOT NULL CHECK (status IN ({",".join(repr(v) for v in sorted(STATUSES))})),
+    title TEXT NOT NULL CHECK (length(title) BETWEEN 1 AND 180),
+    safe_summary TEXT NOT NULL CHECK (length(safe_summary) BETWEEN 1 AND 500),
+    recommended_action TEXT NOT NULL CHECK (length(recommended_action) BETWEEN 1 AND 300),
+    waiting_on TEXT NOT NULL CHECK (waiting_on IN ({",".join(repr(v) for v in sorted(WAITING_ON))})),
+    reason_code TEXT NOT NULL CHECK (reason_code IN ({",".join(repr(v) for v in sorted(REASON_CODES))})),
+    confidence REAL CHECK (confidence IS NULL OR (confidence >= 0 AND confidence <= 1)),
+    due_at REAL,
+    deferred_until REAL,
+    source_deep_link TEXT,
+    prepared_artifact_deep_link TEXT,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    resolved_at REAL,
+    dismissed_at REAL,
+    processing_version TEXT NOT NULL,
+    row_version INTEGER NOT NULL CHECK (row_version > 0)
+);
+INSERT INTO attention_items_v2 SELECT * FROM attention_items;
+DROP TABLE attention_items;
+ALTER TABLE attention_items_v2 RENAME TO attention_items;
+CREATE INDEX attention_items_status_updated ON attention_items(status, updated_at DESC);
+CREATE INDEX attention_items_project_status ON attention_items(project, status);
+CREATE TABLE attention_notifications (
+    item_id TEXT PRIMARY KEY REFERENCES attention_items(item_id) ON DELETE CASCADE,
+    telegram_message_id TEXT,
+    last_notified_priority TEXT CHECK (
+        last_notified_priority IS NULL OR last_notified_priority IN ({",".join(repr(v) for v in sorted(PRIORITIES))})
+    ),
+    last_notified_status TEXT CHECK (
+        last_notified_status IS NULL OR last_notified_status IN ({",".join(repr(v) for v in sorted(STATUSES))})
+    ),
+    failure_count INTEGER NOT NULL DEFAULT 0 CHECK (failure_count >= 0),
+    last_attempt_at REAL,
+    last_success_at REAL
+);
+INSERT INTO attention_notifications
+SELECT * FROM attention_notifications_v1;
+DROP TABLE attention_notifications_v1;
+"""
 
 
 def _apply_migrations(conn: sqlite3.Connection) -> None:
@@ -543,6 +602,17 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
             conn.execute(
                 "INSERT INTO schema_migrations(version, applied_at) VALUES(?, ?)",
                 (1, _now()),
+            )
+            conn.commit()
+        except Exception as exc:
+            conn.rollback()
+            raise AttentionError("attention_migration_failed", 500) from exc
+    if 2 not in applied:
+        try:
+            conn.executescript(f"BEGIN IMMEDIATE;\n{_MIGRATION_2}")
+            conn.execute(
+                "INSERT INTO schema_migrations(version, applied_at) VALUES(?, ?)",
+                (2, _now()),
             )
             conn.commit()
         except Exception as exc:
