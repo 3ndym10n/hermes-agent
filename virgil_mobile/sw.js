@@ -1,4 +1,4 @@
-const SHELL = "virgil-shell-v1";
+const SHELL = "virgil-shell-v2";
 const ASSETS = ["/", "/app.css", "/app.js", "/manifest.webmanifest", "/icons/virgil-192.png", "/icons/virgil-512.png"];
 
 self.addEventListener("install", event => {

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import sqlite3
 import stat
 from pathlib import Path
 from types import SimpleNamespace
@@ -186,6 +187,36 @@ def test_queue_rejects_a_symlink_database(tmp_path):
         attention.list_attention(db_path=link)
 
 
+def test_v1_database_migrates_demonstration_values(tmp_path):
+    db = tmp_path / "attention.db"
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at REAL NOT NULL)"
+        )
+        conn.executescript(attention._MIGRATION_1)
+        conn.execute(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES(?, ?)",
+            (1, 0),
+        )
+    db.chmod(0o600)
+
+    created = attention.upsert_attention(
+        payload(
+            item_type="demonstration",
+            reason_code="product_verification",
+            title="Virgil Mobile test",
+        ),
+        db_path=db,
+    )["item"]
+
+    assert created["item_type"] == "demonstration"
+    with sqlite3.connect(db) as conn:
+        assert [
+            row[0] for row in conn.execute("SELECT version FROM schema_migrations")
+        ] == [1, 2]
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+
+
 def test_gmail_shadow_adapter_labels_without_claiming_a_draft(tmp_path, monkeypatch):
     hermes_home = tmp_path / "hermes"
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
@@ -293,7 +324,10 @@ def test_history_collection_includes_inbox_and_sent_without_label_filter():
     assert {event["kind"] for event in events} == {"inbox", "sent"}
 
 
-def test_private_api_requires_identity_origin_csrf_and_fresh_version(tmp_path):
+def test_private_api_requires_identity_origin_csrf_and_fresh_version(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr("virgil_mobile_server._gmail_watcher_state", lambda: "active")
     db = tmp_path / "attention.db"
     item = attention.upsert_attention(payload(), db_path=db, public_url=PUBLIC_URL)[
         "item"
@@ -318,7 +352,11 @@ def test_private_api_requires_identity_origin_csrf_and_fresh_version(tmp_path):
     session = client.get("/api/session", headers=base_headers)
     assert session.status_code == 200
     assert session.headers["cache-control"] == "no-store"
-    csrf = session.json()["csrf_token"]
+    session_data = session.json()
+    csrf = session_data["csrf_token"]
+    assert session_data["connection"]["virgil"] == "connected"
+    assert session_data["connection"]["gmail_watcher"] == "active"
+    assert session_data["connection"]["last_successful_queue_ingestion_at"]
 
     bad_origin = client.post(
         f"/api/items/{item['item_id']}/action",
@@ -358,6 +396,7 @@ def test_private_api_requires_identity_origin_csrf_and_fresh_version(tmp_path):
 
 def test_service_worker_caches_shell_only():
     worker = (ROOT / "virgil_mobile" / "sw.js").read_text()
+    assert 'const SHELL = "virgil-shell-v2"' in worker
     assets = worker.split("const ASSETS =", 1)[1].split(";", 1)[0]
     assert "/api/" not in assets
     assert "/item/" not in assets
@@ -371,3 +410,12 @@ def test_service_worker_caches_shell_only():
     client = (ROOT / "virgil_mobile" / "app.js").read_text()
     assert 'data-view="needs-you"' in shell
     assert '"needs-you":' in client
+    for message in (
+        "You’re clear for now. New Gmail and Virgil events will appear here automatically.",
+        "No decisions are waiting on you.",
+        "Virgil has no prepared work waiting for review.",
+        "No operational activity has been recorded yet.",
+    ):
+        assert message in client
+    assert "Gmail watcher" in client
+    assert "Virgil could not load live items" in client

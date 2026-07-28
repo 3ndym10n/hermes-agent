@@ -6,6 +6,12 @@ const views = {
   prepared: ["Prepared", "Work Virgil has prepared for review."],
   activity: ["Activity", "Sanitized operational changes, newest first."]
 };
+const emptyViews = {
+  today: "You’re clear for now. New Gmail and Virgil events will appear here automatically.",
+  "needs-you": "No decisions are waiting on you.",
+  prepared: "Virgil has no prepared work waiting for review.",
+  activity: "No operational activity has been recorded yet."
+};
 
 const state = { view: "today", project: "all", csrf: "", items: [], active: null };
 const $ = id => document.getElementById(id);
@@ -32,8 +38,25 @@ function chip(value, extra = "") {
   return node("span", label(value), `chip ${extra}`.trim());
 }
 
+function showConnection(message, connected = false) {
+  const el = $("connection");
+  el.textContent = message;
+  el.classList.toggle("connected", connected);
+  el.hidden = false;
+}
+
 function showOffline(show) {
-  $("connection").hidden = !show;
+  if (show) showConnection("Virgil is offline. Live operational items are unavailable.");
+}
+
+function renderConnection(connection) {
+  const ingestion = connection.last_successful_queue_ingestion_at
+    ? new Date(connection.last_successful_queue_ingestion_at).toLocaleString()
+    : "none yet";
+  showConnection(
+    `Virgil connected · Gmail watcher ${connection.gmail_watcher} · Last successful queue ingestion: ${ingestion}`,
+    true
+  );
 }
 
 async function api(path, options = {}) {
@@ -58,7 +81,7 @@ function empty(message) {
 function renderItems(items) {
   $("count").textContent = String(items.length);
   if (!items.length) {
-    empty("Nothing needs attention here.");
+    empty(emptyViews[state.view]);
     return;
   }
   const cards = items.map(item => {
@@ -81,7 +104,7 @@ function renderItems(items) {
 function renderActivity(events) {
   $("count").textContent = String(events.length);
   if (!events.length) {
-    empty("No recent operational activity.");
+    empty(emptyViews.activity);
     return;
   }
   $("items").replaceChildren(...events.map(event => {
@@ -100,7 +123,8 @@ async function load() {
   $("view-title").textContent = title;
   $("view-note").textContent = note;
   try {
-    if (!state.csrf) state.csrf = (await api("/api/session")).csrf_token;
+    const session = await api("/api/session");
+    state.csrf = session.csrf_token;
     const project = state.project === "all" ? "" : `&project=${encodeURIComponent(state.project)}`;
     if (state.view === "activity") {
       renderActivity((await api(`/api/activity?limit=100${project}`)).events);
@@ -108,9 +132,10 @@ async function load() {
       state.items = (await api(`/api/items?view=${state.view}&limit=100${project}`)).items;
       renderItems(state.items);
     }
-    showOffline(false);
+    renderConnection(session.connection);
   } catch (error) {
-    showOffline(!navigator.onLine);
+    if (navigator.onLine) showConnection("Virgil connection problem.");
+    else showOffline(true);
     empty(navigator.onLine ? `Virgil could not load live items: ${error.message}` : "Live items will return when Virgil reconnects.");
   } finally {
     $("items").setAttribute("aria-busy", "false");
