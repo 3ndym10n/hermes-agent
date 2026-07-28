@@ -755,9 +755,7 @@ def test_customer_question_is_not_an_approved_business_fact(monkeypatch):
 
     grounded = draft_output("The product is available.")
     grounded["supporting_approved_fact_references"] = ["a1"]
-    monkeypatch.setattr(
-        autodraft, "_llm_json", lambda *args, **kwargs: grounded
-    )
+    monkeypatch.setattr(autodraft, "_llm_json", lambda *args, **kwargs: grounded)
     result = autodraft.generate_draft(
         [customer_entry],
         valid_classification(),
@@ -765,6 +763,34 @@ def test_customer_question_is_not_an_approved_business_fact(monkeypatch):
         [],
     )
     assert result["decision"] == "draft_reply"
+
+
+def test_approved_facts_accepts_promoted_retrieval_record(monkeypatch):
+    import gateway.cogitator_intake_bridge as intake_bridge
+
+    monkeypatch.setattr(
+        autodraft, "_bridge_config", lambda: ("https://bridge", "token")
+    )
+    monkeypatch.setattr(
+        intake_bridge,
+        "request_intelligent_retrieval",
+        lambda **kwargs: {
+            "records": [
+                {
+                    "lifecycle_state": "promoted",
+                    "title": "Approved capability",
+                    "core_idea": "The product is available.",
+                }
+            ]
+        },
+    )
+
+    facts = autodraft._approved_facts("product_question")
+
+    assert facts == [
+        {"ref": "a1", "text": "Approved capability The product is available."}
+    ]
+
 
 def test_bounded_shadow_status_and_candidate_limit(private_state, monkeypatch):
     clock = {"now": 1_000.0}
@@ -1428,3 +1454,392 @@ def test_state_corruption_alert_uses_shadow_banner(private_state, monkeypatch):
 
 def test_company_handles_australian_compound_domain():
     assert autodraft._company("person@acme.com.au") == "Acme"
+
+
+@pytest.mark.parametrize(
+    ("message_count", "quoted_size", "attachment_count"),
+    [(20, 500, 5), (13, 22_000, 0)],
+    ids=("aces-admin-shape", "mitchell-shape"),
+)
+def test_long_quoted_threads_bound_each_message_before_cleaning(
+    message_count, quoted_size, attachment_count
+):
+    messages = []
+    for index in range(message_count):
+        source = message(
+            message_id=f"m{index}",
+            thread_id="t1",
+            body=(
+                "New update.\n\n"
+                "On Tue, 1 Jan 2026 at 10:00, Customer wrote:\n> " + "x" * quoted_size
+            ),
+            internal_date=str(index + 1),
+        )
+        if attachment_count:
+            original = source["payload"]
+            source["payload"] = {
+                "mimeType": "multipart/mixed",
+                "headers": original["headers"],
+                "parts": [
+                    {
+                        "mimeType": "text/plain",
+                        "filename": "",
+                        "headers": [],
+                        "body": original["body"],
+                    },
+                    *[
+                        {
+                            "mimeType": "application/octet-stream",
+                            "filename": f"asset{part}.bin",
+                            "headers": [
+                                {
+                                    "name": "Content-Disposition",
+                                    "value": "attachment",
+                                }
+                            ],
+                            "body": {},
+                        }
+                        for part in range(attachment_count)
+                    ],
+                ],
+            }
+        messages.append(source)
+
+    entries = autodraft._thread_entries({"messages": messages})
+
+    assert (
+        message_count * quoted_size > autodraft.MAX_DECODED_BYTES
+        or message_count * (attachment_count + 2) > autodraft.MAX_MIME_PARTS
+    )
+    assert len(entries) == message_count
+    assert sum(len(item["text"]) for item in entries) < autodraft.MAX_MODEL_TEXT
+
+
+def test_single_message_still_obeys_decoded_mime_limit():
+    oversized = message(body="x" * (autodraft.MAX_DECODED_BYTES + 1))
+
+    with pytest.raises(autodraft.AutodraftError, match="thread_too_large"):
+        autodraft._thread_entries({"messages": [oversized]})
+
+
+def test_single_message_still_obeys_mime_part_limit():
+    oversized = message(body="bounded")
+    original = oversized["payload"]
+    oversized["payload"] = {
+        "mimeType": "multipart/mixed",
+        "headers": original["headers"],
+        "parts": [
+            {
+                "mimeType": "application/octet-stream",
+                "filename": f"asset{index}.bin",
+                "headers": [{"name": "Content-Disposition", "value": "attachment"}],
+                "body": {},
+            }
+            for index in range(autodraft.MAX_MIME_PARTS)
+        ],
+    }
+
+    with pytest.raises(autodraft.AutodraftError, match="thread_too_large"):
+        autodraft._thread_entries({"messages": [oversized]})
+
+
+def test_safe_conditional_scheduling_can_be_would_draft(monkeypatch):
+    classification = valid_classification()
+    classification["category"] = "scheduling"
+    customer = entry(subject="Demo timing", text="Could we arrange a demo?")
+    proposed = draft_output("Would you share a suitable time for an online meeting?")
+    proposed["category"] = "scheduling"
+    proposed["subject"] = "Re: Demo timing"
+    monkeypatch.setattr(autodraft, "_llm_json", lambda *args, **kwargs: proposed)
+
+    result = autodraft.generate_draft([customer], classification, [], [])
+
+    assert result["decision"] == "draft_reply"
+    assert result["risk_flags"] == []
+    assert result["missing_facts"] == []
+
+
+def test_unsupported_scheduling_promise_remains_decision_required(monkeypatch):
+    classification = valid_classification()
+    classification["category"] = "scheduling"
+    customer = entry(subject="Demo timing", text="Could we arrange a demo?")
+    proposed = draft_output("Your installation is confirmed for Thursday.")
+    proposed["category"] = "scheduling"
+    proposed["subject"] = "Re: Demo timing"
+    monkeypatch.setattr(autodraft, "_llm_json", lambda *args, **kwargs: proposed)
+
+    with pytest.raises(autodraft.AutodraftError, match="unsupported_claim"):
+        autodraft.generate_draft([customer], classification, [], [])
+
+
+def test_vague_context_stays_below_confidence_gate(monkeypatch):
+    classification = valid_classification()
+    classification.update({
+        "category": "acknowledgement",
+        "confidence": 0.78,
+        "questions_detected": 0,
+    })
+    monkeypatch.setattr(autodraft, "_llm_json", lambda *args, **kwargs: classification)
+
+    result = autodraft.classify_reply([
+        entry(subject="Re: Fwd:", text="Just an update. Still waiting.")
+    ])
+
+    assert result["decision"] == "decision_required"
+    assert result["reason_code"] == "low_confidence"
+
+
+def test_missing_product_fact_remains_blocked(monkeypatch):
+    classification = valid_classification()
+    classification.update({
+        "category": "product_question",
+        "requires_commercial_fact": True,
+        "missing_fact_categories": ["product"],
+    })
+    monkeypatch.setattr(autodraft, "_llm_json", lambda *args, **kwargs: classification)
+
+    result = autodraft.classify_reply([
+        entry(text="Could you provide product information?")
+    ])
+
+    assert result["decision"] == "decision_required"
+    assert result["reason_code"] == "missing_approved_fact"
+    assert result["missing_fact_categories"] == ["product"]
+
+
+def test_cogitator_failure_stays_decision_required_without_mutation(
+    private_state, monkeypatch
+):
+    conn = autodraft._open_state()
+    autodraft._set_meta(conn, "mode", "shadow")
+    conn.commit()
+    metadata = message()
+    thread = {"messages": [metadata]}
+    classification = valid_classification()
+    classification.update({
+        "category": "product_question",
+        "requires_commercial_fact": True,
+    })
+    alerts = []
+    monkeypatch.setattr(autodraft, "_metadata", lambda *args: metadata)
+    monkeypatch.setattr(autodraft, "_metadata_exclusion", lambda value: "")
+    monkeypatch.setattr(autodraft, "_thread", lambda *args: thread)
+    monkeypatch.setattr(autodraft, "_thread_entries", lambda value: [entry()])
+    monkeypatch.setattr(autodraft, "_thread_drafts", lambda *args: [])
+    monkeypatch.setattr(autodraft, "classify_reply", lambda value: classification)
+    monkeypatch.setattr(
+        autodraft,
+        "_approved_facts",
+        lambda category: (_ for _ in ()).throw(
+            autodraft.AutodraftError("cogitator_bridge_failure")
+        ),
+    )
+    monkeypatch.setattr(autodraft, "_notify", lambda *args, **kwargs: True)
+    monkeypatch.setattr(
+        autodraft, "_alert", lambda conn, code, **kwargs: alerts.append(code)
+    )
+    monkeypatch.setattr(
+        autodraft,
+        "_create_reply_draft",
+        lambda *args, **kwargs: pytest.fail("Cogitator failure cannot mutate Gmail"),
+    )
+
+    assert autodraft._process_event(
+        conn,
+        object(),
+        {"message_id": "m1", "thread_id": "t1", "history_id": "8"},
+        autodraft.ACCOUNT_FINGERPRINT,
+    )
+
+    row = conn.execute(
+        "SELECT state,reason_code,draft_id FROM messages WHERE message_id='m1'"
+    ).fetchone()
+    assert tuple(row) == ("decision_required", "missing_approved_fact", "")
+    assert alerts == ["cogitator_bridge_failure"]
+    conn.close()
+
+
+def test_malformed_draft_output_stays_decision_required_without_mutation(
+    private_state, monkeypatch
+):
+    conn = autodraft._open_state()
+    autodraft._set_meta(conn, "mode", "shadow")
+    conn.commit()
+    metadata = message()
+    thread = {"messages": [metadata]}
+    monkeypatch.setattr(autodraft, "_metadata", lambda *args: metadata)
+    monkeypatch.setattr(autodraft, "_metadata_exclusion", lambda value: "")
+    monkeypatch.setattr(autodraft, "_thread", lambda *args: thread)
+    monkeypatch.setattr(autodraft, "_thread_entries", lambda value: [entry()])
+    monkeypatch.setattr(autodraft, "_thread_drafts", lambda *args: [])
+    monkeypatch.setattr(
+        autodraft, "classify_reply", lambda value: valid_classification()
+    )
+    monkeypatch.setattr(autodraft, "_approved_facts", lambda category: [])
+    monkeypatch.setattr(autodraft, "_writing_guidance", lambda category: [])
+    monkeypatch.setattr(
+        autodraft,
+        "generate_draft",
+        lambda *args: (_ for _ in ()).throw(
+            autodraft.AutodraftError("malformed_model_output")
+        ),
+    )
+    monkeypatch.setattr(autodraft, "_notify", lambda *args, **kwargs: True)
+    monkeypatch.setattr(
+        autodraft,
+        "_create_reply_draft",
+        lambda *args, **kwargs: pytest.fail("malformed output cannot mutate Gmail"),
+    )
+
+    assert autodraft._process_event(
+        conn,
+        object(),
+        {"message_id": "m1", "thread_id": "t1", "history_id": "8"},
+        autodraft.ACCOUNT_FINGERPRINT,
+    )
+
+    row = conn.execute(
+        "SELECT state,reason_code,draft_id FROM messages WHERE message_id='m1'"
+    ).fetchone()
+    assert tuple(row) == ("decision_required", "malformed_model_output", "")
+    conn.close()
+
+
+def test_repeated_gmail_failure_pauses_and_preserves_watermark(
+    private_state, monkeypatch
+):
+    conn = autodraft._open_state()
+    autodraft._set_meta(conn, "mode", "shadow")
+    autodraft._set_meta(conn, "history_watermark", "100")
+    autodraft._set_meta(
+        conn,
+        f"alert_{autodraft._sha('processing_failure')[:16]}",
+        str(autodraft._now()),
+    )
+    conn.commit()
+    conn.close()
+    event = {"message_id": "m1", "thread_id": "t1", "history_id": "101"}
+    metadata_calls = {"count": 0}
+    sent = _capture_telegram(monkeypatch)
+    monkeypatch.setattr(
+        autodraft,
+        "_profile",
+        lambda service: {
+            "history_id": "200",
+            "account_fingerprint": autodraft.ACCOUNT_FINGERPRINT,
+        },
+    )
+    monkeypatch.setattr(
+        autodraft, "collect_history_events", lambda *args: ([event], "200")
+    )
+
+    def fail_metadata(*args):
+        metadata_calls["count"] += 1
+        raise autodraft.AutodraftError("gmail_api_failure")
+
+    monkeypatch.setattr(autodraft, "_metadata", fail_metadata)
+    monkeypatch.setattr(
+        autodraft,
+        "_create_reply_draft",
+        lambda *args, **kwargs: pytest.fail("processing failure cannot mutate Gmail"),
+    )
+
+    assert autodraft.run_once(service=object())["status"] == "retry_pending"
+    assert autodraft.run_once(service=object())["status"] == "retry_pending"
+    stopped = autodraft.run_once(service=object())
+
+    assert stopped == {
+        "status": "shadow_safety_hold",
+        "mode": "disabled",
+        "reason": "processing_failure",
+        "checkpoint_advanced": False,
+    }
+    conn = autodraft._open_state()
+    assert autodraft._mode(conn) == "disabled"
+    assert autodraft._meta(conn, "resume_mode") == "shadow"
+    assert autodraft._meta(conn, "shadow_safety_hold") == "processing_failure"
+    assert autodraft._meta(conn, "history_watermark") == "100"
+    row = conn.execute(
+        "SELECT state,reason_code,draft_id,retry_count FROM messages"
+    ).fetchone()
+    assert tuple(row) == ("decision_required", "processing_failure", "", 2)
+    conn.close()
+    assert metadata_calls["count"] == 3
+    assert len(sent) == 1
+    assert sent[0].startswith(f"{autodraft.SHADOW_BANNER}\n")
+    assert "repeated processing failures" in sent[0]
+    assert autodraft.run_once(service=object()) == {
+        "status": "shadow_safety_hold",
+        "mode": "disabled",
+        "reason": "processing_failure",
+    }
+    assert metadata_calls["count"] == 3
+    assert len(sent) == 1
+    with pytest.raises(
+        autodraft.AutodraftError, match="operator_intervention_required"
+    ):
+        autodraft.set_mode("resume")
+    assert autodraft.set_mode("shadow")["mode"] == "shadow"
+    conn = autodraft._open_state()
+    assert autodraft._meta(conn, "history_watermark") == "100"
+    assert autodraft._meta(conn, "shadow_start_history_watermark") == "100"
+    conn.close()
+
+    resumed = autodraft.run_once(service=object())
+
+    assert resumed == {
+        "status": "ok",
+        "mode": "shadow",
+        "events": 1,
+        "checkpoint_advanced": True,
+    }
+    conn = autodraft._open_state()
+    assert autodraft._mode(conn) == "shadow"
+    assert autodraft._meta(conn, "history_watermark") == "200"
+    conn.close()
+    assert metadata_calls["count"] == 3
+    assert len(sent) == 1
+
+
+def test_exhausted_retry_pauses_before_recovery_metadata_lookup(
+    private_state, monkeypatch
+):
+    conn = autodraft._open_state()
+    autodraft._set_meta(conn, "mode", "shadow")
+    autodraft._set_meta(conn, "history_watermark", "100")
+    event = {"message_id": "m1", "thread_id": "t1", "history_id": "101"}
+    assert autodraft._start_message(conn, event, "t1")[0]
+    conn.execute(
+        "UPDATE messages SET state='failed', reason_code='gmail_api_failure', "
+        "retry_count=2 WHERE message_id='m1'"
+    )
+    conn.commit()
+    sent = _capture_telegram(monkeypatch)
+    monkeypatch.setattr(
+        autodraft,
+        "_metadata",
+        lambda *args: (_ for _ in ()).throw(
+            autodraft.AutodraftError("gmail_api_failure")
+        ),
+    )
+    monkeypatch.setattr(
+        autodraft,
+        "_create_reply_draft",
+        lambda *args, **kwargs: pytest.fail("recovery cannot mutate Gmail"),
+    )
+
+    assert autodraft._process_event(
+        conn, object(), event, autodraft.ACCOUNT_FINGERPRINT
+    )
+
+    assert autodraft._mode(conn) == "disabled"
+    assert autodraft._meta(conn, "resume_mode") == "shadow"
+    assert autodraft._meta(conn, "shadow_safety_hold") == "processing_failure"
+    assert autodraft._meta(conn, "history_watermark") == "100"
+    row = conn.execute(
+        "SELECT state,reason_code,draft_id,retry_count FROM messages"
+    ).fetchone()
+    assert tuple(row) == ("decision_required", "processing_failure", "", 3)
+    assert len(sent) == 1
+    assert sent[0].startswith(f"{autodraft.SHADOW_BANNER}\n")
+    conn.close()
