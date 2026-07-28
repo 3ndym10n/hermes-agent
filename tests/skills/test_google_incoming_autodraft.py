@@ -4,6 +4,7 @@ import base64
 import importlib.util
 import json
 import stat
+import time
 from contextlib import nullcontext
 from email import policy
 from email.parser import BytesParser
@@ -25,6 +26,7 @@ SPEC = importlib.util.spec_from_file_location("incoming_autodraft", SCRIPT)
 assert SPEC and SPEC.loader
 autodraft = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(autodraft)
+REAL_WORKER_LOCK = autodraft._worker_lock
 
 
 @pytest.fixture
@@ -324,8 +326,18 @@ def test_reply_mime_is_one_recipient_threaded_and_draft_only():
     assert parsed["References"] == "<m1@example.com>"
     assert parsed["Cc"] is None and parsed["Bcc"] is None
     assert list(parsed.iter_attachments()) == []
-    assert "messages().send" not in SCRIPT.read_text()
-    assert "drafts().send" not in SCRIPT.read_text()
+    source = SCRIPT.read_text()
+    for mutation in (
+        "messages().send",
+        "drafts().send",
+        "messages().modify",
+        "messages().trash",
+        "messages().delete",
+        "threads().modify",
+        "threads().trash",
+        "threads().delete",
+    ):
+        assert mutation not in source
 
 
 def test_systemd_service_uses_stable_checkout():
@@ -924,3 +936,495 @@ def test_history_gap_requires_explicit_baseline_reset(private_state, monkeypatch
     assert autodraft._meta(conn, "history_gap_intervention_required") == ""
     assert autodraft._meta(conn, "history_watermark") == "200"
     conn.close()
+
+
+
+def _capture_telegram(monkeypatch):
+    sent = []
+
+    def capture(text, *, shadow=False):
+        sent.append(autodraft._telegram_payload(text, shadow=shadow))
+
+    monkeypatch.setattr(autodraft, "_send_telegram", capture)
+    return sent
+
+
+@pytest.mark.parametrize(
+    ("kind", "reason", "confidence", "outcome", "reason_code"),
+    [
+        ("shadowed", "", 0.91, "would-draft", "reply_needed"),
+        (
+            "decision_required",
+            "low_confidence",
+            0.72,
+            "decision-required",
+            "low_confidence",
+        ),
+    ],
+)
+def test_shadow_notification_contract(
+    private_state, monkeypatch, kind, reason, confidence, outcome, reason_code
+):
+    conn = autodraft._open_state()
+    autodraft._set_meta(conn, "mode", "shadow")
+    conn.commit()
+    sent = _capture_telegram(monkeypatch)
+    metadata = message(
+        sender="Ava <ava@acme.com>",
+        subject="Question +61 412 345 678",
+        body="SECRET MAILBOX BODY",
+        internal_date="1704067200000",
+    )
+
+    assert autodraft._notify(
+        conn,
+        metadata,
+        category="information_request",
+        confidence=confidence,
+        kind=kind,
+        reason=reason,
+    )
+
+    assert sent == [
+        "\n".join(
+            [
+                autodraft.SHADOW_BANNER,
+                "Sender: Ava",
+                "Company: Acme",
+                "Subject: Question [phone removed]",
+                "Received (Australia/Sydney): 2024-01-01 11:00:00 AEDT",
+                "Category: information_request",
+                f"Confidence: {round(confidence * 100)}%",
+                f"Outcome: {outcome}",
+                f"Reason code: {reason_code}",
+            ]
+        )
+    ]
+    assert "SECRET MAILBOX BODY" not in sent[0]
+    assert "snippet" not in sent[0].casefold()
+    assert "proposed draft" not in sent[0].casefold()
+    assert "+61 412 345 678" not in sent[0]
+    conn.close()
+
+
+def test_shadow_safety_alert_has_central_banner(private_state, monkeypatch):
+    conn = autodraft._open_state()
+    autodraft._set_meta(conn, "mode", "shadow")
+    conn.commit()
+    sent = _capture_telegram(monkeypatch)
+
+    autodraft._alert(conn, "queue_stuck", immediate=True)
+
+    assert len(sent) == 1
+    assert sent[0].startswith(f"{autodraft.SHADOW_BANNER}\n")
+    conn.close()
+
+
+def test_status_exposes_zero_rollout_counters(private_state):
+    report = autodraft.status()
+
+    assert report["stale_thread_count"] == 0
+    assert report["telegram_notification_failure_count"] == 0
+    assert report["shadow_test"]["stale_thread_count"] == 0
+    assert report["shadow_test"]["telegram_notification_failure_count"] == 0
+
+
+@pytest.mark.parametrize("reason", sorted(autodraft._STALE_THREAD_REASONS))
+def test_each_stale_thread_reason_increments_once(private_state, reason):
+    conn = autodraft._open_state()
+    event = {"message_id": "m1", "thread_id": "t1", "history_id": "5"}
+    assert autodraft._start_message(conn, event, "t1")[0]
+
+    autodraft._finish(conn, "m1", state="ignored", reason=reason)
+    autodraft._finish(conn, "m1", state="ignored", reason=reason)
+
+    assert autodraft._counter(conn, "stale_thread_count") == 1
+    conn.close()
+
+
+def test_status_exposes_nonzero_rollout_counters(private_state, monkeypatch):
+    clock = {"now": 1_000.0}
+    monkeypatch.setattr(autodraft, "_now", lambda: clock["now"])
+    conn = autodraft._open_state()
+    autodraft._set_meta(conn, "mode", "shadow")
+    autodraft._set_meta(conn, "shadow_started_at", "999")
+    event = {"message_id": "m1", "thread_id": "t1", "history_id": "5"}
+    assert autodraft._start_message(conn, event, "t1")[0]
+    clock["now"] = 1_001.0
+    autodraft._finish(conn, "m1", state="ignored", reason="later_reply")
+
+    def fail(*args, **kwargs):
+        raise autodraft.AutodraftError("telegram_notification_failure")
+
+    monkeypatch.setattr(autodraft, "_send_telegram", fail)
+    assert not autodraft._notify(
+        conn,
+        message(internal_date="1704067200000"),
+        category="unclear",
+        confidence=None,
+        kind="decision_required",
+        reason="later_reply",
+    )
+    conn.close()
+
+    report = autodraft.status()
+    assert report["stale_thread_count"] == 1
+    assert report["telegram_notification_failure_count"] == 1
+    assert report["shadow_test"]["stale_thread_count"] == 1
+    assert report["shadow_test"]["telegram_notification_failure_count"] == 1
+
+
+def test_worker_overlap_pauses_preserves_and_resumes_explicitly(
+    private_state, monkeypatch
+):
+    monkeypatch.setattr(autodraft, "_worker_lock", REAL_WORKER_LOCK)
+    conn = autodraft._open_state()
+    autodraft._set_meta(conn, "history_watermark", "100")
+    autodraft._set_meta(conn, "mode", "shadow")
+    autodraft._set_meta(conn, "shadow_started_at", "1000")
+    autodraft._set_meta(conn, "shadow_deadline", "9999999999")
+    autodraft._set_meta(conn, "shadow_candidate_limit", "10")
+    autodraft._set_meta(conn, "policy_fingerprint", "unapproved")
+    conn.commit()
+    conn.close()
+    sent = _capture_telegram(monkeypatch)
+
+    with REAL_WORKER_LOCK():
+        with pytest.raises(autodraft.AutodraftError, match="worker_already_running"):
+            autodraft.run_once(service=object())
+        with pytest.raises(autodraft.AutodraftError, match="worker_already_running"):
+            autodraft.run_once(service=object())
+
+    assert sent == [
+        "\n".join(
+            [
+                autodraft.SHADOW_BANNER,
+                "Overlapping worker execution detected.",
+                "Processing paused.",
+                "No Gmail draft or mutation occurred.",
+                "Operator review and explicit resume are required.",
+            ]
+        )
+    ]
+    conn = autodraft._open_state()
+    assert autodraft._mode(conn) == "disabled"
+    assert autodraft._apply_overlap_hold(conn)
+    assert autodraft._meta(conn, "resume_mode") == "shadow"
+    assert autodraft._meta(conn, "shadow_safety_hold") == "worker_overlap"
+    assert autodraft._meta(conn, "history_watermark") == "100"
+    assert autodraft._meta(conn, "policy_fingerprint") == "unapproved"
+    conn.close()
+
+    monkeypatch.setattr(
+        autodraft,
+        "_profile",
+        lambda service: {
+            "history_id": "200",
+            "account_fingerprint": autodraft.ACCOUNT_FINGERPRINT,
+        },
+    )
+    monkeypatch.setattr(
+        autodraft,
+        "collect_history_events",
+        lambda *args: pytest.fail("safety hold must preserve the checkpoint"),
+    )
+    assert autodraft.run_once(service=object()) == {
+        "status": "shadow_safety_hold",
+        "mode": "disabled",
+        "reason": "worker_overlap",
+    }
+    assert len(sent) == 1
+
+    assert autodraft.set_mode("resume")["mode"] == "shadow"
+    resumed_status = autodraft.status()
+    assert resumed_status["shadow_test"]["stop_reason"] == ""
+    conn = autodraft._open_state()
+    assert autodraft._meta(conn, "shadow_stopped_at") == ""
+    conn.close()
+    seen = []
+
+    def collect(service, checkpoint):
+        seen.append(checkpoint)
+        return [], "101"
+
+    monkeypatch.setattr(autodraft, "collect_history_events", collect)
+    assert autodraft.run_once(service=object())["status"] == "ok"
+    assert seen == ["100"]
+    conn = autodraft._open_state()
+    assert autodraft._meta(conn, "history_watermark") == "101"
+    assert autodraft._meta(conn, "worker_overlap_intervention_required") == ""
+    conn.close()
+
+
+def test_worker_overlap_alert_failure_remains_paused_and_is_not_retried(
+    private_state, monkeypatch
+):
+    monkeypatch.setattr(autodraft, "_worker_lock", REAL_WORKER_LOCK)
+    conn = autodraft._open_state()
+    autodraft._set_meta(conn, "history_watermark", "100")
+    autodraft._set_meta(conn, "mode", "shadow")
+    conn.commit()
+    conn.close()
+    attempts = []
+
+    def fail(text, *, shadow=False):
+        attempts.append(autodraft._telegram_payload(text, shadow=shadow))
+        raise autodraft.AutodraftError("telegram_notification_failure")
+
+    monkeypatch.setattr(autodraft, "_send_telegram", fail)
+    with REAL_WORKER_LOCK():
+        with pytest.raises(autodraft.AutodraftError, match="worker_already_running"):
+            autodraft.run_once(service=object())
+        with pytest.raises(autodraft.AutodraftError, match="worker_already_running"):
+            autodraft.run_once(service=object())
+
+    assert len(attempts) == 1
+    assert attempts[0].startswith(f"{autodraft.SHADOW_BANNER}\n")
+    conn = autodraft._open_state()
+    assert autodraft._mode(conn) == "disabled"
+    assert autodraft._apply_overlap_hold(conn)
+    assert autodraft._meta(conn, "history_watermark") == "100"
+    assert autodraft._meta(conn, "overlap_alert_state") == "failed"
+    assert autodraft._meta(conn, "last_notification_error_code") == (
+        "telegram_notification_failure"
+    )
+    assert autodraft._counter(conn, "telegram_failures") == 1
+    conn.close()
+
+    monkeypatch.setattr(
+        autodraft,
+        "_profile",
+        lambda service: {
+            "history_id": "200",
+            "account_fingerprint": autodraft.ACCOUNT_FINGERPRINT,
+        },
+    )
+    assert autodraft.run_once(service=object()) == {
+        "status": "shadow_safety_hold",
+        "mode": "disabled",
+        "reason": "worker_overlap",
+    }
+    assert len(attempts) == 1
+
+
+
+def test_overlap_latches_without_waiting_for_sqlite_writer(private_state, monkeypatch):
+    monkeypatch.setattr(autodraft, "_worker_lock", REAL_WORKER_LOCK)
+    conn = autodraft._open_state()
+    autodraft._set_meta(conn, "mode", "shadow")
+    autodraft._set_meta(conn, "history_watermark", "100")
+    conn.commit()
+    conn.close()
+    sent = _capture_telegram(monkeypatch)
+    writer = autodraft._open_state()
+    writer.execute("BEGIN IMMEDIATE")
+    writer.execute("UPDATE meta SET value=value WHERE key=?", ("mode",))
+
+    started = time.monotonic()
+    with REAL_WORKER_LOCK():
+        with pytest.raises(autodraft.AutodraftError, match="worker_already_running"):
+            autodraft.run_once(service=object())
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 1
+    assert len(sent) == 1
+    assert autodraft._mode(writer) == "disabled"
+    writer.rollback()
+    writer.close()
+    monkeypatch.setattr(
+        autodraft,
+        "_profile",
+        lambda service: pytest.fail("overlap hold must latch before Gmail access"),
+    )
+    assert autodraft.run_once(service=object()) == {
+        "status": "shadow_safety_hold",
+        "mode": "disabled",
+        "reason": "worker_overlap",
+    }
+    conn = autodraft._open_state()
+    assert autodraft._meta(conn, "resume_mode") == "shadow"
+    assert autodraft._meta(conn, "history_watermark") == "100"
+    conn.close()
+
+
+def test_overlap_preserves_stronger_existing_safety_hold(private_state):
+    conn = autodraft._open_state()
+    autodraft._set_meta(conn, "mode", "disabled")
+    autodraft._set_meta(conn, "resume_mode", "shadow")
+    autodraft._set_meta(conn, "shadow_safety_hold", "history_gap")
+    autodraft._set_meta(conn, "history_watermark", "100")
+    conn.commit()
+    assert autodraft._create_overlap_hold()
+    assert autodraft._create_marker(autodraft._OVERLAP_ALERT_SENT_FILE)
+
+    assert autodraft._apply_overlap_hold(conn)
+    assert autodraft._meta(conn, "shadow_safety_hold") == "history_gap"
+    assert autodraft._meta(conn, "resume_mode") == "shadow"
+    assert autodraft._meta(conn, "history_watermark") == "100"
+    conn.close()
+    with pytest.raises(autodraft.AutodraftError, match="operator_intervention_required"):
+        autodraft.set_mode("resume")
+    assert autodraft._marker_exists(autodraft._OVERLAP_HOLD_FILE)
+
+
+@pytest.mark.parametrize(
+    ("reason", "later_message"),
+    [
+        (
+            "later_reply",
+            message(
+                message_id="m2",
+                sender="Cal <caleb.bacon@linxio.com>",
+                internal_date="2",
+                labels=["SENT"],
+            ),
+        ),
+        (
+            "newer_external_message",
+            message(message_id="m2", internal_date="2"),
+        ),
+        ("stale_existing_draft", None),
+    ],
+)
+def test_shadow_revalidates_after_generation(
+    private_state, monkeypatch, reason, later_message
+):
+    conn = autodraft._open_state()
+    autodraft._set_meta(conn, "mode", "shadow")
+    conn.commit()
+    metadata = message()
+    stable_thread = {"messages": [metadata]}
+    changed_thread = (
+        {"messages": [metadata, later_message]} if later_message else stable_thread
+    )
+    thread_results = iter([stable_thread, stable_thread, changed_thread])
+    draft_calls = {"count": 0}
+    notifications = []
+
+    monkeypatch.setattr(autodraft, "_metadata", lambda *args: metadata)
+    monkeypatch.setattr(autodraft, "_metadata_exclusion", lambda value: "")
+    monkeypatch.setattr(autodraft, "_thread", lambda *args: next(thread_results))
+
+    def drafts(*args):
+        draft_calls["count"] += 1
+        if reason == "stale_existing_draft" and draft_calls["count"] == 3:
+            return [{"id": "d1"}]
+        return []
+
+    monkeypatch.setattr(autodraft, "_thread_drafts", drafts)
+    monkeypatch.setattr(
+        autodraft, "classify_reply", lambda entries: valid_classification()
+    )
+    monkeypatch.setattr(autodraft, "_approved_facts", lambda category: [])
+    monkeypatch.setattr(autodraft, "_writing_guidance", lambda category: [])
+    monkeypatch.setattr(autodraft, "generate_draft", lambda *args: draft_output())
+    monkeypatch.setattr(
+        autodraft,
+        "_notify",
+        lambda *args, **kwargs: notifications.append(kwargs) or True,
+    )
+    monkeypatch.setattr(
+        autodraft,
+        "_create_reply_draft",
+        lambda *args, **kwargs: pytest.fail("stale shadow work cannot create a draft"),
+    )
+
+    assert autodraft._process_event(
+        conn,
+        object(),
+        {"message_id": "m1", "thread_id": "t1", "history_id": "8"},
+        autodraft.ACCOUNT_FINGERPRINT,
+    )
+
+    row = conn.execute(
+        "SELECT state, reason_code, draft_id FROM messages WHERE message_id=?",
+        ("m1",),
+    ).fetchone()
+    assert row["state"] == "decision_required"
+    assert row["reason_code"] == reason
+    assert row["draft_id"] == ""
+    assert autodraft._counter(conn, "stale_thread_count") == 1
+    assert notifications[-1]["kind"] == "decision_required"
+    assert notifications[-1]["reason"] == reason
+    conn.close()
+
+
+def test_overlap_guard_inside_draft_create_prevents_mutation(private_state):
+    conn = autodraft._open_state()
+    autodraft._set_meta(conn, "mode", "draft")
+    autodraft._set_meta(conn, "history_watermark", "100")
+    conn.commit()
+    assert autodraft._create_overlap_hold()
+    assert autodraft._create_marker(autodraft._OVERLAP_ALERT_SENT_FILE)
+    drafts = DraftResource({"id": "d1"})
+
+    with pytest.raises(autodraft.AutodraftError, match="worker_already_running"):
+        autodraft._create_reply_draft(
+            Service(drafts),
+            entry(),
+            "t1",
+            "Re: Question",
+            "Thanks.",
+            overlap_conn=conn,
+        )
+
+    assert drafts.created is None
+    assert autodraft._mode(conn) == "disabled"
+    assert autodraft._meta(conn, "resume_mode") == "draft"
+    assert autodraft._meta(conn, "history_watermark") == "100"
+    conn.close()
+
+
+def test_shadow_decision_retry_keeps_shadow_contract_after_mode_change(
+    private_state, monkeypatch
+):
+    conn = autodraft._open_state()
+    event = {"message_id": "m1", "thread_id": "t1", "history_id": "8"}
+    assert autodraft._start_message(conn, event, "t1")[0]
+    autodraft._finish(
+        conn,
+        "m1",
+        state="decision_required",
+        category="information_request",
+        reason="low_confidence",
+        notification="failed_shadow",
+    )
+    autodraft._set_meta(conn, "mode", "disabled")
+    conn.commit()
+    sent = _capture_telegram(monkeypatch)
+    monkeypatch.setattr(
+        autodraft,
+        "_metadata",
+        lambda *args: message(internal_date="1704067200000"),
+    )
+
+    autodraft._retry_notifications(conn, object())
+
+    assert len(sent) == 1
+    assert sent[0].startswith(f"{autodraft.SHADOW_BANNER}\n")
+    assert "Outcome: decision-required" in sent[0]
+    assert "Next action:" not in sent[0]
+    assert conn.execute(
+        "SELECT notification_state FROM messages WHERE message_id=?", ("m1",)
+    ).fetchone()[0] == "sent"
+    conn.close()
+
+
+def test_state_corruption_alert_uses_shadow_banner(private_state, monkeypatch):
+    sent = _capture_telegram(monkeypatch)
+
+    def fail():
+        raise autodraft.AutodraftError("state_corruption")
+
+    monkeypatch.setattr(autodraft, "run_once", fail)
+
+    assert autodraft.main(["run-once"]) == 2
+    assert sent == [
+        autodraft.SHADOW_BANNER
+        + "\nHIGH PRIORITY: Linxio autodraft state failed its integrity check. "
+        + "Processing is stopped."
+    ]
+
+
+def test_company_handles_australian_compound_domain():
+    assert autodraft._company("person@acme.com.au") == "Acme"

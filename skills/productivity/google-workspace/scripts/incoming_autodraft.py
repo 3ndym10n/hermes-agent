@@ -20,13 +20,14 @@ import stat
 import subprocess
 import sys
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
 from email.message import EmailMessage
 from email.policy import SMTP
 from email.utils import getaddresses
 from pathlib import Path
 from typing import Any, Mapping
+from zoneinfo import ZoneInfo
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
 _REPO_ROOT = _SCRIPT_DIR.parents[3]
@@ -58,10 +59,26 @@ MAX_RETRIES = 3
 ALERT_COOLDOWN = 6 * 3600
 SHADOW_DURATION_SECONDS = 24 * 3600
 SHADOW_CANDIDATE_LIMIT = 10
+SHADOW_BANNER = "SHADOW ONLY — NO GMAIL DRAFT CREATED"
+SYDNEY_TIMEZONE = ZoneInfo("Australia/Sydney")
+_OVERLAP_HOLD_FILE = "worker-overlap.hold"
+_OVERLAP_ALERT_SENT_FILE = "worker-overlap-alert-sent.hold"
+_OVERLAP_ALERT_FAILED_FILE = "worker-overlap-alert-failed.hold"
+_MUTATION_LOCK_FILE = "gmail-mutation.lock"
 _SHADOW_COUNTERS = (
     "external_human_candidates",
     "duplicate_events_suppressed",
     "prompt_injection_attempts_ignored",
+    "stale_thread_count",
+    "telegram_failures",
+)
+_STALE_THREAD_REASONS = frozenset(
+    {
+        "thread_changed",
+        "later_reply",
+        "newer_external_message",
+        "stale_existing_draft",
+    }
 )
 
 
@@ -264,6 +281,7 @@ _NUMBER_RE = re.compile(
     r"months?|years?|hours?|vehicles?|units?|dollars?))?"
 )
 _URL_RE = re.compile(r"https?://[^\s<>()]+", re.I)
+_PHONE_RE = re.compile(r"(?<!\w)(?:\+?\d[\d(). -]{6,}\d)(?!\w)")
 _REFERENCE_RE = re.compile(r"<[^<>\s]{1,500}>")
 _WORDS_RE = re.compile(r"[a-z]{3,}", re.I)
 _TERMINAL_STATES = frozenset(
@@ -411,6 +429,75 @@ def _open_state() -> sqlite3.Connection:
         raise AutodraftError("state_corruption") from exc
 
 
+def _overlap_marker(name: str) -> Path:
+    return _state_dir() / name
+
+
+def _marker_exists(name: str) -> bool:
+    path = _overlap_marker(name)
+    if not path.exists() and not path.is_symlink():
+        return False
+    _secure_file(path)
+    return True
+
+
+def _create_marker(name: str) -> bool:
+    path = _overlap_marker(name)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags, 0o600)
+    except FileExistsError:
+        _secure_file(path)
+        return False
+    except OSError as exc:
+        raise AutodraftError("state_corruption") from exc
+    try:
+        os.fchmod(fd, 0o600)
+    finally:
+        os.close(fd)
+    return True
+
+
+@contextmanager
+def _mutation_lock():
+    path = _overlap_marker(_MUTATION_LOCK_FILE)
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags, 0o600)
+        os.fchmod(fd, 0o600)
+        metadata = os.fstat(fd)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_mode & 0o077:
+            raise AutodraftError("state_corruption")
+        import fcntl
+
+        fcntl.flock(fd, fcntl.LOCK_EX)
+    except AutodraftError:
+        raise
+    except OSError as exc:
+        raise AutodraftError("state_corruption") from exc
+    try:
+        yield
+    finally:
+        os.close(fd)
+
+
+def _create_overlap_hold() -> bool:
+    with _mutation_lock():
+        return _create_marker(_OVERLAP_HOLD_FILE)
+
+
+def _clear_overlap_markers() -> None:
+    for name in (
+        _OVERLAP_HOLD_FILE,
+        _OVERLAP_ALERT_SENT_FILE,
+        _OVERLAP_ALERT_FAILED_FILE,
+    ):
+        path = _overlap_marker(name)
+        if path.exists() or path.is_symlink():
+            _secure_file(path)
+            path.unlink()
+
+
 @contextmanager
 def _worker_lock():
     path = _state_dir() / "worker.lock"
@@ -425,6 +512,8 @@ def _worker_lock():
 
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError as exc:
+        os.close(fd)
+        _handle_worker_overlap()
         raise AutodraftError("worker_already_running") from exc
     except AutodraftError:
         raise
@@ -458,9 +547,14 @@ def _bump(conn: sqlite3.Connection, key: str, amount: int = 1) -> None:
     _set_meta(conn, key, str(current + amount))
 
 
-def _mode(conn: sqlite3.Connection) -> str:
+def _stored_mode(conn: sqlite3.Connection) -> str:
     value = _meta(conn, "mode", "disabled")
     return value if value in {"disabled", "shadow", "draft"} else "disabled"
+
+
+def _mode(conn: sqlite3.Connection) -> str:
+    return "disabled" if _marker_exists(_OVERLAP_HOLD_FILE) else _stored_mode(conn)
+
 
 def _counter(conn: sqlite3.Connection, key: str) -> int:
     try:
@@ -908,6 +1002,21 @@ def _thread_drafts(service, thread_id: str) -> list[dict]:
     raise AutodraftError("draft_scan_too_large")
 
 
+def _fresh_thread_state(
+    service, thread_id: str, message_id: str, expected_fingerprint: str
+) -> tuple[str, dict, list[dict]]:
+    fresh_thread = _thread(service, thread_id)
+    fresh_entries = _thread_entries(fresh_thread)
+    reason = _target_state(fresh_entries, message_id)
+    if reason:
+        return reason, fresh_thread, fresh_entries
+    if _thread_drafts(service, thread_id):
+        return "stale_existing_draft", fresh_thread, fresh_entries
+    if _thread_fingerprint(fresh_thread) != expected_fingerprint:
+        return "thread_changed", fresh_thread, fresh_entries
+    return "", fresh_thread, fresh_entries
+
+
 def _json_object(text: str) -> dict:
     value = str(text or "").strip()
     if value.startswith("```"):
@@ -1346,6 +1455,14 @@ def _finish(
     draft_id: str = "",
     notification: str = "",
 ) -> None:
+    previous = conn.execute(
+        "SELECT reason_code FROM messages WHERE message_id=?", (message_id,)
+    ).fetchone()
+    if (
+        reason in _STALE_THREAD_REASONS
+        and (not previous or previous["reason_code"] not in _STALE_THREAD_REASONS)
+    ):
+        _bump(conn, "stale_thread_count")
     conn.execute(
         """
         UPDATE messages SET state=?, category=?, reason_code=?,
@@ -1420,6 +1537,7 @@ def _reserve(conn: sqlite3.Connection, message_id: str) -> str:
 def _safe_display(value: str, limit: int) -> str:
     value = re.sub(r"[\x00-\x1f\x7f]+", " ", str(value or ""))
     value = _URL_RE.sub("[link removed]", value)
+    value = _PHONE_RE.sub("[phone removed]", value)
     value = value.replace("<", "[").replace(">", "]")
     value = re.sub(r"\s+", " ", value).strip()
     return value[:limit]
@@ -1430,19 +1548,36 @@ def _company(address: str) -> str:
     if not domain or domain in PUBLIC_DOMAINS or _is_internal(address):
         return "company unknown"
     labels = domain.split(".")
-    if len(labels) < 2 or not re.fullmatch(r"[a-z0-9-]{2,63}", labels[-2]):
+    company_index = (
+        -3
+        if len(labels) >= 3
+        and len(labels[-1]) == 2
+        and labels[-2] in {"co", "com", "edu", "gov", "net", "org"}
+        else -2
+    )
+    if len(labels) < abs(company_index) or not re.fullmatch(
+        r"[a-z0-9-]{2,63}", labels[company_index]
+    ):
         return "company unknown"
-    return labels[-2].replace("-", " ").title()
+    return labels[company_index].replace("-", " ").title()
 
 
-def _send_telegram(text: str) -> None:
+def _telegram_payload(text: str, *, shadow: bool) -> str:
+    return f"{SHADOW_BANNER}\n{text}" if shadow else text
+
+
+def _send_telegram(text: str, *, shadow: bool) -> None:
     _load_runtime_env()
     try:
         from tools.send_message_tool import send_message_tool
 
         result = json.loads(
             send_message_tool(
-                {"action": "send", "target": "telegram", "message": text}
+                {
+                    "action": "send",
+                    "target": "telegram",
+                    "message": _telegram_payload(text, shadow=shadow),
+                }
             )
         )
     except Exception as exc:
@@ -1466,6 +1601,35 @@ _REASON_TEXT = {
 }
 
 
+def _shadow_context(conn: sqlite3.Connection) -> bool:
+    return _stored_mode(conn) == "shadow" or (
+        _stored_mode(conn) == "disabled"
+        and _meta(conn, "resume_mode") == "shadow"
+        and (
+            bool(_meta(conn, "shadow_safety_hold"))
+            or _marker_exists(_OVERLAP_HOLD_FILE)
+        )
+    )
+
+
+def _received_time(message: Mapping) -> str:
+    try:
+        timestamp = int(str(message.get("internalDate") or "0")) / 1000
+        if timestamp <= 0:
+            raise ValueError
+        return datetime.fromtimestamp(timestamp, timezone.utc).astimezone(
+            SYDNEY_TIMEZONE
+        ).strftime("%Y-%m-%d %H:%M:%S %Z")
+    except (OSError, OverflowError, TypeError, ValueError):
+        return "not available"
+
+
+def _record_telegram_failure(conn: sqlite3.Connection) -> None:
+    _bump(conn, "telegram_failures")
+    _set_meta(conn, "last_notification_error_code", "telegram_notification_failure")
+    conn.commit()
+
+
 def _notify(
     conn: sqlite3.Connection,
     metadata: Mapping,
@@ -1475,6 +1639,7 @@ def _notify(
     kind: str,
     reason: str = "",
     missing: list[str] | None = None,
+    shadow: bool | None = None,
 ) -> bool:
     name, address = _sender(metadata)
     subject = _safe_display(_headers(metadata).get("subject", "(no subject)"), 180)
@@ -1484,20 +1649,32 @@ def _notify(
         f"{round(confidence * 100)}%" if confidence is not None else "not available"
     )
     thread_id = str(metadata.get("threadId") or "")
-    if kind == "drafted":
+    if shadow is None:
+        shadow = kind == "shadowed" or _shadow_context(conn)
+    if shadow:
+        outcome = "would-draft" if kind == "shadowed" else "decision-required"
+        reason_code = (
+            "reply_needed"
+            if kind == "shadowed"
+            else reason if reason in REASON_CODES else "processing_failure"
+        )
+        text = (
+            f"Sender: {sender_name}\n"
+            f"Company: {company}\n"
+            f"Subject: {subject}\n"
+            f"Received (Australia/Sydney): {_received_time(metadata)}\n"
+            f"Category: {category or 'unclear'}\n"
+            f"Confidence: {confidence_text}\n"
+            f"Outcome: {outcome}\n"
+            f"Reason code: {reason_code}"
+        )
+    elif kind == "drafted":
         text = (
             "Linxio incoming email\n"
             f"From: {sender_name}\nCompany: {company}\nSubject: {subject}\n"
             f"Category: {category}\nDraft ready for review\n"
             f"Confidence: {confidence_text}\n"
             f"https://mail.google.com/mail/u/0/#inbox/{thread_id}"
-        )
-    elif kind == "shadowed":
-        text = (
-            "Linxio incoming email — shadow mode\n"
-            f"From: {sender_name}\nCompany: {company}\nSubject: {subject}\n"
-            f"Category: {category}\nProposed reply validated; no draft created\n"
-            f"Confidence: {confidence_text}"
         )
     else:
         detail = _REASON_TEXT.get(reason, "A human decision is required.")
@@ -1510,13 +1687,12 @@ def _notify(
             + "Next action: review the Gmail thread and decide the reply."
         )
     try:
-        _send_telegram(text)
+        _send_telegram(text, shadow=shadow)
         _set_meta(conn, "last_telegram_success", str(_now()))
         conn.commit()
         return True
     except AutodraftError:
-        _bump(conn, "telegram_failures")
-        conn.commit()
+        _record_telegram_failure(conn)
         return False
 
 
@@ -1547,16 +1723,75 @@ def _alert(conn: sqlite3.Connection, code: str, *, immediate: bool = False) -> N
     if not text:
         return
     try:
-        _send_telegram(text)
+        _send_telegram(text, shadow=_shadow_context(conn))
     except AutodraftError:
+        _record_telegram_failure(conn)
         return
     _set_meta(conn, key, str(_now()))
     _set_meta(conn, "last_telegram_success", str(_now()))
     conn.commit()
 
 
+def _apply_overlap_hold(conn: sqlite3.Connection) -> bool:
+    if not _marker_exists(_OVERLAP_HOLD_FILE):
+        return False
+    existing_hold = _meta(conn, "shadow_safety_hold")
+    if _meta(conn, "worker_overlap_intervention_required") != "1":
+        current = _stored_mode(conn)
+        if current != "disabled":
+            _set_meta(conn, "resume_mode", current)
+        _set_meta(conn, "mode", "disabled")
+        if current == "shadow" and not existing_hold:
+            _set_meta(conn, "shadow_stopped_at", str(_now()))
+            _set_meta(conn, "shadow_stop_reason", "worker_overlap")
+        if not existing_hold:
+            _set_meta(conn, "shadow_safety_hold", "worker_overlap")
+        _set_meta(conn, "worker_overlap_intervention_required", "1")
+        _set_meta(conn, "last_error_code", "worker_already_running")
+    if _marker_exists(_OVERLAP_ALERT_FAILED_FILE):
+        if _meta(conn, "overlap_alert_state") != "failed":
+            _bump(conn, "telegram_failures")
+            _set_meta(
+                conn,
+                "last_notification_error_code",
+                "telegram_notification_failure",
+            )
+        _set_meta(conn, "overlap_alert_state", "failed")
+    elif _marker_exists(_OVERLAP_ALERT_SENT_FILE):
+        if _meta(conn, "overlap_alert_state") != "sent":
+            _set_meta(conn, "last_telegram_success", str(_now()))
+        _set_meta(conn, "overlap_alert_state", "sent")
+    else:
+        _set_meta(conn, "overlap_alert_state", "pending")
+    conn.commit()
+    return True
+
+
+def _handle_worker_overlap() -> None:
+    if not _create_overlap_hold():
+        return
+    text = (
+        "Overlapping worker execution detected.\n"
+        "Processing paused.\n"
+        "No Gmail draft or mutation occurred.\n"
+        "Operator review and explicit resume are required."
+    )
+    try:
+        _send_telegram(text, shadow=True)
+    except AutodraftError:
+        _create_marker(_OVERLAP_ALERT_FAILED_FILE)
+        return
+    _create_marker(_OVERLAP_ALERT_SENT_FILE)
+
+
 def _create_reply_draft(
-    service, target: dict, thread_id: str, subject: str, body: str
+    service,
+    target: dict,
+    thread_id: str,
+    subject: str,
+    body: str,
+    *,
+    overlap_conn: sqlite3.Connection | None = None,
 ) -> tuple[str, bool]:
     recipients = _addresses(target["address"])
     if len(recipients) != 1 or recipients[0][1] != target["address"]:
@@ -1575,9 +1810,15 @@ def _create_reply_draft(
         }
     }
     try:
-        result = _execute(
-            service.users().drafts().create(userId="me", body=payload)
+        mutation_lock = (
+            _mutation_lock() if overlap_conn is not None else nullcontext()
         )
+        with mutation_lock:
+            if overlap_conn is not None and _apply_overlap_hold(overlap_conn):
+                raise AutodraftError("worker_already_running")
+            result = _execute(
+                service.users().drafts().create(userId="me", body=payload)
+            )
         draft_id = str(result.get("id") or "")
         if not draft_id:
             raise AutodraftError("gmail_response_invalid")
@@ -1600,6 +1841,7 @@ def _decision(
     confidence: float | None,
     missing: list[str] | None = None,
 ) -> None:
+    shadow = _shadow_context(conn)
     _finish(
         conn,
         message_id,
@@ -1607,7 +1849,7 @@ def _decision(
         category=category,
         reason=reason if reason in REASON_CODES else "processing_failure",
         confidence=confidence,
-        notification="pending",
+        notification="pending_shadow" if shadow else "pending",
     )
     notified = _notify(
         conn,
@@ -1617,12 +1859,39 @@ def _decision(
         kind="decision_required",
         reason=reason,
         missing=missing,
+        shadow=shadow,
     )
     conn.execute(
         "UPDATE messages SET notification_state=? WHERE message_id=?",
-        ("sent" if notified else "failed", message_id),
+        ("sent" if notified else "failed_shadow" if shadow else "failed", message_id),
     )
     conn.commit()
+
+
+def _decision_for_changed_thread(
+    conn: sqlite3.Connection,
+    message_id: str,
+    metadata: Mapping,
+    *,
+    category: str,
+    reason: str,
+    confidence: float | None,
+) -> None:
+    if reason == "stale_existing_draft":
+        _bump(conn, "duplicate_drafts_prevented")
+        _bump(conn, "stale_existing_drafts")
+    if reason == "cross_customer_risk":
+        _alert(conn, "cross_customer_risk", immediate=True)
+        _pause_shadow(conn, reason, safety_hold=True)
+        conn.commit()
+    _decision(
+        conn,
+        message_id,
+        metadata,
+        category=category,
+        reason=reason,
+        confidence=confidence,
+    )
 
 
 def _process_event(
@@ -1646,9 +1915,13 @@ def _process_event(
                 reason="processing_failure",
             )
         return True
+    if _apply_overlap_hold(conn):
+        return False
     metadata: dict | None = None
     try:
         metadata = _metadata(service, message_id)
+        if _apply_overlap_hold(conn):
+            return False
         if str(metadata.get("threadId") or "") != event_thread_id:
             raise AutodraftError("thread_changed")
         if existing and existing["state"] == "reserved":
@@ -1728,18 +2001,45 @@ def _process_event(
             _bump(conn, "duplicate_drafts_prevented")
             if state == "stale_draft":
                 _bump(conn, "stale_existing_drafts")
-            _finish(conn, message_id, state=state, reason=reason)
+            shadow = _shadow_context(conn)
+            _finish(
+                conn,
+                message_id,
+                state=state,
+                reason=reason,
+                notification=("pending_shadow" if shadow else "pending")
+                if state == "stale_draft"
+                else "",
+            )
             if state == "stale_draft":
-                _notify(
+                notified = _notify(
                     conn,
                     metadata,
                     category="unclear",
                     confidence=None,
                     kind="decision_required",
                     reason=reason,
+                    shadow=shadow,
                 )
+                conn.execute(
+                    "UPDATE messages SET notification_state=? WHERE message_id=?",
+                    (
+                        "sent"
+                        if notified
+                        else "failed_shadow"
+                        if shadow
+                        else "failed",
+                        message_id,
+                    ),
+                )
+                conn.commit()
             return True
+        original_fingerprint = _thread_fingerprint(thread)
+        if _apply_overlap_hold(conn):
+            return False
         classification = classify_reply(entries)
+        if _apply_overlap_hold(conn):
+            return False
         category = classification["category"]
         confidence = classification["confidence"]
         if classification["decision"] == "ignore":
@@ -1752,6 +2052,21 @@ def _process_event(
                 confidence=confidence,
             )
             return True
+        changed_reason, validated_thread, validated_entries = _fresh_thread_state(
+            service, event_thread_id, message_id, original_fingerprint
+        )
+        if changed_reason:
+            _decision_for_changed_thread(
+                conn,
+                message_id,
+                metadata,
+                category=category,
+                reason=changed_reason,
+                confidence=confidence,
+            )
+            return True
+        validated_fingerprint = _thread_fingerprint(validated_thread)
+        entries = validated_entries
         if classification["decision"] == "decision_required":
             _decision(
                 conn,
@@ -1769,6 +2084,8 @@ def _process_event(
             _set_meta(conn, "last_cogitator_success", str(_now()))
             conn.commit()
         except AutodraftError:
+            if _apply_overlap_hold(conn):
+                return False
             _alert(conn, "cogitator_bridge_failure")
             _decision(
                 conn,
@@ -1781,6 +2098,8 @@ def _process_event(
                 or ["approved facts or writing guidance unavailable"],
             )
             return True
+        if _apply_overlap_hold(conn):
+            return False
         if classification["requires_commercial_fact"] and not approved_facts:
             _decision(
                 conn,
@@ -1798,6 +2117,8 @@ def _process_event(
                 entries, classification, approved_facts, guidance
             )
         except AutodraftError as exc:
+            if _apply_overlap_hold(conn):
+                return False
             _decision(
                 conn,
                 message_id,
@@ -1812,6 +2133,23 @@ def _process_event(
                 confidence=confidence,
             )
             return True
+        if _apply_overlap_hold(conn):
+            return False
+        changed_reason, validated_thread, validated_entries = _fresh_thread_state(
+            service, event_thread_id, message_id, validated_fingerprint
+        )
+        if changed_reason:
+            _decision_for_changed_thread(
+                conn,
+                message_id,
+                metadata,
+                category=category,
+                reason=changed_reason,
+                confidence=proposed.get("confidence", confidence),
+            )
+            return True
+        validated_fingerprint = _thread_fingerprint(validated_thread)
+        entries = validated_entries
         if proposed["decision"] != "draft_reply":
             _decision(
                 conn,
@@ -1833,7 +2171,7 @@ def _process_event(
                 reason="reply_needed",
                 confidence=proposed["confidence"],
                 fingerprint=response_fingerprint,
-                notification="pending",
+                notification="pending_shadow",
             )
             notified = _notify(
                 conn,
@@ -1844,13 +2182,12 @@ def _process_event(
             )
             conn.execute(
                 "UPDATE messages SET notification_state=? WHERE message_id=?",
-                ("sent" if notified else "failed", message_id),
+                ("sent" if notified else "failed_shadow", message_id),
             )
             conn.commit()
             return True
         if _mode(conn) != "draft":
             raise AutodraftError("policy_not_approved")
-        original_fingerprint = _thread_fingerprint(thread)
         fresh_profile = _profile(service)
         if (
             fresh_profile["account_fingerprint"] != account_fingerprint
@@ -1858,25 +2195,6 @@ def _process_event(
             or not _policy_current(conn)
         ):
             raise AutodraftError("policy_not_approved")
-        fresh_thread = _thread(service, event_thread_id)
-        fresh_entries = _thread_entries(fresh_thread)
-        if (
-            _thread_fingerprint(fresh_thread) != original_fingerprint
-            or _target_state(fresh_entries, message_id)
-        ):
-            _decision(
-                conn,
-                message_id,
-                metadata,
-                category=category,
-                reason="thread_changed",
-                confidence=proposed["confidence"],
-            )
-            return True
-        if _thread_drafts(service, event_thread_id):
-            _bump(conn, "duplicate_drafts_prevented")
-            _finish(conn, message_id, state="ignored", reason="existing_draft")
-            return True
         conn.execute(
             "UPDATE messages SET category=?, confidence_bucket=?, "
             "response_fingerprint=?, updated_at=? WHERE message_id=?",
@@ -1902,6 +2220,8 @@ def _process_event(
                 confidence=proposed["confidence"],
             )
             return True
+        if _apply_overlap_hold(conn):
+            return False
         final_profile = _profile(service)
         if (
             final_profile["account_fingerprint"] != ACCOUNT_FINGERPRINT
@@ -1912,10 +2232,8 @@ def _process_event(
         final_thread = _thread(service, event_thread_id)
         final_entries = _thread_entries(final_thread)
         final_reason = _target_state(final_entries, message_id)
-        if _thread_fingerprint(final_thread) != original_fingerprint or final_reason:
-            if final_reason == "cross_customer_risk":
-                _alert(conn, "cross_customer_risk", immediate=True)
-            _decision(
+        if _thread_fingerprint(final_thread) != validated_fingerprint or final_reason:
+            _decision_for_changed_thread(
                 conn,
                 message_id,
                 metadata,
@@ -1926,11 +2244,19 @@ def _process_event(
             return True
         final_drafts = _thread_drafts(service, event_thread_id)
         if final_drafts:
-            _bump(conn, "duplicate_drafts_prevented")
             if len(final_drafts) > 1:
                 _alert(conn, "possible_duplicate_draft", immediate=True)
-            _finish(conn, message_id, state="ignored", reason="existing_draft")
+            _decision_for_changed_thread(
+                conn,
+                message_id,
+                metadata,
+                category=category,
+                reason="stale_existing_draft",
+                confidence=proposed["confidence"],
+            )
             return True
+        if _apply_overlap_hold(conn):
+            return False
         fresh_target = next(
             item for item in final_entries if item["id"] == message_id
         )
@@ -1940,6 +2266,7 @@ def _process_event(
             event_thread_id,
             proposed["subject"],
             proposed["body"],
+            overlap_conn=conn,
         )
         if reconciled:
             _bump(conn, "uncertain_creates_reconciled")
@@ -2005,7 +2332,7 @@ def _process_event(
 
 def _retry_notifications(conn: sqlite3.Connection, service) -> None:
     rows = conn.execute(
-        "SELECT * FROM messages WHERE notification_state='failed' "
+        "SELECT * FROM messages WHERE notification_state IN ('failed','failed_shadow') "
         "AND state IN ('drafted','shadowed','decision_required','stale_draft') "
         "ORDER BY updated_at LIMIT 10"
     ).fetchall()
@@ -2023,6 +2350,10 @@ def _retry_notifications(conn: sqlite3.Connection, service) -> None:
                     else "decision_required"
                 ),
                 reason=row["reason_code"],
+                shadow=(
+                    row["state"] == "shadowed"
+                    or row["notification_state"] == "failed_shadow"
+                ),
             )
             if notified:
                 conn.execute(
@@ -2041,6 +2372,13 @@ def run_once(*, service=None) -> dict:
     with _worker_lock():
         conn = _open_state()
         try:
+            if _apply_overlap_hold(conn):
+                return {
+                    "status": "shadow_safety_hold",
+                    "mode": "disabled",
+                    "reason": _meta(conn, "shadow_safety_hold")
+                    or "worker_overlap",
+                }
             try:
                 service = service or _gmail_service()
                 profile = _profile(service)
@@ -2149,6 +2487,13 @@ def run_once(*, service=None) -> dict:
                 conn.commit()
                 return {"status": "disabled", "mode": mode}
             _retry_notifications(conn, service)
+            if _apply_overlap_hold(conn):
+                return {
+                    "status": "shadow_safety_hold",
+                    "mode": "disabled",
+                    "reason": _meta(conn, "shadow_safety_hold")
+                    or "worker_overlap",
+                }
             try:
                 events, watermark = collect_history_events(service, checkpoint)
             except AutodraftError as exc:
@@ -2178,6 +2523,8 @@ def run_once(*, service=None) -> dict:
                     _pause_shadow(conn, limit_reason, safety_hold=False)
                     shadow_stop = limit_reason
                     break
+            if _apply_overlap_hold(conn):
+                shadow_stop = _meta(conn, "shadow_safety_hold") or "worker_overlap"
             if shadow_stop:
                 safety_hold = _meta(conn, "shadow_safety_hold")
                 if not safety_hold:
@@ -2309,15 +2656,24 @@ def set_mode(mode: str) -> dict:
     try:
         if mode not in {"disabled", "shadow", "draft", "pause", "resume"}:
             raise AutodraftError("invalid_mode")
+        _apply_overlap_hold(conn)
         requested = mode
         current = _mode(conn)
+        overlap_hold = (
+            _meta(conn, "worker_overlap_intervention_required") == "1"
+        )
         if mode == "pause":
             _set_meta(conn, "resume_mode", current if current != "disabled" else "shadow")
             mode = "disabled"
         elif mode == "resume":
             mode = _meta(conn, "resume_mode", "shadow")
-            if mode not in {"shadow", "draft"}:
-                mode = "shadow"
+            allowed = (
+                {"disabled", "shadow", "draft"}
+                if overlap_hold
+                else {"shadow", "draft"}
+            )
+            if mode not in allowed:
+                mode = "disabled" if overlap_hold else "shadow"
         if (
             mode != "disabled"
             and _meta(conn, "history_gap_intervention_required") == "1"
@@ -2329,10 +2685,26 @@ def set_mode(mode: str) -> dict:
             mode != "disabled"
             and requested != "shadow"
             and _meta(conn, "shadow_safety_hold")
+            and not (
+                requested == "resume"
+                and overlap_hold
+                and _meta(conn, "shadow_safety_hold") == "worker_overlap"
+            )
         ):
             raise AutodraftError("operator_intervention_required")
         if mode == "draft" and not _policy_current(conn):
             raise AutodraftError("policy_not_approved")
+        if overlap_hold and requested in {"resume", "shadow"}:
+            conn.execute(
+                "DELETE FROM meta WHERE key='worker_overlap_intervention_required'"
+            )
+            conn.execute("DELETE FROM meta WHERE key='overlap_alert_state'")
+            if _meta(conn, "shadow_safety_hold") == "worker_overlap":
+                conn.execute("DELETE FROM meta WHERE key='shadow_safety_hold'")
+            if requested == "resume" and mode == "shadow":
+                conn.execute("DELETE FROM meta WHERE key='shadow_stopped_at'")
+                conn.execute("DELETE FROM meta WHERE key='shadow_stop_reason'")
+            _clear_overlap_markers()
         if requested == "shadow" and current != "shadow":
             now = _now()
             for key in (
@@ -2422,6 +2794,7 @@ def _systemd_state() -> dict:
 def status() -> dict:
     conn = _open_state()
     try:
+        _apply_overlap_hold(conn)
         today = _now() - 86400
         rows = conn.execute(
             "SELECT state, reason_code, COUNT(*) count FROM messages "
@@ -2512,6 +2885,12 @@ def status() -> dict:
             - _counter(
                 conn, "shadow_base_prompt_injection_attempts_ignored"
             ),
+            "stale_thread_count": _counter(conn, "stale_thread_count")
+            - _counter(conn, "shadow_base_stale_thread_count"),
+            "telegram_notification_failure_count": _counter(
+                conn, "telegram_failures"
+            )
+            - _counter(conn, "shadow_base_telegram_failures"),
             "processing_failures": sum(
                 1
                 for row in shadow_rows
@@ -2564,6 +2943,10 @@ def status() -> dict:
             ),
             "stale_existing_drafts_detected": int(
                 _meta(conn, "stale_existing_drafts", "0")
+            ),
+            "stale_thread_count": _counter(conn, "stale_thread_count"),
+            "telegram_notification_failure_count": _counter(
+                conn, "telegram_failures"
             ),
             "last_cogitator_retrieval_success": _iso(
                 float(_meta(conn, "last_cogitator_success", "0"))
@@ -2776,7 +3159,8 @@ def main(argv: list[str] | None = None) -> int:
             try:
                 _send_telegram(
                     "HIGH PRIORITY: Linxio autodraft state failed its integrity "
-                    "check. Processing is stopped."
+                    "check. Processing is stopped.",
+                    shadow=True,
                 )
             except AutodraftError:
                 pass

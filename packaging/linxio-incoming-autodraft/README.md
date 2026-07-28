@@ -82,9 +82,13 @@ $AUTODRAFT explain decision
 `mode shadow` starts a fresh bounded observation: at most 24 hours or 10 new
 external-human candidates, whichever occurs first. It records only sanitized
 outcomes and aggregate latency, cannot create drafts, and returns to disabled
-mode at the bound. `status.shadow_test` reports the live counters. A
-history-gap, stuck queue, account/auth fault, or cross-customer risk instead
-creates a safety hold without advancing the checkpoint.
+mode at the bound. Every shadow Telegram notification starts with
+`SHADOW ONLY — NO GMAIL DRAFT CREATED`; message-result notifications contain
+only sanitized sender/company/subject, Australia/Sydney received time,
+category, confidence, outcome, and bounded reason code. `status.shadow_test`
+reports the live counters. A history-gap, stuck queue, account/auth fault,
+cross-customer risk, or overlapping worker instead creates a safety hold
+without advancing the checkpoint.
 
 Draft mode is a separate two-step Cal gate:
 
@@ -96,7 +100,9 @@ $AUTODRAFT mode draft
 
 `mode disabled` is the immediate kill switch. `mode pause` remembers the prior
 shadow/draft mode; `mode resume` restores it only when any required draft
-policy approval remains current.
+policy approval remains current. An overlap safety hold also requires this
+explicit resume command; it preserves the Gmail checkpoint and suppresses
+repeat alerts until resolved.
 While ordinarily disabled or paused, each timer tick advances directly to the
 current profile watermark without listing messages. Resuming therefore never
 drains an old-email queue. Safety and history-gap holds are the exception: they
@@ -123,9 +129,10 @@ There is intentionally no historical replay command in V1.
 
 `status` is sanitized and reports mode, account/policy health, timer state,
 poll/watermark time, pending age/count, daily funnel counts, closed ignore
-reasons, duplicate suppression/prevention, stale drafts, Cogitator/Telegram
-success times, auth health, failures, and bounded shadow counts with average and
-maximum processing latency.
+reasons, duplicate suppression/prevention, stale drafts, explicit
+`stale_thread_count` and `telegram_notification_failure_count`,
+Cogitator/Telegram success times, auth health, failures, and bounded shadow
+counts with average and maximum processing latency.
 
 `doctor` performs read-only profile, configuration, permission, policy, and
 timer checks. Routine healthy runs do not notify. High-signal account, OAuth,
