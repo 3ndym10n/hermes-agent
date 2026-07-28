@@ -396,7 +396,7 @@ def test_private_api_requires_identity_origin_csrf_and_fresh_version(
 
 def test_service_worker_caches_shell_only():
     worker = (ROOT / "virgil_mobile" / "sw.js").read_text()
-    assert 'const SHELL = "virgil-shell-v2"' in worker
+    assert 'const SHELL = "virgil-shell-v3"' in worker
     assets = worker.split("const ASSETS =", 1)[1].split(";", 1)[0]
     assert "/api/" not in assets
     assert "/item/" not in assets
@@ -419,3 +419,4 @@ def test_service_worker_caches_shell_only():
         assert message in client
     assert "Gmail watcher" in client
     assert "Virgil could not load live items" in client
+    assert '"stale", "deferred"].includes(item.status)' in client

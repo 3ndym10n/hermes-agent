@@ -197,6 +197,7 @@ function actionButton(text, action, className = "") {
 
 function renderDetail(item, events) {
   state.active = item;
+  const reopenable = ["resolved", "dismissed", "stale", "deferred"].includes(item.status);
   const content = $("detail-content");
   const meta = node("div", undefined, "meta");
   meta.append(chip(item.project), chip(item.item_type), chip(item.priority, item.priority), chip(item.status));
@@ -231,14 +232,14 @@ function renderDetail(item, events) {
     artifact.target = "_blank";
     actions.append(artifact);
   }
-  if (["resolved", "dismissed", "stale"].includes(item.status)) {
+  if (reopenable) {
     actions.append(actionButton("Reopen", "reopen", "primary"));
   } else {
     actions.append(actionButton("Resolve", "resolve", "primary"), actionButton("Defer", "show-defer"), actionButton("Dismiss", "dismiss"));
   }
   grid.append(actions);
 
-  if (!["resolved", "dismissed", "stale"].includes(item.status)) {
+  if (!reopenable) {
     const defer = node("section", undefined, "defer-panel");
     defer.hidden = true;
     defer.id = "defer-panel";
