@@ -20,7 +20,13 @@
       <p class="eyebrow">ATTENTION QUEUE</p>
       <h1>Virgil</h1>
     </div>
-    <button id="refresh" class="icon-button" type="button" aria-label="Refresh live items">↻</button>
+    <div class="header-actions">
+      <button id="source-status" class="status-button" type="button" aria-haspopup="dialog">
+        <span class="status-dot" aria-hidden="true"></span>
+        <span>Sources</span>
+      </button>
+      <button id="refresh" class="icon-button" type="button" aria-label="Refresh live items">↻</button>
+    </div>
   </header>
 
   <div id="connection" class="connection" role="status" hidden>
@@ -36,13 +42,14 @@
       <span id="count" class="count" aria-live="polite"></span>
     </section>
 
+    <section id="today-brief" class="brief" aria-labelledby="brief-title" hidden>
+      <p class="eyebrow">TODAY AT A GLANCE</p>
+      <h3 id="brief-title">Operational brief</h3>
+      <p id="brief-summary"></p>
+    </section>
+
     <nav id="projects" class="chips" aria-label="Filter by project">
       <button type="button" data-project="all" aria-pressed="true">All</button>
-      <button type="button" data-project="linxio" aria-pressed="false">Linxio</button>
-      <button type="button" data-project="cogitator" aria-pressed="false">Cogitator</button>
-      <button type="button" data-project="ecommerce" aria-pressed="false">Ecommerce</button>
-      <button type="button" data-project="personal" aria-pressed="false">Personal</button>
-      <button type="button" data-project="system" aria-pressed="false">System</button>
     </nav>
 
     <section id="items" class="items" aria-live="polite" aria-busy="true"></section>
@@ -54,6 +61,20 @@
       <button id="close-detail" class="icon-button" type="button" aria-label="Close item details">×</button>
     </div>
     <article id="detail-content"></article>
+  </dialog>
+
+  <dialog id="sources-dialog" aria-labelledby="sources-title">
+    <div class="detail-head">
+      <div>
+        <p class="eyebrow">OPERATIONAL CONNECTIONS</p>
+        <h2 id="sources-title">Source status</h2>
+      </div>
+      <button id="close-sources" class="icon-button" type="button" aria-label="Close source status">×</button>
+    </div>
+    <p id="sync-status" class="sync-status">Source status has not loaded.</p>
+    <section id="source-list" class="source-list" aria-live="polite">
+      <p class="empty">Live source status is unavailable.</p>
+    </section>
   </dialog>
 
   <nav class="bottom-nav" aria-label="Primary">

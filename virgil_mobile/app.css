@@ -97,6 +97,26 @@ h3 { margin-bottom: .35rem; font-size: 1.05rem; line-height: 1.25; }
   background: var(--surface);
   font-size: 1.35rem;
 }
+.header-actions { display: flex; gap: .55rem; }
+.status-button {
+  display: flex;
+  min-height: 48px;
+  align-items: center;
+  gap: .45rem;
+  padding: 0 .8rem;
+  border: 1px solid var(--line);
+  border-radius: 1.5rem;
+  color: var(--text);
+  background: var(--surface);
+  font-weight: 700;
+}
+.status-dot {
+  width: .6rem;
+  height: .6rem;
+  border-radius: 50%;
+  background: var(--accent);
+}
+.status-button.problem .status-dot { background: var(--urgent); }
 
 .connection {
   margin: 0 1rem .75rem;
@@ -130,6 +150,16 @@ main { padding: 0 1rem 6.5rem; }
   text-align: center;
   font-weight: 700;
 }
+.brief {
+  margin-top: 1rem;
+  padding: 1rem;
+  border: 1px solid var(--line);
+  border-radius: .85rem;
+  background: var(--surface);
+  box-shadow: var(--shadow);
+}
+.brief h3 { margin-bottom: .35rem; }
+.brief p:last-child { margin-bottom: 0; line-height: 1.45; }
 
 .chips {
   display: flex;
@@ -251,6 +281,24 @@ dialog {
 }
 dialog::backdrop { background: rgb(0 0 0 / 58%); }
 .detail-head { display: flex; align-items: center; justify-content: space-between; }
+.sync-status { color: var(--muted); font-size: .82rem; line-height: 1.4; }
+.source-list { display: grid; gap: .65rem; }
+.source-status {
+  padding: .8rem;
+  border: 1px solid var(--line);
+  border-radius: .7rem;
+  background: var(--surface-2);
+}
+.source-status-head { display: flex; align-items: center; justify-content: space-between; gap: .75rem; }
+.source-status-head span {
+  color: var(--muted);
+  font-size: .72rem;
+  font-weight: 750;
+  text-transform: uppercase;
+}
+.source-status.problem .source-status-head span { color: var(--urgent); }
+.source-status p { margin: .35rem 0 0; color: var(--muted); line-height: 1.4; }
+.source-status time { display: block; margin-top: .35rem; color: var(--muted); font-size: .76rem; }
 .detail-grid { display: grid; gap: .8rem; }
 .detail-block {
   padding: .8rem;

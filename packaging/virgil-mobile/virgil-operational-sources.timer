@@ -1,0 +1,12 @@
+[Unit]
+Description=Synchronize Virgil Mobile operational sources
+
+[Timer]
+OnBootSec=45s
+OnUnitActiveSec=2m
+Persistent=true
+RandomizedDelaySec=15s
+Unit=virgil-operational-sources.service
+
+[Install]
+WantedBy=timers.target

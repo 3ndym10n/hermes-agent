@@ -10,6 +10,7 @@ import secrets
 import subprocess
 import time
 from collections import defaultdict, deque
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -19,9 +20,12 @@ from fastapi.responses import FileResponse, JSONResponse
 
 from hermes_attention import (
     AttentionError,
+    attention_brief,
+    available_projects,
     get_attention,
     list_activity,
     list_attention,
+    list_source_statuses,
     transition_attention,
     validate_public_url,
 )
@@ -72,6 +76,32 @@ def _gmail_watcher_state() -> str:
     except (OSError, subprocess.TimeoutExpired):
         return "paused"
     return "active" if result.returncode == 0 else "paused"
+
+
+def _sync_range(sources: list[dict[str, Any]]) -> tuple[str | None, str | None]:
+    def parsed(value: Any) -> float | None:
+        try:
+            return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
+        except (TypeError, ValueError):
+            return None
+
+    successful = [
+        (timestamp, source["last_successful_sync_at"])
+        for source in sources
+        if (timestamp := parsed(source.get("last_successful_sync_at"))) is not None
+    ]
+    scheduled = [
+        (timestamp, source["next_scheduled_sync_at"])
+        for source in sources
+        if (timestamp := parsed(source.get("next_scheduled_sync_at"))) is not None
+        and bool(source.get("enabled", True))
+        and not bool(source.get("paused", False))
+        and timestamp >= time.time()
+    ]
+    return (
+        max(successful, default=(0, None))[1],
+        min(scheduled, default=(0, None))[1],
+    )
 
 
 def create_app(
@@ -193,6 +223,8 @@ def create_app(
 
     @app.get("/api/session")
     def session():
+        source_statuses = list_source_statuses(db_path=db_path)
+        last_source_sync, next_source_sync = _sync_range(source_statuses)
         latest = next(
             (
                 event
@@ -211,7 +243,23 @@ def create_app(
                 "last_successful_queue_ingestion_at": (
                     latest["timestamp"] if latest else None
                 ),
+                "last_successful_source_sync_at": last_source_sync,
+                "next_scheduled_source_sync_at": next_source_sync,
+                "sources": [
+                    {
+                        key: source.get(key)
+                        for key in (
+                            "source",
+                            "status",
+                            "message",
+                            "last_successful_sync_at",
+                        )
+                    }
+                    for source in source_statuses
+                ],
             },
+            "projects": available_projects(db_path=db_path),
+            "brief": attention_brief(db_path=db_path),
         }
 
     @app.get("/api/items")
