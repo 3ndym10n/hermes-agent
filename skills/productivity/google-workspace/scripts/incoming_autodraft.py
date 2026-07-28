@@ -890,10 +890,10 @@ def _clean_authored_text(message: Mapping) -> str:
 
 
 def _thread_entries(thread: Mapping) -> list[dict]:
-    budget = {"parts": 0, "bytes": 0}
     entries: list[dict] = []
     model_chars = 0
     for message in thread.get("messages", []):
+        budget = {"parts": 0, "bytes": 0}
         payload = message.get("payload")
         if not isinstance(payload, Mapping):
             raise AutodraftError("thread_too_large")
@@ -1395,7 +1395,7 @@ requested fields. Use only supplied evidence refs; never put refs in the body.""
 
 def _start_message(
     conn: sqlite3.Connection, event: Mapping, thread_id: str
-) -> tuple[bool, sqlite3.Row | None]:
+) -> tuple[bool, sqlite3.Row | None, bool]:
     message_id = str(event["message_id"])
     row = conn.execute(
         "SELECT * FROM messages WHERE message_id = ?", (message_id,)
@@ -1403,7 +1403,7 @@ def _start_message(
     if row and row["state"] in _TERMINAL_STATES:
         _bump(conn, "duplicate_events_suppressed")
         conn.commit()
-        return False, row
+        return False, row, False
     now = _now()
     if row:
         retries = int(row["retry_count"]) + 1
@@ -1415,9 +1415,13 @@ def _start_message(
                 (retries, now, message_id),
             )
             conn.commit()
-            return False, conn.execute(
-                "SELECT * FROM messages WHERE message_id=?", (message_id,)
-            ).fetchone()
+            return (
+                False,
+                conn.execute(
+                    "SELECT * FROM messages WHERE message_id=?", (message_id,)
+                ).fetchone(),
+                True,
+            )
         conn.execute(
             "UPDATE messages SET state='processing', retry_count=?, updated_at=? "
             "WHERE message_id=?",
@@ -1440,7 +1444,7 @@ def _start_message(
         )
         _bump(conn, "messages_examined")
     conn.commit()
-    return True, row
+    return True, row, False
 
 
 def _finish(
@@ -1894,6 +1898,40 @@ def _decision_for_changed_thread(
     )
 
 
+def _terminal_processing_failure(
+    conn: sqlite3.Connection,
+    message_id: str,
+    metadata: Mapping | None,
+    *,
+    service=None,
+) -> None:
+    _pause_shadow(conn, "processing_failure", safety_hold=True)
+    conn.commit()
+    if metadata is None and service is not None:
+        try:
+            metadata = _metadata(service, message_id)
+        except AutodraftError:
+            metadata = None
+    if metadata:
+        _decision(
+            conn,
+            message_id,
+            metadata,
+            category="unclear",
+            reason="processing_failure",
+            confidence=None,
+        )
+    else:
+        _finish(
+            conn,
+            message_id,
+            state="decision_required",
+            category="unclear",
+            reason="processing_failure",
+        )
+    _alert(conn, "processing_failure", immediate=True)
+
+
 def _process_event(
     conn: sqlite3.Connection, service, event: Mapping, account_fingerprint: str
 ) -> bool:
@@ -1902,18 +1940,12 @@ def _process_event(
     event_thread_id = str(event.get("thread_id") or "")
     if not message_id or not event_thread_id:
         raise AutodraftError("gmail_response_invalid")
-    should_process, existing = _start_message(conn, event, event_thread_id)
+    should_process, existing, retry_exhausted = _start_message(
+        conn, event, event_thread_id
+    )
     if not should_process:
-        if existing and existing["state"] == "decision_required" and existing["reason_code"] == "processing_failure":
-            metadata = _metadata(service, message_id)
-            _notify(
-                conn,
-                metadata,
-                category=str(existing["category"] or "unclear"),
-                confidence=None,
-                kind="decision_required",
-                reason="processing_failure",
-            )
+        if retry_exhausted:
+            _terminal_processing_failure(conn, message_id, None, service=service)
         return True
     if _apply_overlap_hold(conn):
         return False
@@ -2304,21 +2336,10 @@ def _process_event(
             conn,
             message_id,
             state="failed",
-            reason=(
-                exc.code if exc.code in REASON_CODES else "processing_failure"
-            ),
+            reason=(exc.code if exc.code in REASON_CODES else "processing_failure"),
         )
         if retry_count and int(retry_count[0]) >= MAX_RETRIES - 1:
-            if metadata:
-                _decision(
-                    conn,
-                    message_id,
-                    metadata,
-                    category="unclear",
-                    reason="processing_failure",
-                    confidence=None,
-                )
-            _alert(conn, "processing_failure")
+            _terminal_processing_failure(conn, message_id, metadata)
             return True
         return False
     finally:
