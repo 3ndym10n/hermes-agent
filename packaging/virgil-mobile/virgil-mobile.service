@@ -1,0 +1,29 @@
+[Unit]
+Description=Virgil Mobile private Attention Queue PWA
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/v0id/.hermes/hermes-agent
+ExecStart=/home/v0id/.hermes/hermes-agent/venv/bin/python /home/v0id/.hermes/hermes-agent/virgil_mobile_server.py --port 8788
+Restart=on-failure
+RestartSec=3
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/v0id/.hermes/attention
+ReadOnlyPaths=/home/v0id/.hermes/hermes-agent
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+TimeoutStartSec=30
+TimeoutStopSec=15
+
+[Install]
+WantedBy=default.target

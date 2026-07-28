@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#10171f" media="(prefers-color-scheme: dark)">
+  <meta name="theme-color" content="#f4f7f9" media="(prefers-color-scheme: light)">
+  <meta name="description" content="Private Virgil Attention Queue">
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="icon" href="/icons/virgil-192.png">
+  <link rel="apple-touch-icon" href="/icons/virgil-192.png">
+  <link rel="stylesheet" href="/app.css">
+  <script src="/app.js" defer></script>
+  <title>Virgil</title>
+</head>
+<body>
+  <a class="skip-link" href="#content">Skip to items</a>
+  <header>
+    <div>
+      <p class="eyebrow">ATTENTION QUEUE</p>
+      <h1>Virgil</h1>
+    </div>
+    <button id="refresh" class="icon-button" type="button" aria-label="Refresh live items">↻</button>
+  </header>
+
+  <div id="connection" class="connection" role="status" hidden>
+    Virgil is offline. Live operational items are unavailable.
+  </div>
+
+  <main id="content">
+    <section class="view-heading" aria-labelledby="view-title">
+      <div>
+        <h2 id="view-title">Today</h2>
+        <p id="view-note">Highest-priority unresolved work relevant now.</p>
+      </div>
+      <span id="count" class="count" aria-live="polite"></span>
+    </section>
+
+    <nav id="projects" class="chips" aria-label="Filter by project">
+      <button type="button" data-project="all" aria-pressed="true">All</button>
+      <button type="button" data-project="linxio" aria-pressed="false">Linxio</button>
+      <button type="button" data-project="cogitator" aria-pressed="false">Cogitator</button>
+      <button type="button" data-project="ecommerce" aria-pressed="false">Ecommerce</button>
+      <button type="button" data-project="personal" aria-pressed="false">Personal</button>
+      <button type="button" data-project="system" aria-pressed="false">System</button>
+    </nav>
+
+    <section id="items" class="items" aria-live="polite" aria-busy="true"></section>
+  </main>
+
+  <dialog id="detail" aria-labelledby="detail-title">
+    <div class="detail-head">
+      <p class="eyebrow">ATTENTION ITEM</p>
+      <button id="close-detail" class="icon-button" type="button" aria-label="Close item details">×</button>
+    </div>
+    <article id="detail-content"></article>
+  </dialog>
+
+  <nav class="bottom-nav" aria-label="Primary">
+    <button type="button" data-view="today" aria-current="page"><span>●</span>Today</button>
+    <button type="button" data-view="needs-you"><span>!</span>Needs You</button>
+    <button type="button" data-view="prepared"><span>✓</span>Prepared</button>
+    <button type="button" data-view="activity"><span>↻</span>Activity</button>
+  </nav>
+</body>
+</html>

@@ -957,7 +957,17 @@ def _is_telegram_thread_not_found(error: Exception) -> bool:
     return "thread not found" in str(error).lower()
 
 
-async def _send_telegram(token, chat_id, message, media_files=None, thread_id=None, disable_link_previews=False, force_document=False):
+async def _send_telegram(
+    token,
+    chat_id,
+    message,
+    media_files=None,
+    thread_id=None,
+    disable_link_previews=False,
+    force_document=False,
+    button_url=None,
+    edit_message_id=None,
+):
     """Send via Telegram Bot API (one-shot, no polling needed).
 
     Applies markdown→MarkdownV2 formatting (same as the gateway adapter)
@@ -1042,6 +1052,34 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
         text_kwargs = dict(thread_kwargs)
         if disable_link_previews:
             text_kwargs["disable_web_page_preview"] = True
+        if button_url:
+            from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+            text_kwargs["reply_markup"] = InlineKeyboardMarkup(
+                [[InlineKeyboardButton("Review in Virgil", url=button_url)]]
+            )
+        if edit_message_id is not None:
+            if media_files:
+                return {"error": "Telegram message edits cannot include media"}
+            edit_kwargs = dict(text_kwargs)
+            edit_kwargs.pop("message_thread_id", None)
+            try:
+                await bot.edit_message_text(
+                    chat_id=int_chat_id,
+                    message_id=int(edit_message_id),
+                    text=message,
+                    parse_mode=None,
+                    **edit_kwargs,
+                )
+            except Exception as edit_error:
+                if "message is not modified" not in str(edit_error).lower():
+                    raise
+            return {
+                "success": True,
+                "platform": "telegram",
+                "chat_id": chat_id,
+                "message_id": str(edit_message_id),
+            }
 
         last_msg = None
         warnings = []

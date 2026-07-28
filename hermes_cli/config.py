@@ -1622,6 +1622,13 @@ DEFAULT_CONFIG = {
         "public_url": "",
     },
 
+    # Private Virgil Mobile Attention Queue.  Values are intentionally explicit:
+    # the app refuses to start without an authorised tailnet identity and URL.
+    "attention": {
+        "authorized_tailscale_user": "",
+        "public_url": "",
+    },
+
     # Privacy settings
     "privacy": {
         "redact_pii": False,  # When True, hash user IDs and strip phone numbers from LLM context

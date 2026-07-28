@@ -33,6 +33,7 @@ REAL_WORKER_LOCK = autodraft._worker_lock
 def private_state(tmp_path, monkeypatch):
     root = tmp_path / "incoming-autodraft"
     root.mkdir(mode=0o700)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
     monkeypatch.setattr(autodraft, "_state_dir", lambda: root)
     monkeypatch.setattr(autodraft, "_worker_lock", nullcontext)
     monkeypatch.setattr(
@@ -1011,25 +1012,33 @@ def test_shadow_notification_contract(
         reason=reason,
     )
 
-    assert sent == [
-        "\n".join(
-            [
-                autodraft.SHADOW_BANNER,
-                "Sender: Ava",
-                "Company: Acme",
-                "Subject: Question [phone removed]",
-                "Received (Australia/Sydney): 2024-01-01 11:00:00 AEDT",
-                "Category: information_request",
-                f"Confidence: {round(confidence * 100)}%",
-                f"Outcome: {outcome}",
-                f"Reason code: {reason_code}",
-            ]
-        )
-    ]
-    assert "SECRET MAILBOX BODY" not in sent[0]
-    assert "snippet" not in sent[0].casefold()
-    assert "proposed draft" not in sent[0].casefold()
-    assert "+61 412 345 678" not in sent[0]
+    expected = "\n".join(
+        [
+            autodraft.SHADOW_BANNER,
+            "Sender: Ava",
+            "Company: Acme",
+            "Subject: Question [phone removed]",
+            "Received (Australia/Sydney): 2024-01-01 11:00:00 AEDT",
+            "Category: information_request",
+            f"Confidence: {round(confidence * 100)}%",
+            f"Outcome: {outcome}",
+            f"Reason code: {reason_code}",
+        ]
+    )
+    if kind == "shadowed":
+        from hermes_attention import list_attention
+
+        assert sent == []
+        stored = json.dumps(list_attention(view="prepared"), ensure_ascii=False)
+        assert autodraft.SHADOW_BANNER in stored
+        inspected = stored
+    else:
+        assert sent == [expected]
+        inspected = sent[0]
+    assert "SECRET MAILBOX BODY" not in inspected
+    assert "snippet" not in inspected.casefold()
+    assert "proposed draft" not in inspected.casefold()
+    assert "+61 412 345 678" not in inspected
     conn.close()
 
 
