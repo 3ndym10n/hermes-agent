@@ -21,7 +21,7 @@ import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator, Mapping
+from typing import Any, Iterator, Mapping, cast
 from urllib.parse import quote, urlparse
 from zoneinfo import ZoneInfo
 
@@ -639,7 +639,7 @@ def _append_event(
     )
 
 
-def _item_dict(row: sqlite3.Row) -> dict[str, Any]:
+def _item_dict(row: sqlite3.Row | Mapping[str, Any]) -> dict[str, Any]:
     result = dict(row)
     for field in (
         "due_at",
@@ -940,7 +940,7 @@ def upsert_attention(
 
 def _event_dict(row: sqlite3.Row) -> dict[str, Any]:
     result = dict(row)
-    result["timestamp"] = _iso(result.pop("happened_at"))
+    result["timestamp"] = _iso(cast(float, result.pop("happened_at")))
     return result
 
 
