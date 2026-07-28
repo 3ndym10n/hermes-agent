@@ -4,12 +4,11 @@ from __future__ import annotations
 
 from typing import Any
 
-from attention_telegram import send_attention_notification
+from attention_telegram import deliver_attention_result
 from hermes_attention import (
     AttentionError,
     REASON_CODES,
     prune_attention,
-    record_notification,
     resolve_attention_by_source,
     upsert_attention,
 )
@@ -59,38 +58,7 @@ _URGENT_ALERTS = {
 
 
 def _deliver(result: dict[str, Any]) -> str:
-    plan = result["notification"]
-    if plan["action"] == "none":
-        return "queued"
-    item = result["item"]
-    if plan["action"] == "blocked":
-        record_notification(item["item_id"], success=False)
-        return "failed"
-    heading = {
-        "needs_cal": "Needs You — Linxio",
-        "prepared": "Prepared — Linxio",
-        "safety_hold": "Safety Hold — Linxio",
-    }.get(item["status"], "Virgil — Linxio")
-    message = f"{heading}\n{item['safe_summary']}\n{item['recommended_action']}"
-    try:
-        delivered = send_attention_notification(
-            message,
-            plan["deep_link"],
-            message_id=plan.get("message_id"),
-        )
-        success = bool(delivered.get("success"))
-        record_notification(
-            item["item_id"],
-            success=success,
-            message_id=str(delivered.get("message_id") or "") or None,
-        )
-        return "delivered" if success else "failed"
-    except Exception:
-        try:
-            record_notification(item["item_id"], success=False)
-        except Exception:
-            pass
-        return "failed"
+    return deliver_attention_result(result)
 
 
 def upsert_gmail_outcome(

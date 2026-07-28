@@ -1,0 +1,24 @@
+[Unit]
+Description=Virgil Mobile operational source synchronization
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/v0id/.hermes/hermes-agent
+EnvironmentFile=-/home/v0id/.hermes/.env
+ExecStart=/home/v0id/.hermes/hermes-agent/venv/bin/python -m virgil_operational_sources run
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/v0id/.hermes/attention
+ReadOnlyPaths=/home/v0id/.hermes/hermes-agent
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+TimeoutStartSec=120
+TimeoutStopSec=15

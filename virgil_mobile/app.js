@@ -7,13 +7,12 @@ const views = {
   activity: ["Activity", "Sanitized operational changes, newest first."]
 };
 const emptyViews = {
-  today: "You’re clear for now. New Gmail and Virgil events will appear here automatically.",
-  "needs-you": "No decisions are waiting on you.",
+  today: "You’re clear for now. Connected sources will add important work here automatically.",
+  "needs-you": "No decisions are currently waiting on you.",
   prepared: "Virgil has no prepared work waiting for review.",
-  activity: "No operational activity has been recorded yet."
+  activity: "No recent operational changes."
 };
-
-const state = { view: "today", project: "all", csrf: "", items: [], active: null };
+const state = { view: "today", project: "all", csrf: "", items: [], active: null, sources: {} };
 const $ = id => document.getElementById(id);
 
 function node(tag, text, className) {
@@ -50,13 +49,66 @@ function showOffline(show) {
 }
 
 function renderConnection(connection) {
-  const ingestion = connection.last_successful_queue_ingestion_at
-    ? new Date(connection.last_successful_queue_ingestion_at).toLocaleString()
-    : "none yet";
+  const ingestion = formatTime(connection.last_successful_queue_ingestion_at, "none yet");
+  const sourceSync = formatTime(connection.last_successful_source_sync_at, "none yet");
   showConnection(
-    `Virgil connected · Gmail watcher ${connection.gmail_watcher} · Last successful queue ingestion: ${ingestion}`,
+    `Virgil connected · Gmail watcher ${connection.gmail_watcher} · Queue ingestion: ${ingestion} · Source sync: ${sourceSync}`,
     true
   );
+}
+
+function formatTime(value, fallback = "not yet") {
+  if (!value) return fallback;
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? fallback : date.toLocaleString();
+}
+
+function renderProjects(projects) {
+  const available = Array.isArray(projects) && projects.length ? projects : ["all"];
+  if (!available.includes(state.project)) state.project = "all";
+  $("projects").replaceChildren(...available.map(project => {
+    const button = node("button", label(project));
+    button.type = "button";
+    button.dataset.project = project;
+    button.setAttribute("aria-pressed", String(project === state.project));
+    return button;
+  }));
+}
+
+function renderBrief(brief) {
+  const show = state.view === "today" && Boolean(brief?.summary);
+  $("today-brief").hidden = !show;
+  $("brief-summary").textContent = show
+    ? `${brief.summary}${brief.recommended_action ? ` Recommended next: ${brief.recommended_action}` : ""}`
+    : "";
+}
+
+function renderSources(sources, connection) {
+  const records = Array.isArray(sources) ? sources : [];
+  state.sources = Object.fromEntries(records.map(source => [source.source, source]));
+  const problems = records.filter(source => ["blocked", "degraded", "failed"].includes(source.status));
+  $("source-status").classList.toggle("problem", problems.length > 0);
+  $("source-status").setAttribute(
+    "aria-label",
+    problems.length ? `Open source status, ${problems.length} source issues` : "Open source status"
+  );
+  $("sync-status").textContent = `Last successful sync: ${formatTime(connection.last_successful_source_sync_at)} · Next sync: ${formatTime(connection.next_scheduled_source_sync_at, "not scheduled")}`;
+  if (!records.length) {
+    $("source-list").replaceChildren(node("p", "Source status is not available.", "empty"));
+    return;
+  }
+  $("source-list").replaceChildren(...records.map(source => {
+    const card = node("article", undefined, `source-status ${["blocked", "degraded", "failed"].includes(source.status) ? "problem" : ""}`.trim());
+    const head = node("div", undefined, "source-status-head");
+    head.append(node("strong", label(source.source)), node("span", label(source.status)));
+    card.append(head, node("p", source.message || `${label(source.source)} status is ${label(source.status).toLowerCase()}.`));
+    if (source.last_successful_sync_at) {
+      const sync = node("time", `Last synced ${formatTime(source.last_successful_sync_at)}`);
+      sync.dateTime = source.last_successful_sync_at;
+      card.append(sync);
+    }
+    return card;
+  }));
 }
 
 async function api(path, options = {}) {
@@ -78,10 +130,25 @@ function empty(message) {
   $("items").replaceChildren(el);
 }
 
+function emptyMessage() {
+  if (state.project === "personal") return "Personal is not connected.";
+  if (state.project !== "ecommerce") return emptyViews[state.view];
+  const source = state.sources.ecommerce;
+  if (!source || source.status === "unavailable") {
+    return source?.message || "No trustworthy ecommerce runtime feed is currently available.";
+  }
+  return {
+    today: "Ecommerce is connected; no current work needs attention.",
+    "needs-you": "No ecommerce decisions are currently waiting on you.",
+    prepared: "No ecommerce work is prepared for review.",
+    activity: "No recent ecommerce operational changes."
+  }[state.view];
+}
+
 function renderItems(items) {
   $("count").textContent = String(items.length);
   if (!items.length) {
-    empty(emptyViews[state.view]);
+    empty(emptyMessage());
     return;
   }
   const cards = items.map(item => {
@@ -104,12 +171,14 @@ function renderItems(items) {
 function renderActivity(events) {
   $("count").textContent = String(events.length);
   if (!events.length) {
-    empty(emptyViews.activity);
+    empty(emptyMessage());
     return;
   }
   $("items").replaceChildren(...events.map(event => {
     const el = node("article", undefined, "activity");
-    const title = node("strong", label(event.event_type));
+    const subject = event.title ? ` — ${event.title}` : "";
+    const project = event.project ? ` · ${label(event.project)}` : "";
+    const title = node("strong", `${label(event.event_type)}${project}${subject}`);
     const time = node("time", new Date(event.timestamp).toLocaleString());
     time.dateTime = event.timestamp;
     el.append(title, document.createElement("br"), time, node("p", event.safe_description));
@@ -122,9 +191,13 @@ async function load() {
   const [title, note] = views[state.view];
   $("view-title").textContent = title;
   $("view-note").textContent = note;
+  $("today-brief").hidden = true;
   try {
     const session = await api("/api/session");
     state.csrf = session.csrf_token;
+    renderProjects(session.projects);
+    renderBrief(session.brief);
+    renderSources(session.connection.sources, session.connection);
     const project = state.project === "all" ? "" : `&project=${encodeURIComponent(state.project)}`;
     if (state.view === "activity") {
       renderActivity((await api(`/api/activity?limit=100${project}`)).events);
@@ -318,6 +391,8 @@ document.addEventListener("click", event => {
 });
 
 $("refresh").addEventListener("click", () => void load());
+$("source-status").addEventListener("click", () => $("sources-dialog").showModal());
+$("close-sources").addEventListener("click", () => $("sources-dialog").close());
 $("close-detail").addEventListener("click", () => $("detail").close());
 $("detail").addEventListener("close", () => history.replaceState(null, "", "/"));
 window.addEventListener("offline", () => showOffline(true));

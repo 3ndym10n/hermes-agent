@@ -10,7 +10,11 @@ import re
 from typing import Any
 from urllib.parse import urlparse
 
-from hermes_attention import AttentionError, validate_public_url
+from hermes_attention import (
+    AttentionError,
+    record_notification,
+    validate_public_url,
+)
 
 
 _ITEM_PATH_RE = re.compile(r"^/item/[0-9a-f]{32}$")
@@ -57,3 +61,41 @@ def send_attention_notification(
             edit_message_id=message_id,
         )
     )
+
+
+def deliver_attention_result(result: dict[str, Any]) -> str:
+    """Execute one deterministic queue notification plan."""
+
+    plan = result["notification"]
+    if plan["action"] == "none":
+        return "queued"
+    item = result["item"]
+    if plan["action"] == "blocked":
+        record_notification(item["item_id"], success=False)
+        return "failed"
+    project = str(item["project"]).replace("_", " ").title()
+    heading = {
+        "needs_cal": f"Needs You — {project}",
+        "prepared": f"Prepared — {project}",
+        "safety_hold": f"Safety Hold — {project}",
+    }.get(item["status"], f"Virgil — {project}")
+    message = f"{heading}\n{item['safe_summary']}\n{item['recommended_action']}"
+    try:
+        delivered = send_attention_notification(
+            message,
+            plan["deep_link"],
+            message_id=plan.get("message_id"),
+        )
+        success = bool(delivered.get("success"))
+        record_notification(
+            item["item_id"],
+            success=success,
+            message_id=str(delivered.get("message_id") or "") or None,
+        )
+        return "delivered" if success else "failed"
+    except Exception:
+        try:
+            record_notification(item["item_id"], success=False)
+        except Exception:
+            pass
+        return "failed"
