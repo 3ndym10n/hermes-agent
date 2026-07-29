@@ -1393,6 +1393,63 @@ requested fields. Use only supplied evidence refs; never put refs in the body.""
     return result
 
 
+def queue_depth(conn: sqlite3.Connection) -> dict[str, int]:
+    """Return the sanitized queue breakdown used by both the safety gate and status.
+
+    ``failed`` rows are retried by ``_start_message`` until ``retry_count`` reaches
+    ``MAX_RETRIES``; past that they can never progress again, so they are terminal
+    and must not gate live processing. Counts only — no message content.
+    """
+
+    now = _now()
+    active_ages: list[float] = []
+    retryable_ages: list[float] = []
+    terminal = 0
+    for row in conn.execute(
+        "SELECT state, retry_count, created_at FROM messages "
+        "WHERE state IN ('processing','reserved','failed')"
+    ):
+        age = now - float(row["created_at"])
+        if row["state"] in {"processing", "reserved"}:
+            active_ages.append(age)
+        elif int(row["retry_count"] or 0) >= MAX_RETRIES:
+            terminal += 1
+        else:
+            retryable_ages.append(age)
+    return {
+        "active_processing_count": len(active_ages),
+        "retryable_failed_count": len(retryable_ages),
+        "terminal_failed_count": terminal,
+        "oldest_active_processing_age": round(max(active_ages, default=0)),
+        "oldest_retryable_failed_age": round(max(retryable_ages, default=0)),
+    }
+
+
+def _queue_stuck_age(conn: sqlite3.Connection) -> float:
+    """Seconds that live queue work has been failing to progress.
+
+    Terminal rows are excluded: they are permanently unprocessable, so counting
+    them latched the safety hold on forever. Age is also measured from the later
+    of the row's creation and the moment processing was last resumed — while the
+    worker is paused nothing can progress, so wall-clock age alone re-tripped the
+    hold on the first cycle after every resume, before any work could be drained.
+    Genuinely stuck retryable work still trips the gate once the worker has had a
+    full window to make progress.
+    """
+
+    depth = queue_depth(conn)
+    oldest = max(
+        depth["oldest_active_processing_age"], depth["oldest_retryable_failed_age"]
+    )
+    if not oldest:
+        return 0.0
+    try:
+        resumed_at = float(_meta(conn, "shadow_started_at", "0") or 0)
+    except ValueError:
+        resumed_at = 0.0
+    return min(float(oldest), _now() - resumed_at) if resumed_at else float(oldest)
+
+
 def _start_message(
     conn: sqlite3.Connection, event: Mapping, thread_id: str
 ) -> tuple[bool, sqlite3.Row | None, bool]:
@@ -2558,11 +2615,7 @@ def run_once(*, service=None) -> dict:
                     checkpoint_updated = 0
                 if checkpoint_updated and _now() - checkpoint_updated > 300:
                     _alert(conn, "stale_checkpoint")
-                oldest_pending = conn.execute(
-                    "SELECT MIN(created_at) FROM messages "
-                    "WHERE state IN ('processing','reserved','failed')"
-                ).fetchone()[0]
-                if oldest_pending and _now() - oldest_pending > 300:
+                if _queue_stuck_age(conn) > 300:
                     _alert(conn, "queue_stuck")
                     if mode == "shadow":
                         _pause_shadow(conn, "queue_stuck", safety_hold=True)
@@ -3028,6 +3081,9 @@ def status() -> dict:
             ),
             "pending_count": pending[0],
             "oldest_pending_age_seconds": oldest_age,
+            # Terminal rows stay counted and visible here even though they no
+            # longer gate processing, so a historical failure is never silent.
+            **queue_depth(conn),
             "messages_examined_today": sum(by_state.values()),
             "eligible_messages_today": sum(
                 by_state.get(key, 0)

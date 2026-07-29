@@ -1458,7 +1458,7 @@ def _gmail_meta() -> dict[str, str]:
             check = conn.execute("PRAGMA quick_check").fetchone()
             if not check or check[0] != "ok":
                 raise SourceError("gmail_state_invalid")
-            return {
+            meta = {
                 str(row[0]): str(row[1])
                 for row in conn.execute(
                     "SELECT key,value FROM meta WHERE key IN ("
@@ -1468,6 +1468,15 @@ def _gmail_meta() -> dict[str, str]:
                     "'shadow_safety_hold')"
                 )
             }
+            # Count only. Terminal rows no longer gate the worker, so surface them
+            # here rather than letting a historical failure disappear silently.
+            meta["terminal_failed_count"] = str(
+                conn.execute(
+                    "SELECT COUNT(*) FROM messages "
+                    "WHERE state='failed' AND CAST(retry_count AS INTEGER) >= 3"
+                ).fetchone()[0]
+            )
+            return meta
     except SourceError:
         raise
     except (OSError, sqlite3.DatabaseError) as exc:
@@ -1505,6 +1514,13 @@ def sync_gmail_health(context: SourceContext) -> SourceResult:
     if context.now.timestamp() - last_poll > 300:
         return SourceResult(
             "degraded", "Gmail synchronization has not completed recently."
+        )
+    terminal = meta.get("terminal_failed_count", "0")
+    if terminal not in {"", "0"}:
+        return SourceResult(
+            "active",
+            "Gmail Attention synchronization is active in shadow mode with "
+            f"{terminal} historical failures retained for review.",
         )
     return SourceResult(
         "active", "Gmail Attention synchronization is active in shadow mode."

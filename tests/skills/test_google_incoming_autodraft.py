@@ -1852,3 +1852,150 @@ def test_exhausted_retry_pauses_before_recovery_metadata_lookup(
     assert len(sent) == 1
     assert sent[0].startswith(f"{autodraft.SHADOW_BANNER}\n")
     conn.close()
+
+
+def _seed_queue_row(conn, message_id, state, retry_count, age_seconds):
+    """Insert one queue row directly; no Gmail call, no draft, no mutation."""
+    now = autodraft._now()
+    conn.execute(
+        "INSERT INTO messages(message_id, thread_id, history_id, state, "
+        "retry_count, created_at, updated_at) VALUES(?,?,?,?,?,?,?)",
+        (
+            message_id,
+            f"thread-{message_id}",
+            "3058100",
+            state,
+            retry_count,
+            now - age_seconds,
+            now - age_seconds,
+        ),
+    )
+    conn.commit()
+
+
+def _stuck_conn(private_state, *, resumed_seconds_ago=10_000):
+    conn = autodraft._open_state()
+    autodraft._set_meta(
+        conn, "shadow_started_at", str(autodraft._now() - resumed_seconds_ago)
+    )
+    conn.commit()
+    return conn
+
+
+def test_queue_stuck_trips_on_old_processing_row(private_state):
+    conn = _stuck_conn(private_state)
+    _seed_queue_row(conn, "m-processing", "processing", 0, 900)
+    assert autodraft._queue_stuck_age(conn) > 300
+    conn.close()
+
+
+def test_queue_stuck_trips_on_old_reserved_row(private_state):
+    conn = _stuck_conn(private_state)
+    _seed_queue_row(conn, "m-reserved", "reserved", 0, 900)
+    assert autodraft._queue_stuck_age(conn) > 300
+    conn.close()
+
+
+def test_queue_stuck_trips_on_retryable_failed_row(private_state):
+    conn = _stuck_conn(private_state)
+    _seed_queue_row(conn, "m-retryable", "failed", autodraft.MAX_RETRIES - 1, 900)
+    assert autodraft._queue_stuck_age(conn) > 300
+    assert autodraft.queue_depth(conn)["retryable_failed_count"] == 1
+    conn.close()
+
+
+def test_queue_stuck_ignores_failed_row_at_max_retries(private_state):
+    conn = _stuck_conn(private_state)
+    _seed_queue_row(conn, "m-terminal", "failed", autodraft.MAX_RETRIES, 900)
+    assert autodraft._queue_stuck_age(conn) == 0
+    conn.close()
+
+
+def test_queue_stuck_ignores_rows_past_max_retries(private_state):
+    conn = _stuck_conn(private_state)
+    _seed_queue_row(conn, "m-terminal-2", "failed", autodraft.MAX_RETRIES + 2, 900)
+    assert autodraft._queue_stuck_age(conn) == 0
+    conn.close()
+
+
+def test_terminal_rows_remain_stored_and_visible_in_diagnostics(private_state):
+    conn = _stuck_conn(private_state)
+    _seed_queue_row(conn, "m-terminal", "failed", autodraft.MAX_RETRIES, 900)
+    _seed_queue_row(conn, "m-retryable", "failed", 0, 120)
+    _seed_queue_row(conn, "m-active", "processing", 0, 60)
+    depth = autodraft.queue_depth(conn)
+    assert depth["terminal_failed_count"] == 1
+    assert depth["retryable_failed_count"] == 1
+    assert depth["active_processing_count"] == 1
+    assert depth["oldest_active_processing_age"] >= 60
+    assert depth["oldest_retryable_failed_age"] >= 120
+    # The row itself is still durably present and untouched.
+    row = conn.execute(
+        "SELECT state, retry_count FROM messages WHERE message_id='m-terminal'"
+    ).fetchone()
+    assert row["state"] == "failed"
+    assert int(row["retry_count"]) == autodraft.MAX_RETRIES
+    conn.close()
+
+
+def test_terminal_rows_do_not_block_newer_retryable_work(private_state):
+    """A terminal row must not mask a genuinely stuck newer row, nor gate it."""
+    conn = _stuck_conn(private_state)
+    _seed_queue_row(conn, "m-terminal", "failed", autodraft.MAX_RETRIES, 99_999)
+    assert autodraft._queue_stuck_age(conn) == 0
+    _seed_queue_row(conn, "m-newer", "processing", 0, 900)
+    assert autodraft._queue_stuck_age(conn) > 300
+    conn.close()
+
+
+def test_queue_stuck_grace_window_after_resume(private_state):
+    """Nothing can progress while paused, so age counts from the resume."""
+    conn = autodraft._open_state()
+    _seed_queue_row(conn, "m-retryable", "failed", 0, 99_999)
+    autodraft._set_meta(conn, "shadow_started_at", str(autodraft._now() - 5))
+    conn.commit()
+    assert autodraft._queue_stuck_age(conn) <= 300  # just resumed: grace applies
+    autodraft._set_meta(conn, "shadow_started_at", str(autodraft._now() - 900))
+    conn.commit()
+    assert autodraft._queue_stuck_age(conn) > 300  # still stuck a full window later
+    conn.close()
+
+
+def test_queue_depth_is_counts_only_and_stable_across_repeated_cycles(private_state):
+    conn = _stuck_conn(private_state)
+    _seed_queue_row(conn, "m-terminal", "failed", autodraft.MAX_RETRIES, 900)
+    first = autodraft.queue_depth(conn)
+    for _ in range(3):
+        assert autodraft._queue_stuck_age(conn) == 0
+        assert autodraft.queue_depth(conn)["terminal_failed_count"] == 1
+    assert set(first) == {
+        "active_processing_count",
+        "retryable_failed_count",
+        "terminal_failed_count",
+        "oldest_active_processing_age",
+        "oldest_retryable_failed_age",
+    }
+    assert all(isinstance(v, int) for v in first.values())
+    # counts only: no message ids, subjects, bodies or addresses
+    assert "m-terminal" not in json.dumps(first)
+    conn.close()
+
+
+def test_terminal_rows_do_not_touch_watermark_policy_or_drafts(private_state):
+    conn = _stuck_conn(private_state)
+    autodraft._set_meta(conn, "history_watermark", "3057985")
+    conn.commit()
+    _seed_queue_row(conn, "m-terminal", "failed", autodraft.MAX_RETRIES, 900)
+    autodraft._queue_stuck_age(conn)
+    autodraft.queue_depth(conn)
+    assert autodraft._meta(conn, "history_watermark") == "3057985"
+    assert autodraft._meta(conn, "policy_approved", "") in {"", "false"}
+    assert autodraft._mode(conn) != "draft"
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM messages WHERE draft_id IS NOT NULL "
+            "AND draft_id != ''"
+        ).fetchone()[0]
+        == 0
+    )
+    conn.close()
