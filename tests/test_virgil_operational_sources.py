@@ -837,3 +837,57 @@ def test_orchestrator_lock_prevents_overlap(tmp_path, monkeypatch):
             )
     finally:
         os.close(lock)
+
+
+def test_system_health_reports_gmail_staleness_only_when_worker_should_run(monkeypatch):
+    """A held or disabled worker stops polling by design; only a worker that is
+    supposed to be running should raise the stale finding."""
+
+    stale_poll = str((NOW - timedelta(minutes=30)).timestamp())
+
+    def healthy_units(unit, *, user):
+        del user
+        return {
+            "LoadState": "loaded",
+            "ActiveState": "active",
+            "Result": "success",
+            "NRestarts": "0",
+            "ExecMainStatus": "0",
+            "LastTriggerUSec": NOW.strftime("%a %Y-%m-%d %H:%M:%S UTC"),
+        }
+
+    monkeypatch.setattr(sources, "_unit_state", healthy_units)
+    monkeypatch.setattr(sources, "_attention_db_healthy", lambda _path: True)
+    monkeypatch.setattr(
+        sources, "_run_json", lambda *_args, **_kwargs: _tailscale_status()
+    )
+    monkeypatch.setattr(
+        sources.shutil,
+        "disk_usage",
+        lambda _path: SimpleNamespace(free=20 * 1024**3),
+    )
+
+    def meta(**overrides):
+        base = {
+            "authentication_health": "ok",
+            "last_successful_poll": stale_poll,
+            "history_watermark": "3057985",
+            "verified_account_fingerprint": "fingerprint",
+            "mode": "shadow",
+        }
+        base.update(overrides)
+        return base
+
+    def ids_for(**overrides):
+        monkeypatch.setattr(sources, "_gmail_meta", lambda: meta(**overrides))
+        return {
+            fact.record_id
+            for fact in sources.sync_system(sources.SourceContext(NOW, {})).facts
+        }
+
+    # A worker that should be running and has not polled is a real problem.
+    assert "health:gmail-stale" in ids_for()
+    # A fail-closed safety hold already reports itself; do not duplicate it.
+    assert "health:gmail-stale" not in ids_for(shadow_safety_hold="processing_failure")
+    # A deliberately disabled worker is not polling by design.
+    assert "health:gmail-stale" not in ids_for(mode="disabled")
