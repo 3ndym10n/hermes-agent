@@ -1695,7 +1695,13 @@ def sync_system(context: SourceContext) -> SourceResult:
                 "Pause processing and review the protected Gmail checkpoint state.",
             )
         )
-    if last_poll and context.now.timestamp() - last_poll > 300:
+    # A deliberate pause or fail-closed safety hold stops polling by design, so
+    # staleness then only duplicates the worker's own hold item. sync_gmail_health
+    # already guards this; keep the signal for a worker that should be running.
+    deliberately_idle = bool(
+        gmail.get("mode", "disabled") == "disabled" or gmail.get("shadow_safety_hold")
+    )
+    if last_poll and not deliberately_idle and context.now.timestamp() - last_poll > 300:
         facts.append(
             SourceFact(
                 "system",
