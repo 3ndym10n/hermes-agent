@@ -17,6 +17,7 @@ from hermes_attention import (
 _RECOMMENDATIONS = {
     "blocked_category": "Decide the commercial response.",
     "missing_approved_fact": "Provide or approve the missing fact.",
+    "missing_writing_guidance": "Approve Linxio writing guidance for this category.",
     "conflicting_facts": "Resolve the conflicting facts.",
     "cross_customer_risk": "Review the thread for cross-customer contamination.",
     "unsupported_claim": "Review the unsupported claim.",

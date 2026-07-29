@@ -244,6 +244,11 @@ def test_classifier_requires_exact_closed_schema(monkeypatch):
     assert result["reason_code"] == "low_confidence"
 
 
+def approved_guidance(category=None):
+    """Guidance stands in for Cal's approved rules in tests about other things."""
+    return [{"ref": "g1", "text": "Use a warm, direct tone."}]
+
+
 def draft_output(body="Thanks for your enquiry."):
     return {
         "decision": "draft_reply",
@@ -424,7 +429,7 @@ def test_shadow_pipeline_generates_but_never_creates_draft(
     monkeypatch.setattr(autodraft, "_thread_drafts", lambda *a: [])
     monkeypatch.setattr(autodraft, "classify_reply", lambda value: valid_classification())
     monkeypatch.setattr(autodraft, "_approved_facts", lambda category: [])
-    monkeypatch.setattr(autodraft, "_writing_guidance", lambda category: [])
+    monkeypatch.setattr(autodraft, "_writing_guidance", approved_guidance)
     monkeypatch.setattr(
         autodraft,
         "generate_draft",
@@ -680,7 +685,7 @@ def test_final_reread_aborts_when_new_external_message_arrives(
         autodraft, "classify_reply", lambda value: valid_classification()
     )
     monkeypatch.setattr(autodraft, "_approved_facts", lambda category: [])
-    monkeypatch.setattr(autodraft, "_writing_guidance", lambda category: [])
+    monkeypatch.setattr(autodraft, "_writing_guidance", approved_guidance)
     monkeypatch.setattr(autodraft, "generate_draft", lambda *a: draft_output())
     monkeypatch.setattr(
         autodraft,
@@ -766,7 +771,22 @@ def test_customer_question_is_not_an_approved_business_fact(monkeypatch):
     assert result["decision"] == "draft_reply"
 
 
-def test_approved_facts_accepts_promoted_retrieval_record(monkeypatch):
+def linxio_fact(**changes):
+    """A record that satisfies every deterministic eligibility check."""
+    value = {
+        "lifecycle_state": "promoted",
+        "record_type": autodraft.LINXIO_FACT_RECORD_TYPE,
+        "scope": "linxio",
+        "fact_category": "product",
+        "provenance": "linxio-product-sheet-2026",
+        "title": "Approved capability",
+        "core_idea": "The product is available.",
+    }
+    value.update(changes)
+    return value
+
+
+def _facts_for(monkeypatch, records, category="product_question"):
     import gateway.cogitator_intake_bridge as intake_bridge
 
     monkeypatch.setattr(
@@ -775,22 +795,117 @@ def test_approved_facts_accepts_promoted_retrieval_record(monkeypatch):
     monkeypatch.setattr(
         intake_bridge,
         "request_intelligent_retrieval",
-        lambda **kwargs: {
-            "records": [
-                {
-                    "lifecycle_state": "promoted",
-                    "title": "Approved capability",
-                    "core_idea": "The product is available.",
-                }
-            ]
-        },
+        lambda **kwargs: {"records": records},
     )
+    return autodraft._approved_facts(category)
 
-    facts = autodraft._approved_facts("product_question")
+
+def test_approved_facts_accepts_promoted_retrieval_record(monkeypatch):
+    facts = _facts_for(monkeypatch, [linxio_fact()])
 
     assert facts == [
         {"ref": "a1", "text": "Approved capability The product is available."}
     ]
+
+
+@pytest.mark.parametrize(
+    ("label", "changes"),
+    [
+        # Approval alone must never imply Linxio applicability or relevance.
+        ("record type", {"record_type": "virgil_retrieval_record"}),
+        ("missing record type", {"record_type": None}),
+        ("scope", {"scope": "general"}),
+        ("missing scope", {"scope": None}),
+        ("incompatible category", {"fact_category": "refund"}),
+        ("missing category", {"fact_category": None}),
+        ("missing provenance", {"provenance": ""}),
+        ("superseded by", {"superseded_by": "ki_newer"}),
+        ("superseded flag", {"superseded": True}),
+        ("not approved", {"lifecycle_state": "candidate"}),
+    ],
+)
+def test_approval_alone_cannot_bypass_a_required_check(monkeypatch, label, changes):
+    assert _facts_for(monkeypatch, [linxio_fact(**changes)]) == [], label
+
+
+def test_unrelated_approved_records_never_become_linxio_facts(monkeypatch):
+    """The real promoted store, which retrieval offered as Linxio business facts."""
+    unrelated = [
+        {
+            "lifecycle_state": "promoted",
+            "label": "KNOWLEDGE",
+            "title": "A sponsored X article presents a playbook for AI-agent teams",
+            "core_idea": "Multi-agent leverage comes from operating structure.",
+        },
+        {
+            "lifecycle_state": "promoted",
+            "label": "KNOWLEDGE",
+            "title": "Southeast University graduate Knowledge Graph course README",
+            "core_idea": "A syllabus and bibliography.",
+        },
+        # An operating lesson and a writing-style rule must not cross either.
+        {
+            "lifecycle_state": "approved",
+            "record_type": "virgil_retrieval_record",
+            "title": "Safe Cogitator sprint workflow",
+        },
+        {
+            "lifecycle_state": "promoted",
+            "record_type": "linxio_email_writing_rule",
+            "scope": "linxio",
+            "title": "Use a warm, direct tone.",
+        },
+    ]
+
+    assert _facts_for(monkeypatch, unrelated) == []
+    # A real fact alongside them still comes through, and only that one.
+    assert _facts_for(monkeypatch, [*unrelated, linxio_fact()]) == [
+        {"ref": "a1", "text": "Approved capability The product is available."}
+    ]
+
+
+def test_unresolved_conflict_between_eligible_facts_fails_closed(monkeypatch):
+    with pytest.raises(autodraft.AutodraftError, match="conflicting_facts"):
+        _facts_for(
+            monkeypatch,
+            [
+                linxio_fact(),
+                linxio_fact(
+                    core_idea="The product is discontinued.",
+                    conflicts_with=["ki_other"],
+                ),
+            ],
+        )
+
+
+def test_conflict_on_an_ineligible_record_is_simply_excluded(monkeypatch):
+    """An out-of-scope record cannot manufacture a conflict for this question."""
+    assert (
+        _facts_for(
+            monkeypatch,
+            [linxio_fact(scope="general", conflicts_with=["ki_other"])],
+        )
+        == []
+    )
+
+
+def test_acknowledgement_admits_no_business_facts(monkeypatch):
+    assert _facts_for(monkeypatch, [linxio_fact()], "acknowledgement") == []
+
+
+def test_every_safe_category_maps_to_a_supported_guidance_kind():
+    """Hermes must not ask the bridge for a draft_kind it will reject."""
+    supported = {
+        "general", "proposal_quote", "follow_up", "information_request",
+        "pricing", "payment_terms", "installation", "objection_handling",
+        "initial_outreach", "product_explanation", "scheduling",
+        "deal_progression", "customer_support", "closing_next_step", "other",
+    }
+    for category in autodraft.SAFE_CATEGORIES:
+        assert autodraft.GUIDANCE_KIND.get(category, "general") in supported
+    # Every safe category also has a declared fact scope, even if it is empty.
+    for category in autodraft.SAFE_CATEGORIES:
+        assert category in autodraft.CATEGORY_FACT_CATEGORIES
 
 
 def test_bounded_shadow_status_and_candidate_limit(private_state, monkeypatch):
@@ -1351,7 +1466,7 @@ def test_shadow_revalidates_after_generation(
         autodraft, "classify_reply", lambda entries: valid_classification()
     )
     monkeypatch.setattr(autodraft, "_approved_facts", lambda category: [])
-    monkeypatch.setattr(autodraft, "_writing_guidance", lambda category: [])
+    monkeypatch.setattr(autodraft, "_writing_guidance", approved_guidance)
     monkeypatch.setattr(autodraft, "generate_draft", lambda *args: draft_output())
     monkeypatch.setattr(
         autodraft,
@@ -1685,7 +1800,7 @@ def test_malformed_draft_output_stays_decision_required_without_mutation(
         autodraft, "classify_reply", lambda value: valid_classification()
     )
     monkeypatch.setattr(autodraft, "_approved_facts", lambda category: [])
-    monkeypatch.setattr(autodraft, "_writing_guidance", lambda category: [])
+    monkeypatch.setattr(autodraft, "_writing_guidance", approved_guidance)
     monkeypatch.setattr(
         autodraft,
         "generate_draft",
@@ -2395,7 +2510,7 @@ def test_cross_customer_thread_stops_its_thread_not_the_worker(
         autodraft, "classify_reply", lambda value: valid_classification()
     )
     monkeypatch.setattr(autodraft, "_approved_facts", lambda category: [])
-    monkeypatch.setattr(autodraft, "_writing_guidance", lambda category: [])
+    monkeypatch.setattr(autodraft, "_writing_guidance", approved_guidance)
     monkeypatch.setattr(autodraft, "generate_draft", lambda *args: draft_output())
     # Proof 3 and 7: no draft, no send, no Gmail mutation on any path.
     for mutator in ("_create_reply_draft", "_send_reply"):
@@ -2478,3 +2593,97 @@ def test_cross_customer_thread_stops_its_thread_not_the_worker(
     # Telegram is the fallback for a failed Attention upsert, not a second copy:
     # both items queued, so nothing is duplicated into Telegram.
     assert sent == []
+
+
+def test_no_approved_guidance_is_explicit_and_never_drafts(private_state, monkeypatch):
+    """Empty guidance must stop the reply, not fall back to the model's own style.
+
+    Cal approved no category-free global writing rules, so the six categories he
+    never promoted retrieve nothing. Drafting anyway would use whatever voice the
+    model already has, which Cal never approved.
+    """
+    conn = autodraft._open_state()
+    autodraft._set_meta(conn, "mode", "shadow")
+    conn.commit()
+    metadata = message()
+    monkeypatch.setattr(autodraft, "_metadata", lambda *a: metadata)
+    monkeypatch.setattr(autodraft, "_metadata_exclusion", lambda value: "")
+    monkeypatch.setattr(autodraft, "_thread", lambda *a: {"messages": [metadata]})
+    monkeypatch.setattr(autodraft, "_thread_entries", lambda value: [entry()])
+    monkeypatch.setattr(autodraft, "_thread_drafts", lambda *a: [])
+    monkeypatch.setattr(
+        autodraft, "classify_reply", lambda value: valid_classification()
+    )
+    monkeypatch.setattr(autodraft, "_approved_facts", lambda category: [])
+    monkeypatch.setattr(autodraft, "_writing_guidance", lambda category: [])
+    monkeypatch.setattr(autodraft, "_notify", lambda *a, **k: True)
+    monkeypatch.setattr(
+        autodraft,
+        "generate_draft",
+        lambda *a: pytest.fail("no draft may be generated without approved guidance"),
+    )
+
+    assert (
+        autodraft._process_event(
+            conn,
+            object(),
+            {"message_id": "m1", "thread_id": "t1", "history_id": "8"},
+            autodraft.ACCOUNT_FINGERPRINT,
+        )
+        is True
+    )
+
+    row = conn.execute(
+        "SELECT state,reason_code,draft_id FROM messages"
+    ).fetchone()
+    assert tuple(row) == ("decision_required", "missing_writing_guidance", "")
+    # The worker is not blocked by a missing configuration.
+    assert autodraft._mode(conn) == "shadow"
+    assert autodraft._meta(conn, "shadow_safety_hold") == ""
+    conn.close()
+
+
+def test_conflicting_facts_reach_cal_as_a_conflict_not_a_missing_fact(
+    private_state, monkeypatch
+):
+    conn = autodraft._open_state()
+    autodraft._set_meta(conn, "mode", "shadow")
+    conn.commit()
+    metadata = message()
+    monkeypatch.setattr(autodraft, "_metadata", lambda *a: metadata)
+    monkeypatch.setattr(autodraft, "_metadata_exclusion", lambda value: "")
+    monkeypatch.setattr(autodraft, "_thread", lambda *a: {"messages": [metadata]})
+    monkeypatch.setattr(autodraft, "_thread_entries", lambda value: [entry()])
+    monkeypatch.setattr(autodraft, "_thread_drafts", lambda *a: [])
+    monkeypatch.setattr(
+        autodraft, "classify_reply", lambda value: valid_classification()
+    )
+    monkeypatch.setattr(
+        autodraft,
+        "_approved_facts",
+        lambda category: (_ for _ in ()).throw(
+            autodraft.AutodraftError("conflicting_facts")
+        ),
+    )
+    monkeypatch.setattr(autodraft, "_notify", lambda *a, **k: True)
+    monkeypatch.setattr(
+        autodraft,
+        "generate_draft",
+        lambda *a: pytest.fail("conflicting facts must never reach drafting"),
+    )
+
+    assert (
+        autodraft._process_event(
+            conn,
+            object(),
+            {"message_id": "m1", "thread_id": "t1", "history_id": "8"},
+            autodraft.ACCOUNT_FINGERPRINT,
+        )
+        is True
+    )
+
+    row = conn.execute("SELECT state,reason_code,draft_id FROM messages").fetchone()
+    assert tuple(row) == ("decision_required", "conflicting_facts", "")
+    # A conflict is a real answer, not a bridge outage, so no failure alert fires.
+    assert autodraft._meta(conn, "last_failure_code") != "cogitator_bridge_failure"
+    conn.close()
