@@ -2063,8 +2063,7 @@ def _decision_for_changed_thread(
         _bump(conn, "duplicate_drafts_prevented")
         _bump(conn, "stale_existing_drafts")
     if reason == "cross_customer_risk":
-        _pause_shadow(conn, reason, safety_hold=True)
-        conn.commit()
+        _bump(conn, "cross_customer_threads")
     _decision(
         conn,
         message_id,
@@ -2188,8 +2187,12 @@ def _process_event(
             _bump(conn, "prompt_injection_attempts_ignored")
         target_reason = _target_state(entries, message_id)
         if target_reason == "cross_customer_risk":
-            _pause_shadow(conn, target_reason, safety_hold=True)
-            conn.commit()
+            # A thread with several external senders is a property of that thread,
+            # not of the worker: a customer CC'ing a colleague is routine. It stays
+            # fail-closed per thread (decision_required, no draft, high-priority
+            # alert) but must not stop unrelated threads, which is how a global
+            # safety hold latched the whole worker.
+            _bump(conn, "cross_customer_threads")
             _decision(
                 conn,
                 message_id,
@@ -3174,6 +3177,9 @@ def status() -> dict:
             ),
             "stale_existing_drafts_detected": int(
                 _meta(conn, "stale_existing_drafts", "0")
+            ),
+            "cross_customer_threads": int(
+                _meta(conn, "cross_customer_threads", "0")
             ),
             "stale_thread_count": _counter(conn, "stale_thread_count"),
             "telegram_notification_failure_count": _counter(
