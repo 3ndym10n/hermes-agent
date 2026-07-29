@@ -148,6 +148,32 @@ REASON_CODES = frozenset(
         "processing_failure",
     }
 )
+
+# Internal failure vocabulary recorded for operator diagnostics. Every entry is a
+# fixed literal raised by this module, never message content, so persisting one is
+# safe. Deliberately separate from REASON_CODES: these are never offered to the
+# model as allowed output, and never shown to a customer.
+FAILURE_CODES = frozenset(
+    {
+        "approval_invalid",
+        "cogitator_bridge_failure",
+        "draft_scan_too_large",
+        "gmail_api_failure",
+        "gmail_response_invalid",
+        "history_backlog",
+        "history_gap",
+        "message_not_found",
+        "missing_reply_headers",
+        "model_failure",
+        "oauth_failure",
+        "operator_intervention_required",
+        "policy_not_approved",
+        "state_corruption",
+        "telegram_notification_failure",
+        "worker_already_running",
+        "wrong_account",
+    }
+)
 MISSING_FACT_CATEGORIES = frozenset(
     {
         "product",
@@ -563,6 +589,35 @@ def _counter(conn: sqlite3.Connection, key: str) -> int:
         return 0
 
 
+def _record_failure_code(conn: sqlite3.Connection, code: str) -> None:
+    """Persist which stage failed, so diagnostics are not all 'processing_failure'.
+
+    Only fixed literals from ``FAILURE_CODES`` are stored — never message content,
+    exception text, addresses or secrets. Anything unrecognised is bucketed as
+    ``unexpected_error`` rather than written through.
+    """
+
+    bounded = code if code in FAILURE_CODES else "unexpected_error"
+    _set_meta(conn, "last_failure_code", bounded)
+    _set_meta(conn, "last_failure_at", str(_now()))
+    _bump(conn, f"failure_code_{bounded}")
+    conn.commit()
+
+
+def _failure_code_counts(conn: sqlite3.Connection) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for row in conn.execute(
+        "SELECT key, value FROM meta WHERE key LIKE 'failure_code_%'"
+    ):
+        try:
+            count = int(row["value"])
+        except (TypeError, ValueError):
+            continue
+        if count:
+            counts[str(row["key"])[len("failure_code_") :]] = count
+    return counts
+
+
 def _pause_shadow(
     conn: sqlite3.Connection, reason: str, *, safety_hold: bool
 ) -> None:
@@ -643,6 +698,11 @@ def _execute(request, *, history: bool = False) -> dict:
             raise AutodraftError("history_gap") from exc
         if status in {401, 403}:
             raise AutodraftError("oauth_failure") from exc
+        if status == 404:
+            # The message or thread is gone from the mailbox. Deleting mail is a
+            # normal user action, not a worker fault, so it must stay separable
+            # from a real API failure: retrying a 404 can never succeed.
+            raise AutodraftError("message_not_found") from exc
         raise AutodraftError("gmail_api_failure") from exc
 
 
@@ -2457,6 +2517,16 @@ def _process_event(
         conn.commit()
         return True
     except AutodraftError as exc:
+        _record_failure_code(conn, exc.code)
+        if exc.code == "message_not_found":
+            # The message no longer exists, so no retry can ever succeed and there
+            # is no customer left waiting. Skip it the same way any other
+            # unprocessable message is skipped rather than holding the worker.
+            _finish(
+                conn, message_id, state="ignored", reason="message_not_found"
+            )
+            conn.commit()
+            return True
         retry_count = conn.execute(
             "SELECT retry_count FROM messages WHERE message_id=?", (message_id,)
         ).fetchone()
@@ -3084,6 +3154,10 @@ def status() -> dict:
             # Terminal rows stay counted and visible here even though they no
             # longer gate processing, so a historical failure is never silent.
             **queue_depth(conn),
+            # Which stage failed, not just that something did. Bounded codes only.
+            "last_failure_code": _meta(conn, "last_failure_code"),
+            "last_failure_at": _iso(float(_meta(conn, "last_failure_at", "0") or 0)),
+            "failure_codes": _failure_code_counts(conn),
             "messages_examined_today": sum(by_state.values()),
             "eligible_messages_today": sum(
                 by_state.get(key, 0)
