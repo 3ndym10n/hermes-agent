@@ -2299,3 +2299,182 @@ def test_run_once_incident_replay_deleted_message_after_resume(
     assert autodraft._policy_current(conn) is False
     conn.close()
     assert sent == []
+
+
+def test_cross_customer_thread_stops_its_thread_not_the_worker(
+    private_state, monkeypatch
+):
+    """A multi-sender thread fails closed per thread; the worker keeps going.
+
+    Before the fix this reason called _pause_shadow(safety_hold=True), so one
+    routine thread (a customer CC'ing a colleague) disabled the whole worker and
+    every unrelated email behind it stopped being examined.
+    """
+    import gmail_attention
+
+    conn = autodraft._open_state()
+    autodraft._set_meta(conn, "history_watermark", "100")
+    conn.commit()
+    conn.close()
+    assert autodraft.set_mode("shadow")["mode"] == "shadow"
+
+    sent = _capture_telegram(monkeypatch)
+    attention: list[tuple[str, str, str]] = []
+
+    def capture_attention(**kwargs):
+        attention.append(
+            (kwargs["thread_id"], kwargs["kind"], kwargs["reason"])
+        )
+        return f"att-{len(attention)}"
+
+    monkeypatch.setattr(gmail_attention, "upsert_gmail_outcome", capture_attention)
+
+    threads = {
+        "t1": [
+            entry(
+                id="m0",
+                address="first@example.com",
+                internal_date=0,
+                text="Earlier customer data",
+            ),
+            entry(id="m1", address="person@example.com", internal_date=1),
+        ],
+        "t2": [
+            entry(
+                id="m2",
+                thread_id="t2",
+                address="other@example.com",
+                message_id="<m2@example.com>",
+                internal_date=2,
+            )
+        ],
+    }
+    cycles = [
+        ([{"message_id": "m1", "thread_id": "t1", "history_id": "101"}], "200"),
+        ([{"message_id": "m2", "thread_id": "t2", "history_id": "102"}], "300"),
+    ]
+
+    monkeypatch.setattr(
+        autodraft,
+        "_profile",
+        lambda service: {
+            "history_id": "900",
+            "account_fingerprint": autodraft.ACCOUNT_FINGERPRINT,
+        },
+    )
+    monkeypatch.setattr(
+        autodraft,
+        "collect_history_events",
+        lambda *args: cycles.pop(0) if cycles else ([], "300"),
+    )
+    monkeypatch.setattr(
+        autodraft,
+        "_metadata",
+        lambda service, message_id: message(
+            message_id=message_id,
+            thread_id="t1" if message_id in {"m0", "m1"} else "t2",
+        ),
+    )
+    monkeypatch.setattr(autodraft, "_metadata_exclusion", lambda value: "")
+    monkeypatch.setattr(
+        autodraft,
+        "_thread",
+        lambda service, thread_id: {
+            "id": thread_id,
+            "messages": [
+                message(message_id=item["id"], thread_id=thread_id)
+                for item in threads[thread_id]
+            ],
+        },
+    )
+    monkeypatch.setattr(
+        autodraft, "_thread_entries", lambda value: threads[value["id"]]
+    )
+    monkeypatch.setattr(autodraft, "_thread_drafts", lambda *args: [])
+    monkeypatch.setattr(
+        autodraft, "classify_reply", lambda value: valid_classification()
+    )
+    monkeypatch.setattr(autodraft, "_approved_facts", lambda category: [])
+    monkeypatch.setattr(autodraft, "_writing_guidance", lambda category: [])
+    monkeypatch.setattr(autodraft, "generate_draft", lambda *args: draft_output())
+    # Proof 3 and 7: no draft, no send, no Gmail mutation on any path.
+    for mutator in ("_create_reply_draft", "_send_reply"):
+        if hasattr(autodraft, mutator):
+            monkeypatch.setattr(
+                autodraft,
+                mutator,
+                lambda *a, **k: pytest.fail(f"{mutator} must never run in shadow"),
+            )
+
+    # Cycle 1: the multi-sender thread.
+    first = autodraft.run_once(service=object())
+
+    assert first["status"] == "ok"
+    assert first["mode"] == "shadow"
+    conn = autodraft._open_state()
+    # Proof 2: the thread itself is decision_required for the right reason.
+    row = conn.execute(
+        "SELECT state,reason_code,draft_id FROM messages WHERE message_id='m1'"
+    ).fetchone()
+    assert tuple(row) == ("decision_required", "cross_customer_risk", "")
+    # Proof 4: the worker is still in shadow, with no global safety hold.
+    assert autodraft._mode(conn) == "shadow"
+    assert autodraft._meta(conn, "shadow_safety_hold") == ""
+    assert autodraft._meta(conn, "shadow_stop_reason") != "cross_customer_risk"
+    # The retained protection stays observable.
+    assert autodraft._meta(conn, "cross_customer_threads") == "1"
+    # Proof 8: watermark advanced only once the cycle completed.
+    assert autodraft._meta(conn, "history_watermark") == "200"
+    conn.close()
+
+    # Cycle 2, proof 5: a later unrelated single-sender thread still processes.
+    second = autodraft.run_once(service=object())
+
+    assert second["status"] == "ok"
+    conn = autodraft._open_state()
+    row = conn.execute(
+        "SELECT state,reason_code,draft_id FROM messages WHERE message_id='m2'"
+    ).fetchone()
+    # Proof 1: a normal thread reaches the normal shadow outcome.
+    assert tuple(row) == ("shadowed", "reply_needed", "")
+    assert autodraft._mode(conn) == "shadow"
+    assert autodraft._meta(conn, "shadow_safety_hold") == ""
+    assert autodraft._meta(conn, "history_watermark") == "300"
+    conn.close()
+
+    # Three further clean cycles: still shadow, still no hold, still no drafts.
+    for _ in range(3):
+        assert autodraft.run_once(service=object())["status"] == "ok"
+
+    conn = autodraft._open_state()
+    assert autodraft._mode(conn) == "shadow"
+    assert autodraft._meta(conn, "shadow_safety_hold") == ""
+    # Proof 3 and 7 again, at rest: nothing was ever drafted or sent.
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM messages WHERE state IN ('drafted','sent')"
+        ).fetchone()[0]
+        == 0
+    )
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM messages WHERE draft_id IS NOT NULL "
+            "AND draft_id != ''"
+        ).fetchone()[0]
+        == 0
+    )
+    # policy_approved stays false throughout.
+    assert autodraft._policy_current(conn) is False
+    assert autodraft.status()["cross_customer_threads"] == 1
+    conn.close()
+
+    # Proof 6: exactly one alert per thread, no duplicate on the repeat cycles.
+    assert [item for item in attention if item[0] == "t1"] == [
+        ("t1", "decision_required", "cross_customer_risk")
+    ]
+    assert [item for item in attention if item[0] == "t2"] == [
+        ("t2", "shadowed", "reply_needed")
+    ]
+    # Telegram is the fallback for a failed Attention upsert, not a second copy:
+    # both items queued, so nothing is duplicated into Telegram.
+    assert sent == []
