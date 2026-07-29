@@ -133,6 +133,7 @@ REASON_CODES = frozenset({
     "low_confidence",
     "blocked_category",
     "missing_approved_fact",
+    "missing_writing_guidance",
     "conflicting_facts",
     "cross_customer_risk",
     "unsafe_promise",

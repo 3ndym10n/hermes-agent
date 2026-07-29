@@ -123,6 +123,7 @@ REASON_CODES = frozenset(
         "low_confidence",
         "blocked_category",
         "missing_approved_fact",
+        "missing_writing_guidance",
         "conflicting_facts",
         "cross_customer_risk",
         "unsafe_promise",
@@ -188,6 +189,38 @@ MISSING_FACT_CATEGORIES = frozenset(
         "compatibility",
     }
 )
+
+# Deterministic eligibility for the approved_business_facts bucket.
+#
+# Approval alone means a record was reviewed, not that it is a Linxio business
+# fact, that it is current, or that it answers this email. The promoted store
+# holds research notes, operating lessons, software playbooks and university
+# material, all of them legitimately approved; retrieval offered them as Linxio
+# facts and only the drafting model's refusal to cite them prevented an unsafe
+# answer. That refusal is the last safety net, not the relevance boundary.
+#
+# Every check below is mandatory, is evaluated before any semantic score is
+# considered, and fails closed. A record that omits the metadata cannot be shown
+# to be a current, in-scope, non-conflicting Linxio business fact, so it is
+# excluded rather than trusted.
+LINXIO_FACT_RECORD_TYPE = "linxio_business_fact"
+LINXIO_FACT_SCOPES = frozenset({"linxio", "linxio_global"})
+# Which fact categories may answer which incoming-email category. A pricing fact
+# cannot answer an installation question merely because both are approved.
+CATEGORY_FACT_CATEGORIES = {
+    "acknowledgement": frozenset(),
+    "scheduling": frozenset({"installation", "delivery"}),
+    "information_request": frozenset({"product", "compatibility", "delivery"}),
+    "product_question": frozenset({"product", "compatibility"}),
+    "pricing_question": frozenset({"pricing"}),
+    "quote_or_proposal": frozenset({"pricing", "product", "contract"}),
+    "installation_question": frozenset({"installation", "compatibility"}),
+    "payment_terms_question": frozenset({"payment_terms", "pricing"}),
+    "service_agreement_question": frozenset({"contract", "warranty"}),
+    "customer_support": frozenset(
+        {"product", "warranty", "installation", "compatibility", "delivery"}
+    ),
+}
 RISK_FLAGS = frozenset(
     {
         "discount",
@@ -1237,6 +1270,36 @@ def _bridge_config() -> tuple[str, str]:
     return url, token
 
 
+def _eligible_fact(record: Mapping, category: str) -> bool:
+    """Whether one retrieved record may enter the approved_business_facts bucket.
+
+    Deterministic metadata only. This runs before any semantic score is used, so
+    ranking can only ever reorder an already-trusted subset — it can never admit
+    a record that failed a check here. Missing metadata is a failure, not a pass.
+
+    ponytail: Cogitator ranks before Hermes filters, so a genuinely eligible fact
+    could in principle be crowded out of the retrieved page by ineligible records
+    and reported as missing. That fails closed, and cannot happen while no Linxio
+    facts exist at all. The upgrade is a deterministic pre-filter on the Cogitator
+    side, which lands with the first approved fact set.
+    """
+    if record.get("lifecycle_state") not in {"approved", "promoted"}:
+        return False
+    if record.get("record_type") != LINXIO_FACT_RECORD_TYPE:
+        return False
+    if record.get("scope") not in LINXIO_FACT_SCOPES:
+        return False
+    if record.get("fact_category") not in CATEGORY_FACT_CATEGORIES.get(
+        category, frozenset()
+    ):
+        return False
+    if not str(record.get("provenance") or "").strip():
+        return False
+    if record.get("superseded_by") or record.get("superseded") is True:
+        return False
+    return True
+
+
 def _approved_facts(category: str) -> list[dict]:
     try:
         from gateway.cogitator_intake_bridge import request_intelligent_retrieval
@@ -1255,13 +1318,17 @@ def _approved_facts(category: str) -> list[dict]:
         )
     except Exception as exc:
         raise AutodraftError("cogitator_bridge_failure") from exc
-    facts = []
-    for index, record in enumerate(response.get("records", [])[:12], 1):
-        if not isinstance(record, Mapping) or record.get("lifecycle_state") not in {
-            "approved",
-            "promoted",
-        }:
+    records = response.get("records", [])[:12]
+    for record in records:
+        if not isinstance(record, Mapping):
             raise AutodraftError("cogitator_bridge_failure")
+    eligible = [record for record in records if _eligible_fact(record, category)]
+    # An unresolved conflict between records that are otherwise eligible for this
+    # question must stop the reply, not be silently narrowed to one side.
+    if any(record.get("conflicts_with") for record in eligible):
+        raise AutodraftError("conflicting_facts")
+    facts = []
+    for index, record in enumerate(eligible, 1):
         text = " ".join(
             str(record.get(key) or "").strip()
             for key in ("title", "core_idea", "plan_delta", "why_relevant", "citation")
@@ -1710,6 +1777,9 @@ def _send_telegram(text: str, *, shadow: bool) -> None:
 _REASON_TEXT = {
     "blocked_category": "This category requires Cal's decision.",
     "missing_approved_fact": "An exact approved fact is missing.",
+    "missing_writing_guidance": (
+        "No approved Linxio writing guidance applies to this category."
+    ),
     "conflicting_facts": "The available facts conflict.",
     "cross_customer_risk": "The thread contains more than one external sender.",
     "unsupported_claim": "The proposed reply contained an unsupported claim.",
@@ -2306,23 +2376,42 @@ def _process_event(
             _set_meta(conn, "last_cogitator_success", str(_now()))
             conn.commit()
             _recover_attention_alert("cogitator_bridge_failure")
-        except AutodraftError:
+        except AutodraftError as exc:
             if _apply_overlap_hold(conn):
                 return False
-            _alert(conn, "cogitator_bridge_failure")
+            # A conflict is a real, answered retrieval, not a bridge outage: it
+            # must reach Cal as conflicting_facts rather than a missing fact.
+            conflict = exc.code == "conflicting_facts"
+            if not conflict:
+                _alert(conn, "cogitator_bridge_failure")
             _decision(
                 conn,
                 message_id,
                 metadata,
                 category=category,
-                reason="missing_approved_fact",
+                reason="conflicting_facts" if conflict else "missing_approved_fact",
                 confidence=confidence,
-                missing=classification["missing_fact_categories"]
+                missing=[]
+                if conflict
+                else classification["missing_fact_categories"]
                 or ["approved facts or writing guidance unavailable"],
             )
             return True
         if _apply_overlap_hold(conn):
             return False
+        if not guidance:
+            # Drafting with no approved guidance would fall back to whatever style
+            # the model already has. Cal's approved voice is the only sanctioned
+            # source, so say so explicitly instead of guessing.
+            _decision(
+                conn,
+                message_id,
+                metadata,
+                category=category,
+                reason="missing_writing_guidance",
+                confidence=confidence,
+            )
+            return True
         if classification["requires_commercial_fact"] and not approved_facts:
             _decision(
                 conn,
