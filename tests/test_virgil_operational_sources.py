@@ -891,3 +891,38 @@ def test_system_health_reports_gmail_staleness_only_when_worker_should_run(monke
     assert "health:gmail-stale" not in ids_for(shadow_safety_hold="processing_failure")
     # A deliberately disabled worker is not polling by design.
     assert "health:gmail-stale" not in ids_for(mode="disabled")
+
+
+def test_gmail_health_surfaces_retained_terminal_failures(monkeypatch):
+    """Terminal failures stay visible in source status instead of vanishing."""
+
+    base = {
+        "authentication_health": "ok",
+        "mode": "shadow",
+        "last_successful_poll": str(NOW.timestamp()),
+        "history_watermark": "3057985",
+        "verified_account_fingerprint": "fingerprint",
+    }
+    monkeypatch.setattr(
+        sources,
+        "_unit_state",
+        lambda _unit, *, user: {"ActiveState": "active"},
+    )
+
+    def status_for(**overrides):
+        meta = dict(base)
+        meta.update(overrides)
+        monkeypatch.setattr(sources, "_gmail_meta", lambda: meta)
+        return sources.sync_gmail_health(sources.SourceContext(NOW, {}))
+
+    clean = status_for(terminal_failed_count="0")
+    assert clean.status == "active"
+    assert "historical failures" not in clean.message
+
+    retained = status_for(terminal_failed_count="2")
+    assert retained.status == "active"
+    assert "2 historical failures" in retained.message
+
+    # A safety hold still outranks the historical-failure wording.
+    held = status_for(terminal_failed_count="2", shadow_safety_hold="queue_stuck")
+    assert held.status == "degraded"
