@@ -1999,3 +1999,303 @@ def test_terminal_rows_do_not_touch_watermark_policy_or_drafts(private_state):
         == 0
     )
     conn.close()
+
+
+class _Resp:
+    def __init__(self, status):
+        self.status = status
+
+
+class _FailingRequest:
+    """Minimal googleapiclient-shaped request whose execute() raises."""
+
+    def __init__(self, status):
+        self._status = status
+
+    def execute(self, num_retries=0):
+        error = RuntimeError("gmail rejected the request")
+        error.resp = _Resp(self._status)
+        raise error
+
+
+def test_execute_maps_message_404_to_message_not_found():
+    """A vanished message must be separable from a real API failure."""
+    with pytest.raises(autodraft.AutodraftError) as excinfo:
+        autodraft._execute(_FailingRequest(404))
+    assert excinfo.value.code == "message_not_found"
+
+
+def test_execute_preserves_history_gap_and_auth_mapping():
+    """The new 404 branch must not shadow the pre-existing mappings."""
+    with pytest.raises(autodraft.AutodraftError) as history:
+        autodraft._execute(_FailingRequest(404), history=True)
+    assert history.value.code == "history_gap"
+    for status in (401, 403):
+        with pytest.raises(autodraft.AutodraftError) as auth:
+            autodraft._execute(_FailingRequest(status))
+        assert auth.value.code == "oauth_failure"
+    for status in (429, 500, 503):
+        with pytest.raises(autodraft.AutodraftError) as api:
+            autodraft._execute(_FailingRequest(status))
+        assert api.value.code == "gmail_api_failure"
+
+
+def test_deleted_message_is_skipped_without_halting_the_worker(
+    private_state, monkeypatch
+):
+    """A 404 message is skipped like any other unprocessable mail, not held on."""
+    conn = autodraft._open_state()
+    autodraft._set_meta(conn, "mode", "shadow")
+    autodraft._set_meta(conn, "history_watermark", "100")
+    conn.commit()
+    conn.close()
+    sent = _capture_telegram(monkeypatch)
+    monkeypatch.setattr(
+        autodraft,
+        "_profile",
+        lambda service: {
+            "history_id": "200",
+            "account_fingerprint": autodraft.ACCOUNT_FINGERPRINT,
+        },
+    )
+    monkeypatch.setattr(
+        autodraft,
+        "collect_history_events",
+        lambda *args: (
+            [{"message_id": "m1", "thread_id": "t1", "history_id": "101"}],
+            "200",
+        ),
+    )
+    calls = {"count": 0}
+
+    def gone(*args):
+        calls["count"] += 1
+        raise autodraft.AutodraftError("message_not_found")
+
+    monkeypatch.setattr(autodraft, "_metadata", gone)
+    monkeypatch.setattr(
+        autodraft,
+        "_create_reply_draft",
+        lambda *args, **kwargs: pytest.fail("a deleted message cannot mutate Gmail"),
+    )
+
+    result = autodraft.run_once(service=object())
+
+    assert result["status"] == "ok"
+    assert result["mode"] == "shadow"
+    conn = autodraft._open_state()
+    # Skipped, not failed: no retry, no safety hold, worker still running.
+    row = conn.execute(
+        "SELECT state,reason_code,draft_id,retry_count FROM messages"
+    ).fetchone()
+    assert tuple(row) == ("ignored", "message_not_found", "", 0)
+    assert autodraft._mode(conn) == "shadow"
+    assert autodraft._meta(conn, "shadow_safety_hold") == ""
+    assert autodraft._meta(conn, "last_failure_code") == "message_not_found"
+    conn.close()
+    # Fetched once. A 404 can never succeed, so it must not burn the retries.
+    assert calls["count"] == 1
+    assert sent == []
+
+
+def test_deleted_message_does_not_recur_or_alert_across_cycles(
+    private_state, monkeypatch
+):
+    """Repeating the same deleted message must stay quiet and never hold."""
+    conn = autodraft._open_state()
+    autodraft._set_meta(conn, "mode", "shadow")
+    autodraft._set_meta(conn, "history_watermark", "100")
+    conn.commit()
+    conn.close()
+    sent = _capture_telegram(monkeypatch)
+    monkeypatch.setattr(
+        autodraft,
+        "_profile",
+        lambda service: {
+            "history_id": "200",
+            "account_fingerprint": autodraft.ACCOUNT_FINGERPRINT,
+        },
+    )
+    monkeypatch.setattr(
+        autodraft,
+        "collect_history_events",
+        lambda *args: (
+            [{"message_id": "m1", "thread_id": "t1", "history_id": "101"}],
+            "200",
+        ),
+    )
+    monkeypatch.setattr(
+        autodraft,
+        "_metadata",
+        lambda *args: (_ for _ in ()).throw(
+            autodraft.AutodraftError("message_not_found")
+        ),
+    )
+
+    for _ in range(3):
+        assert autodraft.run_once(service=object())["status"] == "ok"
+
+    conn = autodraft._open_state()
+    assert autodraft._mode(conn) == "shadow"
+    assert autodraft._meta(conn, "shadow_safety_hold") == ""
+    assert autodraft.queue_depth(conn)["retryable_failed_count"] == 0
+    conn.close()
+    assert sent == []
+
+
+def test_failure_codes_are_bounded_and_never_leak_content(private_state):
+    conn = autodraft._open_state()
+    autodraft._record_failure_code(conn, "model_failure")
+    autodraft._record_failure_code(conn, "model_failure")
+    autodraft._record_failure_code(conn, "message_not_found")
+    # Anything outside the bounded vocabulary is bucketed, never written through.
+    autodraft._record_failure_code(
+        conn, "customer@example.com said 'invoice 12345' is wrong"
+    )
+    counts = autodraft._failure_code_counts(conn)
+    assert counts == {
+        "model_failure": 2,
+        "message_not_found": 1,
+        "unexpected_error": 1,
+    }
+    assert autodraft._meta(conn, "last_failure_code") == "unexpected_error"
+    assert set(counts) <= autodraft.FAILURE_CODES | {"unexpected_error"}
+    dumped = json.dumps(counts) + json.dumps(
+        {
+            key: autodraft._meta(conn, key)
+            for key in ("last_failure_code", "last_failure_at")
+        }
+    )
+    for secret in ("customer@example.com", "invoice", "12345", "wrong"):
+        assert secret not in dumped
+    conn.close()
+
+
+def test_failure_codes_are_disjoint_from_model_output_vocabulary():
+    """FAILURE_CODES must never widen what the model is allowed to emit."""
+    assert not (autodraft.FAILURE_CODES & autodraft.REASON_CODES)
+    assert "message_not_found" not in autodraft.REASON_CODES
+
+
+def test_run_once_incident_replay_deleted_message_after_resume(
+    private_state, monkeypatch
+):
+    """Full replay of the #107/#110 incident shape, end to end through run_once.
+
+    An aged retryable row survives a safety hold; the operator resumes shadow;
+    the queue gate must not relatch inside the grace window; the worker must
+    actually process; the underlying failure must be categorised rather than
+    collapsed; and no Gmail mutation may occur at any point.
+    """
+    conn = autodraft._open_state()
+    autodraft._set_meta(conn, "mode", "shadow")
+    autodraft._set_meta(conn, "history_watermark", "100")
+    now = autodraft._now()
+    # An aged retryable row: exactly what latched the gate before PR #108.
+    conn.execute(
+        "INSERT INTO messages(message_id, thread_id, history_id, state, "
+        "retry_count, created_at, updated_at) VALUES(?,?,?,?,?,?,?)",
+        ("m1", "t1", "101", "failed", 1, now - 99_999, now - 99_999),
+    )
+    autodraft._pause_shadow(conn, "processing_failure", safety_hold=True)
+    conn.commit()
+    conn.close()
+
+    sent = _capture_telegram(monkeypatch)
+    monkeypatch.setattr(
+        autodraft,
+        "_profile",
+        lambda service: {
+            "history_id": "200",
+            "account_fingerprint": autodraft.ACCOUNT_FINGERPRINT,
+        },
+    )
+    monkeypatch.setattr(
+        autodraft,
+        "collect_history_events",
+        lambda *args: (
+            [{"message_id": "m1", "thread_id": "t1", "history_id": "101"}],
+            "200",
+        ),
+    )
+    monkeypatch.setattr(
+        autodraft,
+        "_metadata",
+        lambda *args: (_ for _ in ()).throw(
+            autodraft.AutodraftError("message_not_found")
+        ),
+    )
+    for mutator in ("_create_reply_draft", "_reserve"):
+        monkeypatch.setattr(
+            autodraft,
+            mutator,
+            lambda *args, **kwargs: pytest.fail(f"{mutator} must never run here"),
+        )
+
+    # While held, the worker stays put and the watermark must not move.
+    assert autodraft.run_once(service=object()) == {
+        "status": "shadow_safety_hold",
+        "mode": "disabled",
+        "reason": "processing_failure",
+    }
+    conn = autodraft._open_state()
+    assert autodraft._meta(conn, "history_watermark") == "100"
+    conn.close()
+
+    # resume is refused under a safety hold; shadow is the supported verb.
+    with pytest.raises(
+        autodraft.AutodraftError, match="operator_intervention_required"
+    ):
+        autodraft.set_mode("resume")
+    assert autodraft.set_mode("shadow")["mode"] == "shadow"
+
+    first = autodraft.run_once(service=object())
+
+    # The gate did not relatch, and the worker reached actual processing.
+    assert first["status"] == "ok"
+    assert first["mode"] == "shadow"
+    conn = autodraft._open_state()
+    assert autodraft._mode(conn) == "shadow"
+    assert autodraft._meta(conn, "shadow_safety_hold") == ""
+    assert autodraft._meta(conn, "shadow_stop_reason") != "queue_stuck"
+    # The aged row is resolved, not left to age further.
+    row = conn.execute(
+        "SELECT state,reason_code,draft_id FROM messages WHERE message_id='m1'"
+    ).fetchone()
+    assert tuple(row) == ("ignored", "message_not_found", "")
+    assert autodraft._queue_stuck_age(conn) == 0
+    assert autodraft.queue_depth(conn) == {
+        "active_processing_count": 0,
+        "retryable_failed_count": 0,
+        "terminal_failed_count": 0,
+        "oldest_active_processing_age": 0,
+        "oldest_retryable_failed_age": 0,
+    }
+    # The stage is recorded rather than collapsed into processing_failure.
+    assert autodraft._meta(conn, "last_failure_code") == "message_not_found"
+    # Watermark advanced only now that the cycle actually completed.
+    assert autodraft._meta(conn, "history_watermark") == "200"
+    conn.close()
+
+    # Three further clean cycles: still shadow, still no hold, still no drafts.
+    for _ in range(3):
+        assert autodraft.run_once(service=object())["status"] == "ok"
+    conn = autodraft._open_state()
+    assert autodraft._mode(conn) == "shadow"
+    assert autodraft._meta(conn, "shadow_safety_hold") == ""
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM messages WHERE draft_id IS NOT NULL "
+            "AND draft_id != ''"
+        ).fetchone()[0]
+        == 0
+    )
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM messages WHERE state IN ('drafted','sent')"
+        ).fetchone()[0]
+        == 0
+    )
+    assert autodraft._policy_current(conn) is False
+    conn.close()
+    assert sent == []
