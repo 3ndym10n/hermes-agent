@@ -214,7 +214,7 @@ async def test_passive_reference_dispatches_to_intelligent_intake_without_agent_
     runner._running_agents_ts.clear()
     runner.handle_intelligent_intake = AsyncMock(return_value="reference assessment")
     pasted = (
-        "Mem0 graph memory and semantic triplets. Source: https://example.com/mem0\n"
+        "Source: https://example.com/mem0\nMem0 graph memory and semantic triplets.\n"
         + "Reference excerpt about retrieval, provenance, and graph edges. " * 40
     )
 
