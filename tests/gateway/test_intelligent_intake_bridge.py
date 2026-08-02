@@ -1,11 +1,55 @@
 import json
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from gateway import cogitator_intake_bridge as ib
+from tests.gateway.test_running_agent_session_toggles import _make_event, _make_runner
+
+
+_OPERATIONAL_CONTEXT = (
+    """
+
+Repository:
+/home/v0id/.hermes/hermes-agent
+
+Scope:
+Keep the approved implementation intact.
+Retain the current branch and working tree.
+Validate the real gateway path before altering behavior.
+Confirm the live execution path still uses the preserved implementation.
+
+Source material: the approved operational record and its existing checkout.
+
+Preservation and runtime verification:
+"""
+    + (
+        "- Preserve the current files, verify the normal execution path, "
+        "record observed evidence, and leave candidates, storage, runtime "
+        "configuration, and services unchanged.\n"
+        * 14
+    )
+    + """
+
+Return the observed runtime result and the exact files inspected.
+"""
+)
+_OPERATIONAL_ROUTING_REGRESSIONS = (
+    pytest.param(
+        "Preserve the approved implementation and verify it in the running runtime.\n"
+        "Source: https://github.com/NousResearch/hermes-agent"
+        + _OPERATIONAL_CONTEXT,
+        id="inote-441",
+    ),
+    pytest.param(
+        "Merge Cogitator PR #1076 now. Source: "
+        "https://github.com/example/cogitator/pull/1076"
+        + _OPERATIONAL_CONTEXT,
+        id="cogitator-pr-1076",
+    ),
+)
 
 
 def test_bare_url_routes_to_intake_but_url_question_stays_conversational():
@@ -38,6 +82,16 @@ def test_explicit_pasted_forwarded_and_transcript_inputs_route():
     )
     assert transcript.input_kind == "transcript"
     assert ib.parse_intelligent_intake("ordinary conversation") is None
+
+
+def test_source_labeled_reference_routes_without_length_inference():
+    pasted = (
+        "Source: https://example.com/source\nReference notes.\n"
+        + "Quoted architecture detail with provenance and citations. " * 20
+    )
+    assert ib.parse_intelligent_intake(pasted) == ib.IntelligentIntake(
+        pasted.strip(), "pasted_text"
+    )
 
 
 @pytest.mark.parametrize(
@@ -75,6 +129,51 @@ def test_explicit_research_and_long_task_instructions_do_not_become_passive_inta
     assert ib.parse_intelligent_intake(bare_embedded) is None
     task = "TASK\nImplement the approved routing fix.\n" + ("constraint " * 200)
     assert ib.parse_intelligent_intake(task) is None
+
+
+def test_ambiguous_citation_and_mention_fall_through():
+    message = (
+        "Merge the approved change now.\n"
+        "https://example.com/change\n"
+        "@reviewer\n"
+        + "Operational verification step with preserved runtime context. " * 20
+    )
+    assert ib.parse_intelligent_intake(message) is None
+    assert ib.parse_intelligent_intake(
+        "Quote the runtime evidence now. " + "Preserve every detail. " * 40
+    ) is None
+
+
+@pytest.mark.parametrize("message", _OPERATIONAL_ROUTING_REGRESSIONS)
+def test_operational_incidents_are_not_intelligent_intake(message):
+    assert len(message) >= 1800
+    assert ib.is_passive_reference_content(message) is False
+    assert ib.parse_intelligent_intake(message) is None
+    assert ib.parse_intake_message(message) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("message", _OPERATIONAL_ROUTING_REGRESSIONS)
+async def test_operational_incidents_fall_through_to_normal_gateway_execution(message):
+    runner = _make_runner()
+    runner._running_agents.clear()
+    runner._running_agents_ts.clear()
+    runner.handle_intelligent_intake = AsyncMock(
+        side_effect=AssertionError("operational command must not request intake")
+    )
+    runner._claim_active_session_slot = MagicMock(return_value=(None, None))
+    runner._begin_session_run_generation = MagicMock(return_value=1)
+    runner._release_running_agent_state = MagicMock()
+    runner._handle_message_with_agent = AsyncMock(return_value="normal execution")
+    runner._post_turn_goal_continuation = AsyncMock()
+
+    result = await runner._handle_message(_make_event(message))
+
+    assert result == "normal execution"
+    runner.handle_intelligent_intake.assert_not_awaited()
+    runner._handle_message_with_agent.assert_awaited_once()
+    event = runner._handle_message_with_agent.await_args.args[0]
+    assert event.text == message
 
 
 def test_event_metadata_routes_forwarded_posts_and_transcripts():

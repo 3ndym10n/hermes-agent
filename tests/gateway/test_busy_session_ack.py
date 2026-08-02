@@ -272,7 +272,7 @@ class TestBusySessionAck:
         runner._busy_input_mode = "steer"
         adapter = _make_adapter()
         pasted = (
-            "Mem0 graph-memory reference. Source: https://example.com/mem0\n"
+            "Source: https://example.com/mem0\nMem0 graph-memory reference.\n"
             + "Semantic triplets, graph edges, retrieval, and provenance notes. " * 40
         )
         event = _make_event(text=pasted)
