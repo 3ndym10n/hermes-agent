@@ -61,6 +61,73 @@ class GatewaySlashCommandsMixin:
         adapter = self.adapters.get(platform) if getattr(self, "adapters", None) else None
         return getattr(adapter, "typed_command_prefix", "/") if adapter is not None else "/"
 
+    async def _handle_store_command(self, event: MessageEvent) -> str:
+        """Handle deterministic /store controls without an agent turn."""
+        source = event.source
+        if source.platform != Platform.TELEGRAM or not source.user_id or not source.chat_id:
+            return "Commerce controls are available only in an authorized Telegram chat."
+        parts = event.get_command_args().strip().split()
+        operation = parts[0].lower() if parts else "status"
+        if operation not in {"status", "pause", "resume", "cancel", "receipt"}:
+            return "Usage: /store [status|pause|resume|cancel|receipt] [job-id]"
+        job_id = parts[1] if len(parts) > 1 else ""
+        origin = {
+            "platform": "telegram",
+            "chat_id": str(source.chat_id),
+            "thread_id": str(source.thread_id or ""),
+            "user_id": str(source.user_id),
+            "message_id": str(event.message_id or ""),
+        }
+        from tools.commerce_tool import commerce_control_from_origin
+
+        result = await asyncio.to_thread(
+            commerce_control_from_origin,
+            operation,
+            origin=origin,
+            job_id=job_id,
+            reason="requested_via_store_command",
+        )
+        if not result.get("ok"):
+            errors = {
+                "commerce_disabled": "The commerce operator is disabled.",
+                "job_not_found": "No commerce job exists for this Telegram user.",
+                "job_not_owned": "That commerce job is not owned by this Telegram user.",
+                "job_not_resumable": "That commerce job cannot be resumed.",
+                "reconciliation_required": "Reconciliation must finish before this job can be changed.",
+            }
+            return errors.get(result.get("error"), "Commerce control failed safely.")
+        lines = [
+            "🛒 Virgil Commerce",
+            str(result.get("message") or "Status updated."),
+            f"Job: {result.get('job_id', '')}",
+            f"State: {result.get('state', '')}",
+        ]
+        if result.get("current_step"):
+            lines.append(f"Step: {result['current_step']}")
+        if result.get("receipt_status") == "pending":
+            lines.append("Receipt: pending launch completion")
+        store_factory = getattr(self, "_commerce_store", None)
+        if (
+            operation == "status"
+            and result.get("state") == "awaiting_cal"
+            and callable(store_factory)
+        ):
+            from commerce_jobs import CommerceJobError
+            from gateway.commerce_watcher import commerce_gate_status
+
+            try:
+                gate_status = await asyncio.to_thread(
+                    commerce_gate_status,
+                    store_factory(),
+                    str(result["job_id"]),
+                    actor=f"telegram:{source.user_id}",
+                )
+            except CommerceJobError:
+                gate_status = ""
+            if gate_status:
+                lines.append(gate_status)
+        return "\n".join(lines)
+
     async def _handle_reset_command(self, event: MessageEvent) -> Union[str, EphemeralReply]:
         """Handle /new or /reset command."""
         source = event.source

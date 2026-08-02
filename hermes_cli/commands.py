@@ -114,6 +114,14 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("profile", "Show active profile name and home directory", "Info"),
     CommandDef("sethome", "Set this chat as the home channel", "Session",
                gateway_only=True, aliases=("set-home",)),
+    CommandDef(
+        "store",
+        "Inspect or control the governed commerce launch",
+        "Session",
+        gateway_only=True,
+        args_hint="[status|pause|resume|cancel|receipt] [job-id]",
+        subcommands=("status", "pause", "resume", "cancel", "receipt"),
+    ),
     CommandDef("resume", "Resume a previously-named session", "Session",
                args_hint="[name]"),
 
@@ -386,6 +394,7 @@ ACTIVE_SESSION_BYPASS_COMMANDS: frozenset[str] = frozenset(
         "queue",
         "restart",
         "status",
+        "store",
         "steer",
         "stop",
         "update",
@@ -1088,8 +1097,9 @@ _SLACK_PRIORITY_ALIASES = ("btw", "bg")
 #     rationale — keep it off the native Slack manifest, reachable via /hermes.
 #   - decision-batch: default-off read-only Cogitator decision-batch display; same
 #     rationale — keep it off the native Slack manifest, reachable via /hermes.
+#   - store: Telegram-bound commerce control; reachable via /hermes only on Slack.
 _SLACK_VIA_HERMES_ONLY = frozenset(
-    {"credits", "debug", "promote", "review", "review-page", "context-checkpoint", "decision-batch", "x-batch"}
+    {"credits", "debug", "promote", "review", "review-page", "context-checkpoint", "decision-batch", "x-batch", "store"}
 )
 
 

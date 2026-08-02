@@ -352,13 +352,12 @@ def test_check_entrypoint_requires_no_credentials():
     assert result.stdout == "Porkbun read-only self-check: PASS\n"
 
 
-def test_no_mutation_endpoint_is_callable(monkeypatch):
+def test_only_planned_mutation_endpoints_are_callable(monkeypatch):
     monkeypatch.setenv("PORKBUN_API_KEY", FAKE_API_KEY)
     monkeypatch.setenv("PORKBUN_SECRET_KEY", FAKE_SECRET_KEY)
     client = porkbun.PorkbunClient()
     for name in (
         "register_domain",
-        "create_domain",
         "renew_domain",
         "transfer_domain",
         "create_dns_record",
@@ -367,9 +366,13 @@ def test_no_mutation_endpoint_is_callable(monkeypatch):
         "update_nameservers",
     ):
         assert not hasattr(client, name)
+    assert all(
+        hasattr(client, name)
+        for name in ("create_domain", "dns_create", "dns_edit", "dns_delete")
+    )
 
 
-def test_private_transport_refuses_mutation_route(monkeypatch):
+def test_private_transport_refuses_unvalidated_mutation_route(monkeypatch):
     routes = {
         ("POST", "/domain/create/example.com"): (
             200,
@@ -377,7 +380,9 @@ def test_private_transport_refuses_mutation_route(monkeypatch):
         )
     }
     with fake_server(monkeypatch, routes) as client:
-        with pytest.raises(porkbun.PorkbunConfigurationError, match="read-only route"):
+        with pytest.raises(
+            porkbun.PorkbunConfigurationError, match="validated payload"
+        ):
             client._request("domain/create/example.com", method="POST")
     assert FakePorkbunHandler.requests == []
 

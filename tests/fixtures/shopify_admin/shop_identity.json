@@ -1,0 +1,37 @@
+{
+  "data": {
+    "shop": {
+      "id": "gid://shopify/Shop/1",
+      "name": "Silicon Current",
+      "myshopifyDomain": "silicon-current.myshopify.com",
+      "currencyCode": "AUD",
+      "ianaTimezone": "Australia/Sydney",
+      "checkoutApiSupported": false,
+      "plan": {
+        "displayName": "Basic",
+        "publicDisplayName": "Basic",
+        "partnerDevelopment": false
+      },
+      "primaryDomain": {
+        "id": "gid://shopify/Domain/1",
+        "host": "siliconcurrent.com",
+        "url": "https://siliconcurrent.com",
+        "sslEnabled": true
+      },
+      "domains": [
+        {
+          "id": "gid://shopify/Domain/1",
+          "host": "siliconcurrent.com",
+          "url": "https://siliconcurrent.com",
+          "sslEnabled": true
+        },
+        {
+          "id": "gid://shopify/Domain/2",
+          "host": "silicon-current.myshopify.com",
+          "url": "https://silicon-current.myshopify.com",
+          "sslEnabled": true
+        }
+      ]
+    }
+  }
+}

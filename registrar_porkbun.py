@@ -1,10 +1,11 @@
-"""Read-only Porkbun API v3 adapter for commerce discovery Slice S1.
+"""Porkbun API v3 adapter for governed commerce operations.
 
-This module intentionally exposes no registrar or DNS mutation operation.
-Every call is single-attempt, redirects are refused, credentials are accepted
-only from ``PORKBUN_API_KEY``/``PORKBUN_SECRET_KEY`` or a mode-0600 JSON file
-named by ``PORKBUN_CREDENTIALS_FILE``, and exceptions never include response
-bodies or credential values.
+Every call is single-attempt and redirects are refused. Real writes require
+an explicit idempotency key; an unvalidated response after dispatch is exposed
+as an uncertain outcome for caller-side provider reconciliation. Credentials
+are accepted only from ``PORKBUN_API_KEY``/``PORKBUN_SECRET_KEY`` or a
+mode-0600 JSON file named by ``PORKBUN_CREDENTIALS_FILE``, and exceptions never
+include response bodies or credential values.
 
 ``PORKBUN_API_BASE`` exists only for tests and must identify a loopback host.
 The ``--check`` entrypoint starts its own loopback fake and requires no real
@@ -33,6 +34,22 @@ MAX_RESPONSE_BYTES = 1_048_576
 TIMEOUT_SECONDS = 15
 
 _DOMAIN_LABEL = re.compile(r"(?i)^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+_DNS_NAME_LABEL = re.compile(r"(?i)^[a-z0-9_](?:[a-z0-9_-]{0,61}[a-z0-9_])?$")
+_DNS_RECORD_ID = re.compile(r"^[1-9]\d*$")
+_IDEMPOTENCY_KEY = re.compile(r"^[\x20-\x7e]{1,255}$")
+_DNS_TYPES = frozenset({
+    "A",
+    "AAAA",
+    "MX",
+    "CNAME",
+    "ALIAS",
+    "TXT",
+    "NS",
+    "SRV",
+    "TLSA",
+    "CAA",
+    "SSHFP",
+})
 _ERROR_CODE = re.compile(r"^[A-Z0-9_]{1,64}$")
 _MONEY = re.compile(r"^(?:0|[1-9]\d*)(?:\.\d{1,2})?$")
 _AUTH_ERROR_CODES = frozenset({
@@ -46,6 +63,10 @@ _AUTH_ERROR_CODES = frozenset({
     "MISSING_SECRETAPIKEY",
 })
 
+_IDEMPOTENCY_ERROR_CODES = frozenset({
+    "IDEMPOTENCY_KEY_IN_USE",
+    "IDEMPOTENCY_KEY_MISMATCH",
+})
 _READ_ONLY_ROUTES = (
     ("GET", True, re.compile(r"^ping$")),
     ("GET", False, re.compile(r"^pricing/get$")),
@@ -54,6 +75,14 @@ _READ_ONLY_ROUTES = (
     ("GET", True, re.compile(r"^dns/retrieve/[a-z0-9.-]+$")),
     ("GET", True, re.compile(r"^domain/getNs/[a-z0-9.-]+$")),
     ("GET", True, re.compile(r"^domain/listAll(?:\?start=\d+)?$")),
+)
+
+
+_WRITE_ROUTES = (
+    re.compile(r"^domain/create/[a-z0-9.-]+$"),
+    re.compile(r"^dns/create/[a-z0-9.-]+$"),
+    re.compile(r"^dns/edit/[a-z0-9.-]+/[1-9]\d*$"),
+    re.compile(r"^dns/delete/[a-z0-9.-]+/[1-9]\d*$"),
 )
 
 
@@ -85,6 +114,25 @@ class PorkbunAPIError(PorkbunError):
 
 class PorkbunAuthenticationError(PorkbunAPIError):
     """Validated authentication or API-key scope failure."""
+
+
+class PorkbunIdempotencyError(PorkbunAPIError):
+    """Provider-declared 409 for a reused or still-in-flight key."""
+
+    @property
+    def outcome_uncertain(self) -> bool:
+        return self.code == "IDEMPOTENCY_KEY_IN_USE"
+
+
+class PorkbunMutationUncertainError(PorkbunTransportError):
+    """A write was dispatched but its provider outcome could not be validated."""
+
+    def __init__(self, operation: str):
+        self.operation = operation
+        super().__init__(
+            "Porkbun mutation outcome is uncertain; reconcile provider state "
+            "before any retry"
+        )
 
 
 def redact(text: str, secrets: tuple[str, ...] = ()) -> str:
@@ -268,6 +316,116 @@ def _tld(value: str) -> str:
     if any(not _DOMAIN_LABEL.fullmatch(label) for label in ascii_value.split(".")):
         raise PorkbunConfigurationError("TLD is invalid")
     return ascii_value
+
+
+def _input_integer(value: object, where: str, *, maximum: int | None = None) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise PorkbunConfigurationError(f"{where} must be a non-negative integer")
+    if maximum is not None and value > maximum:
+        raise PorkbunConfigurationError(f"{where} is too large")
+    return value
+
+
+def _idempotency(value: str | None, *, dry_run: bool) -> str | None:
+    if not isinstance(dry_run, bool):
+        raise PorkbunConfigurationError("dry_run must be a boolean")
+    if value is None:
+        if dry_run:
+            return None
+        raise PorkbunConfigurationError(
+            "a real Porkbun write requires an idempotency key"
+        )
+    if (
+        not isinstance(value, str)
+        or value != value.strip()
+        or not _IDEMPOTENCY_KEY.fullmatch(value)
+    ):
+        raise PorkbunConfigurationError(
+            "idempotency key must be 1-255 visible ASCII characters"
+        )
+    return value
+
+
+def _record_id(value: str) -> str:
+    if not isinstance(value, str) or not _DNS_RECORD_ID.fullmatch(value):
+        raise PorkbunConfigurationError(
+            "DNS record id must be a positive integer string"
+        )
+    return value
+
+
+def _record_name(value: str, domain: str) -> str:
+    if not isinstance(value, str) or len(value) > 253 or value != value.strip():
+        raise PorkbunConfigurationError("DNS record name is invalid")
+    if not value:
+        return ""
+    labels = value.lower().split(".")
+    if any(
+        (label == "*" and index != 0)
+        or (label != "*" and not _DNS_NAME_LABEL.fullmatch(label))
+        for index, label in enumerate(labels)
+    ):
+        raise PorkbunConfigurationError("DNS record name is invalid")
+    normalized = ".".join(labels)
+    if normalized == domain or normalized.endswith("." + domain):
+        raise PorkbunConfigurationError(
+            "DNS record name must be relative to the domain"
+        )
+    return normalized
+
+
+def _record_content(record_type: str, value: str) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > 65_535
+        or any(character in value for character in "\x00\r\n")
+    ):
+        raise PorkbunConfigurationError("DNS record content is invalid")
+    if record_type in {"A", "AAAA"}:
+        try:
+            address = ipaddress.ip_address(value)
+        except ValueError:
+            raise PorkbunConfigurationError("DNS record content is invalid") from None
+        expected_version = 4 if record_type == "A" else 6
+        if address.version != expected_version:
+            raise PorkbunConfigurationError("DNS record content is invalid")
+    elif record_type in {"ALIAS", "CNAME", "MX", "NS"}:
+        _domain(value)
+    return value
+
+
+def _dns_payload(
+    domain: str,
+    *,
+    record_type: str,
+    content: str,
+    name: str | None,
+    ttl: int | None,
+    prio: int | None,
+    notes: str | None,
+) -> dict[str, object]:
+    if not isinstance(record_type, str) or record_type not in _DNS_TYPES:
+        raise PorkbunConfigurationError("DNS record type is unsupported")
+    payload: dict[str, object] = {
+        "type": record_type,
+        "content": _record_content(record_type, content),
+    }
+    if name is not None:
+        payload["name"] = _record_name(name, domain)
+    if ttl is not None:
+        payload["ttl"] = _input_integer(ttl, "DNS ttl", maximum=2_147_483_647)
+    if prio is not None:
+        payload["prio"] = _input_integer(prio, "DNS priority", maximum=65_535)
+    if notes is not None:
+        if (
+            not isinstance(notes, str)
+            or len(notes) > 4096
+            or any(character in notes for character in "\x00\r\n")
+        ):
+            raise PorkbunConfigurationError("DNS record notes are invalid")
+        payload["notes"] = notes
+    return payload
 
 
 def _success(
@@ -501,6 +659,165 @@ def _validate_dns(payload: object) -> dict:
     return data
 
 
+def _validate_create_domain(
+    payload: object, *, domain: str, cost: int, dry_run: bool
+) -> dict:
+    if dry_run:
+        data = _success(
+            payload,
+            "domain-create dry-run response",
+            {
+                "dryRun",
+                "wouldSucceed",
+                "operation",
+                "domain",
+                "cost",
+                "balance",
+                "sufficientFunds",
+            },
+            {
+                "tld",
+                "available",
+                "premium",
+                "duration",
+                "costDisplay",
+                "monthlySpendLimit",
+                "monthlySpendSoFar",
+                "withinMonthlySpendLimit",
+                "message",
+                "idempotentReplayed",
+            },
+        )
+        if data["dryRun"] is not True:
+            raise PorkbunResponseError(
+                "domain-create dry-run response.dryRun must be true"
+            )
+        would_succeed = _boolean(
+            data["wouldSucceed"],
+            "domain-create dry-run response.wouldSucceed",
+        )
+        _string(
+            data["operation"],
+            "domain-create dry-run response.operation",
+            values={"registration"},
+        )
+        sufficient_funds = _boolean(
+            data["sufficientFunds"],
+            "domain-create dry-run response.sufficientFunds",
+        )
+        if would_succeed and not sufficient_funds:
+            raise PorkbunResponseError(
+                "domain-create dry-run response has inconsistent funds state"
+            )
+        _integer(data["balance"], "domain-create dry-run response.balance")
+        optional_integers = (
+            "duration",
+            "monthlySpendLimit",
+            "monthlySpendSoFar",
+        )
+        for field in optional_integers:
+            if field in data:
+                _integer(
+                    data[field],
+                    f"domain-create dry-run response.{field}",
+                    minimum=1 if field == "duration" else 0,
+                )
+        if "withinMonthlySpendLimit" in data:
+            _boolean(
+                data["withinMonthlySpendLimit"],
+                "domain-create dry-run response.withinMonthlySpendLimit",
+            )
+        spend_fields = {
+            "monthlySpendLimit",
+            "monthlySpendSoFar",
+            "withinMonthlySpendLimit",
+        }
+        if "idempotentReplayed" in data and data["idempotentReplayed"] is not True:
+            raise PorkbunResponseError(
+                "domain-create dry-run response.idempotentReplayed must be true"
+            )
+        if spend_fields & data.keys() and not spend_fields <= data.keys():
+            raise PorkbunResponseError(
+                "domain-create dry-run response has incomplete spend-limit fields"
+            )
+        if "tld" in data:
+            _tld(_string(data["tld"], "domain-create dry-run response.tld"))
+        if "available" in data:
+            _string(
+                data["available"],
+                "domain-create dry-run response.available",
+                values={"available", "unavailable"},
+            )
+        if "premium" in data:
+            _boolean(data["premium"], "domain-create dry-run response.premium")
+        if "costDisplay" in data:
+            display = _string(
+                data["costDisplay"],
+                "domain-create dry-run response.costDisplay",
+            )
+            expected_display = "$" + f"{cost // 100}.{cost % 100:02d}"
+            if display != expected_display:
+                raise PorkbunResponseError(
+                    "domain-create dry-run response cost display does not match cost"
+                )
+        if "message" in data:
+            _string(data["message"], "domain-create dry-run response.message")
+    else:
+        data = _success(
+            payload,
+            "domain-create response",
+            {"domain", "cost", "orderId", "balance"},
+            {"limits", "ttlRemaining", "idempotentReplayed"},
+        )
+        _integer(data["orderId"], "domain-create response.orderId", minimum=1)
+        _integer(data["balance"], "domain-create response.balance")
+        if "limits" in data:
+            limits = _object(
+                data["limits"],
+                "domain-create response.limits",
+                {"attempts", "success"},
+            )
+            for name in ("attempts", "success"):
+                _validate_limits(limits[name], f"domain-create response.limits.{name}")
+        if "ttlRemaining" in data:
+            _integer(data["ttlRemaining"], "domain-create response.ttlRemaining")
+        if "idempotentReplayed" in data and data["idempotentReplayed"] is not True:
+            raise PorkbunResponseError(
+                "domain-create response.idempotentReplayed must be true"
+            )
+    if _domain(_string(data["domain"], "domain-create response.domain")) != domain:
+        raise PorkbunResponseError(
+            "domain-create response domain does not match request"
+        )
+    if _integer(data["cost"], "domain-create response.cost") != cost:
+        raise PorkbunResponseError("domain-create response cost does not match quote")
+    return data
+
+
+def _validate_dns_create(payload: object) -> dict:
+    data = _success(
+        payload,
+        "DNS-create response",
+        {"id"},
+        {"idempotentReplayed"},
+    )
+    _record_id(_string(data["id"], "DNS-create response.id"))
+    if "idempotentReplayed" in data and data["idempotentReplayed"] is not True:
+        raise PorkbunResponseError(
+            "DNS-create response.idempotentReplayed must be true"
+        )
+    return data
+
+
+def _validate_dns_change(payload: object, where: str) -> dict:
+    data = _success(payload, where, set(), {"message", "idempotentReplayed"})
+    if "message" in data:
+        _string(data["message"], f"{where}.message")
+    if "idempotentReplayed" in data and data["idempotentReplayed"] is not True:
+        raise PorkbunResponseError(f"{where}.idempotentReplayed must be true")
+    return data
+
+
 def _validate_nameservers(payload: object) -> dict:
     data = _success(payload, "nameserver response", {"ns"})
     if not isinstance(data["ns"], list):
@@ -566,7 +883,7 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 class PorkbunClient:
-    """Single-attempt client exposing only the S1 read operations."""
+    """Single-attempt client for validated reads and explicitly keyed writes."""
 
     def __init__(self, *, timeout: float = TIMEOUT_SECONDS):
         self._credentials: tuple[str, str] | None = None
@@ -608,22 +925,50 @@ class PorkbunClient:
             _string(action["hint"], "error response.next_action.hint")
             if "url" in action:
                 _string(action["url"], "error response.next_action.url")
-        error_type = (
-            PorkbunAuthenticationError if code in _AUTH_ERROR_CODES else PorkbunAPIError
-        )
+        if code in _AUTH_ERROR_CODES:
+            error_type = PorkbunAuthenticationError
+        elif http_status == 409 and code in _IDEMPOTENCY_ERROR_CODES:
+            error_type = PorkbunIdempotencyError
+        else:
+            error_type = PorkbunAPIError
         raise error_type(code, http_status)
 
     def _request(
-        self, path: str, *, method: str = "GET", authenticated: bool = True
+        self,
+        path: str,
+        *,
+        method: str = "GET",
+        authenticated: bool = True,
+        payload: dict[str, object] | None = None,
+        idempotency_key: str | None = None,
     ) -> dict:
         path = path.lstrip("/")
-        if not any(
+        read_route = any(
             method == allowed_method
             and authenticated is allowed_auth
             and pattern.fullmatch(path)
             for allowed_method, allowed_auth, pattern in _READ_ONLY_ROUTES
-        ):
-            raise PorkbunConfigurationError("unsupported Porkbun read-only route")
+        )
+        write_route = (
+            method == "POST"
+            and authenticated
+            and any(pattern.fullmatch(path) for pattern in _WRITE_ROUTES)
+        )
+        if not read_route and not write_route:
+            raise PorkbunConfigurationError("unsupported Porkbun route")
+        if write_route and payload is None:
+            raise PorkbunConfigurationError(
+                "Porkbun write route requires a validated payload"
+            )
+        if read_route and (payload is not None or idempotency_key is not None):
+            raise PorkbunConfigurationError(
+                "Porkbun read route does not accept write parameters"
+            )
+        mutation = (
+            write_route and payload is not None and payload.get("dryRun") is not True
+        )
+        if write_route:
+            idempotency_key = _idempotency(idempotency_key, dry_run=not mutation)
         headers = {"Accept": "application/json"}
         if authenticated:
             if self._credentials is None:
@@ -633,44 +978,86 @@ class PorkbunClient:
                 "X-API-Key": api_key,
                 "X-Secret-API-Key": secret_key,
             })
-        data = b"{}" if method == "POST" else None
+        if idempotency_key is not None:
+            headers["Idempotency-Key"] = idempotency_key
+        data = None
+        if method == "POST":
+            data = json.dumps(
+                payload if write_route else {},
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
         if data is not None:
             headers["Content-Type"] = "application/json"
         request = urllib.request.Request(
             f"{self._base}/{path}", data=data, headers=headers, method=method
         )
+        replayed: str | None = None
         try:
             with self._opener.open(request, timeout=self._timeout) as response:
                 raw = response.read(MAX_RESPONSE_BYTES + 1)
+                replayed = response.headers.get("Idempotent-Replayed")
         except urllib.error.HTTPError as error:
             raw = error.read(MAX_RESPONSE_BYTES + 1)
             if len(raw) > MAX_RESPONSE_BYTES:
+                if mutation:
+                    raise PorkbunMutationUncertainError(path) from None
                 raise PorkbunTransportError(
                     f"Porkbun HTTP failure for {path}: {error.code}"
                 ) from None
             try:
                 payload = json.loads(raw.decode("utf-8"))
             except (json.JSONDecodeError, UnicodeError):
+                if mutation:
+                    raise PorkbunMutationUncertainError(path) from None
                 raise PorkbunTransportError(
                     f"Porkbun HTTP failure for {path}: {error.code}"
                 ) from None
-            self._provider_error(payload, error.code)
+            try:
+                self._provider_error(payload, error.code)
+            except PorkbunResponseError:
+                if mutation:
+                    raise PorkbunMutationUncertainError(path) from None
+                raise
             raise AssertionError("unreachable")
         except (urllib.error.URLError, OSError, ValueError) as error:
+            if mutation:
+                raise PorkbunMutationUncertainError(path) from None
             safe = redact(str(error), self._credentials or ())
             raise PorkbunTransportError(
                 f"Porkbun transport failure for {path}: {safe}"
             ) from None
         if len(raw) > MAX_RESPONSE_BYTES:
+            if mutation:
+                raise PorkbunMutationUncertainError(path)
             raise PorkbunResponseError(f"Porkbun response for {path} is too large")
         try:
             payload = json.loads(raw.decode("utf-8"))
         except (json.JSONDecodeError, UnicodeError):
+            if mutation:
+                raise PorkbunMutationUncertainError(path) from None
             raise PorkbunResponseError(
                 f"Porkbun response for {path} is not valid JSON"
             ) from None
         if isinstance(payload, dict) and payload.get("status") == "ERROR":
-            self._provider_error(payload, None)
+            try:
+                self._provider_error(payload, None)
+            except PorkbunResponseError:
+                if mutation:
+                    raise PorkbunMutationUncertainError(path) from None
+                raise
+        if replayed is not None:
+            if (
+                replayed.lower() != "true"
+                or not write_route
+                or idempotency_key is None
+                or not isinstance(payload, dict)
+            ):
+                if mutation:
+                    raise PorkbunMutationUncertainError(path)
+                raise PorkbunResponseError("invalid Porkbun idempotency replay header")
+            payload = dict(payload)
+            payload["idempotentReplayed"] = True
         return payload
 
     def ping(self) -> dict:
@@ -694,6 +1081,124 @@ class PorkbunClient:
     def get_dns_records(self, domain: str) -> dict:
         name = quote(_domain(domain), safe="")
         return _validate_dns(self._request(f"dns/retrieve/{name}"))
+
+    def create_domain(
+        self,
+        domain: str,
+        *,
+        cost: int,
+        dry_run: bool,
+        idempotency_key: str | None = None,
+    ) -> dict:
+        """Preview or perform one registration attempt at the exact quoted cents."""
+        normalized = _domain(domain)
+        cents = _input_integer(cost, "domain cost")
+        key = _idempotency(idempotency_key, dry_run=dry_run)
+        payload: dict[str, object] = {
+            "cost": cents,
+            "agreeToTerms": "yes",
+            "whoisPrivacy": True,
+        }
+        if dry_run:
+            payload["dryRun"] = True
+        raw = self._request(
+            f"domain/create/{quote(normalized, safe='')}",
+            method="POST",
+            payload=payload,
+            idempotency_key=key,
+        )
+        try:
+            return _validate_create_domain(
+                raw, domain=normalized, cost=cents, dry_run=dry_run
+            )
+        except (PorkbunConfigurationError, PorkbunResponseError):
+            if not dry_run:
+                raise PorkbunMutationUncertainError(
+                    f"domain/create/{normalized}"
+                ) from None
+            raise
+
+    def dns_create(
+        self,
+        domain: str,
+        *,
+        record_type: str,
+        content: str,
+        idempotency_key: str,
+        name: str = "",
+        ttl: int | None = None,
+        prio: int | None = None,
+        notes: str | None = None,
+    ) -> dict:
+        normalized = _domain(domain)
+        payload = _dns_payload(
+            normalized,
+            record_type=record_type,
+            content=content,
+            name=name,
+            ttl=ttl,
+            prio=prio,
+            notes=notes,
+        )
+        raw = self._request(
+            f"dns/create/{quote(normalized, safe='')}",
+            method="POST",
+            payload=payload,
+            idempotency_key=_idempotency(idempotency_key, dry_run=False),
+        )
+        try:
+            return _validate_dns_create(raw)
+        except (PorkbunConfigurationError, PorkbunResponseError):
+            raise PorkbunMutationUncertainError("dns/create") from None
+
+    def dns_edit(
+        self,
+        domain: str,
+        record_id: str,
+        *,
+        record_type: str,
+        content: str,
+        idempotency_key: str,
+        name: str | None = None,
+        ttl: int | None = None,
+        prio: int | None = None,
+        notes: str | None = None,
+    ) -> dict:
+        normalized = _domain(domain)
+        identifier = _record_id(record_id)
+        payload = _dns_payload(
+            normalized,
+            record_type=record_type,
+            content=content,
+            name=name,
+            ttl=ttl,
+            prio=prio,
+            notes=notes,
+        )
+        raw = self._request(
+            f"dns/edit/{quote(normalized, safe='')}/{identifier}",
+            method="POST",
+            payload=payload,
+            idempotency_key=_idempotency(idempotency_key, dry_run=False),
+        )
+        try:
+            return _validate_dns_change(raw, "DNS-edit response")
+        except PorkbunResponseError:
+            raise PorkbunMutationUncertainError("dns/edit") from None
+
+    def dns_delete(self, domain: str, record_id: str, *, idempotency_key: str) -> dict:
+        normalized = _domain(domain)
+        identifier = _record_id(record_id)
+        raw = self._request(
+            f"dns/delete/{quote(normalized, safe='')}/{identifier}",
+            method="POST",
+            payload={},
+            idempotency_key=_idempotency(idempotency_key, dry_run=False),
+        )
+        try:
+            return _validate_dns_change(raw, "DNS-delete response")
+        except PorkbunResponseError:
+            raise PorkbunMutationUncertainError("dns/delete") from None
 
     def get_nameservers(self, domain: str) -> dict:
         name = quote(_domain(domain), safe="")

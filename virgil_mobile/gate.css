@@ -1,0 +1,162 @@
+:root {
+  color-scheme: dark;
+  font-family: system-ui, sans-serif;
+  background: #101315;
+  color: #f2f5f4;
+}
+* {
+  box-sizing: border-box;
+}
+body {
+  margin: 0;
+  min-height: 100vh;
+  background: #101315;
+}
+header {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.8rem 1rem;
+  background: #171c1e;
+  border-bottom: 1px solid #364145;
+}
+header span {
+  color: #aab7b5;
+  overflow-wrap: anywhere;
+}
+main {
+  width: min(100%, 70rem);
+  margin: auto;
+  padding: 1rem;
+}
+h1 {
+  margin: 0 0 0.5rem;
+  font-size: 1.2rem;
+}
+.task,
+form,
+.actions {
+  margin-bottom: 1rem;
+}
+.task p {
+  margin: 0.35rem 0;
+}
+.hint {
+  color: #aab7b5;
+  font-size: 0.9rem;
+}
+.browser-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  margin-bottom: 0.6rem;
+}
+.browser-toolbar label {
+  margin: 0;
+}
+.viewer {
+  position: relative;
+  min-height: 15rem;
+  margin-bottom: 1rem;
+  background: #050606;
+  border: 1px solid #364145;
+  border-radius: 0.6rem;
+  overflow: hidden;
+}
+canvas {
+  display: block;
+  width: 100%;
+  height: auto;
+  min-height: 15rem;
+  touch-action: none;
+  outline: none;
+}
+canvas:focus {
+  box-shadow: inset 0 0 0 3px #5ed4b3;
+}
+canvas.readonly {
+  opacity: 0.72;
+}
+#control-banner {
+  position: absolute;
+  inset: auto 0 0;
+  padding: 0.7rem;
+  text-align: center;
+  background: #8a5b09e8;
+}
+label {
+  display: block;
+  margin-bottom: 0.35rem;
+}
+form div,
+.actions {
+  display: flex;
+  gap: 0.6rem;
+}
+input {
+  min-width: 0;
+  flex: 1;
+  padding: 0.75rem;
+  color: inherit;
+  background: #171c1e;
+  border: 1px solid #536266;
+  border-radius: 0.45rem;
+  font-size: 1rem;
+}
+select {
+  min-width: 0;
+  flex: 1;
+  padding: 0.55rem;
+  color: inherit;
+  background: #171c1e;
+  border: 1px solid #536266;
+  border-radius: 0.45rem;
+  font: inherit;
+}
+select:disabled {
+  color: #aab7b5;
+}
+button {
+  padding: 0.7rem 0.9rem;
+  border: 1px solid #647477;
+  border-radius: 0.45rem;
+  color: inherit;
+  background: #273034;
+  font: inherit;
+}
+button.primary {
+  margin-left: auto;
+  color: #07120f;
+  background: #5ed4b3;
+  border-color: #5ed4b3;
+  font-weight: 700;
+}
+button:focus-visible,
+input:focus-visible,
+select:focus-visible {
+  outline: 3px solid #8de7ce;
+  outline-offset: 2px;
+}
+#status {
+  min-height: 1.4rem;
+}
+.gate-error {
+  padding-top: 12vh;
+  text-align: center;
+}
+@media (max-width: 40rem) {
+  header {
+    flex-direction: column;
+  }
+  form div,
+  .actions {
+    flex-wrap: wrap;
+  }
+  button {
+    flex: 1;
+  }
+  button.primary {
+    margin-left: 0;
+    flex-basis: 100%;
+  }
+}

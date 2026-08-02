@@ -237,6 +237,12 @@ TOOLSETS = {
         "includes": []
     },
     
+    "commerce": {
+        "description": "Governed ecommerce launch control plane (Telegram only)",
+        "tools": ["commerce_launch"],
+        "includes": []
+    },
+
     "code_execution": {
         "description": "Run Python scripts that call tools programmatically (reduces LLM round trips)",
         "tools": ["execute_code"],

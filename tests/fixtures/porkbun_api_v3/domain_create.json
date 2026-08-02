@@ -1,0 +1,23 @@
+{
+  "status": "SUCCESS",
+  "domain": "example.com",
+  "cost": 1108,
+  "orderId": 12345678,
+  "limits": {
+    "attempts": {
+      "TTL": 10,
+      "limit": 1,
+      "used": 1,
+      "naturalLanguage": "1 out of 1 create attempts used."
+    },
+    "success": {
+      "TTL": 86400,
+      "limit": 50,
+      "used": 1,
+      "naturalLanguage": "1 out of 50 successful creates used."
+    }
+  },
+  "balance": 392,
+  "ttlRemaining": 86400,
+  "requestId": "019e04fa-0000-7000-8000-000000000011"
+}

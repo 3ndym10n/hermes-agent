@@ -1,0 +1,17 @@
+{
+  "status": "SUCCESS",
+  "dryRun": true,
+  "wouldSucceed": true,
+  "operation": "registration",
+  "domain": "example.com",
+  "tld": "com",
+  "available": "available",
+  "premium": false,
+  "duration": 1,
+  "cost": 1108,
+  "costDisplay": "$11.08",
+  "balance": 1500,
+  "sufficientFunds": true,
+  "message": "Dry run: no order was created and no charge was made.",
+  "requestId": "019e04fa-0000-7000-8000-000000000010"
+}
