@@ -31,6 +31,7 @@ class Store:
     def __init__(self):
         self.accounts = []
         self.actions = []
+        self.gates = []
 
     def latest_facts(self, _job_id):
         return dict(FACTS)
@@ -41,6 +42,9 @@ class Store:
     def upsert_provider_account(self, **value):
         self.accounts.append(value)
         return value
+
+    def list_gates(self, _job_id):
+        return deepcopy(getattr(self, "gates", []))
 
 
 class Porkbun:
@@ -511,3 +515,126 @@ def test_mutation_reconcilers_use_only_provider_truth():
         result = reconcilers[action_type]({}, action_value)
         assert result["status"] == "succeeded"
         assert result["evidence"]["provider_truth_verified"] is True
+
+
+APPROVAL_FINGERPRINT = "a" * 64
+
+
+def _approval_gate(fingerprint=APPROVAL_FINGERPRINT):
+    return {
+        "gate_type": "action_approval",
+        "approval_fingerprint": fingerprint,
+        "status": "consumed",
+        "completion_evidence": {
+            "approval_granted": True,
+            "proposal_id": "pp_1",
+            "ticket_id": "pt_1",
+            "approval_reference": "pa_1",
+            "action_fingerprint": fingerprint,
+        },
+    }
+
+
+def test_registration_reconciliation_restores_cogitator_truth(tmp_path):
+    """Provider charged, first completion report failed: reconcile, never re-buy."""
+    porkbun = Porkbun()
+    current, provider, _handlers = expanded(tmp_path, porkbun=porkbun)
+    store = Store()
+    store.gates = [_approval_gate()]
+    calls: list[str] = []
+
+    def flaky_record(**kwargs):
+        calls.append(str(kwargs.get("order_id")))
+        if len(calls) == 1:
+            raise RuntimeError("cogitator unreachable")
+        return {
+            "proposal_id": "pp_1",
+            "approval_id": "pa_1",
+            "receipt_ref": "purchase-receipts/domain-1",
+        }
+
+    handlers = production_handlers(
+        store,
+        porkbun_factory=lambda: provider,
+        shopify_factory=lambda: Shopify(),
+        facts_loader=lambda _job: FACTS,
+        record_purchase=flaky_record,
+        clock=lambda: NOW,
+        sleep=lambda _seconds: None,
+        evidence_root=tmp_path,
+    )
+    step = find_step(current, "s02_porkbun_register")
+    register_action = action(step, approval_status="live")
+    register_action["action_fingerprint"] = APPROVAL_FINGERPRINT
+
+    # 1-3. Provider create succeeds; the completion report fails; the step
+    # reports an uncertain outcome carrying the safe registration facts.
+    with pytest.raises(ProviderStepError) as raised:
+        handlers["porkbun_register_domain"](current, register_action)
+    assert raised.value.code == "registration_completion_unrecorded"
+    assert raised.value.uncertain is True
+    carried = raised.value.evidence
+    assert carried["order_id"] == "1234"
+    assert carried["amount_usd_cents"] == 1200
+    assert carried["proposal_id"] == "pp_1"
+    assert provider.registrations == 1
+
+    # 4-5. Reconciliation confirms the domain and retries the report.
+    provider.account_domains = [
+        {"domain": "siliconcurrent.com", "autoRenew": 1, "whoisPrivacy": 1}
+    ]
+    reconcilers = production_reconcilers(
+        porkbun_factory=lambda: provider,
+        record_purchase=flaky_record,
+        store=store,
+        clock=lambda: NOW,
+    )
+    uncertain_action = {
+        "request": {"input": deepcopy(step["request"])},
+        "action_fingerprint": APPROVAL_FINGERPRINT,
+        "dispatched_at": "2026-08-02T11:00:00Z",
+        "result": {"error_code": "registration_completion_unrecorded", **carried},
+    }
+    verdict = reconcilers["porkbun_register_domain"](current, uncertain_action)
+
+    # 6-8. Exactly one purchase, and the reconciled result carries the refs.
+    assert verdict["status"] == "succeeded"
+    assert provider.registrations == 1
+    assert len(calls) == 2
+    assert verdict["evidence"]["cogitator"] == {
+        "proposal_id": "pp_1",
+        "approval_id": "pa_1",
+        "receipt_ref": "purchase-receipts/domain-1",
+    }
+    assert verdict["evidence"]["order_id"] == "1234"
+    assert verdict["evidence"]["amount_usd_cents"] == 1200
+
+
+def test_registration_stays_parked_when_cogitator_cannot_be_reconciled(tmp_path):
+    """Porkbun agreeing is not enough; the money authority must agree too."""
+    porkbun = Porkbun()
+    current, provider, _handlers = expanded(tmp_path, porkbun=porkbun)
+    provider.account_domains = [
+        {"domain": "siliconcurrent.com", "autoRenew": 1, "whoisPrivacy": 1}
+    ]
+
+    def always_fails(**_kwargs):
+        raise RuntimeError("cogitator down")
+
+    reconcilers = production_reconcilers(
+        porkbun_factory=lambda: provider,
+        record_purchase=always_fails,
+        store=Store(),
+        clock=lambda: NOW,
+    )
+    verdict = reconcilers["porkbun_register_domain"](
+        current,
+        {
+            "request": {"input": {"domain": "siliconcurrent.com"}},
+            "dispatched_at": "2026-08-02T11:00:00Z",
+            "result": {"order_id": "1234", "amount_usd_cents": 1200},
+        },
+    )
+
+    # Parked, not advanced: DNS and Shopify must not run on an unrecorded buy.
+    assert verdict == {"status": "pending"}

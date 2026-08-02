@@ -908,29 +908,63 @@ class ShopifyAdminClient:
             else None,
         }
 
-    def commerce_surface(self) -> dict:
-        """Read the two provider truths that prove checkout cannot be reached.
+    def page_by_handle(self, handle: str) -> dict | None:
+        """Read one published page back, for gate verification."""
+        pages = self._pages(_handle(handle))
+        if len(pages) > 1:
+            raise ShopifyResponseError(
+                "multiple Shopify pages use the requested handle"
+            )
+        return pages[0] if pages else None
 
-        V1 publishes no products and configures no payment provider, so both
-        counts must be zero for the §9.3 `checkout_absent` check to pass.
+    def menu_by_handle(self, handle: str) -> dict | None:
+        """Read one navigation menu back, for gate verification."""
+        menus = self._menus(_handle(handle))
+        return menus[0] if menus else None
+
+    def theme_settings_text(self, theme_id: str | None = None) -> str:
+        """Read the live theme's settings JSON, for gate verification."""
+        resolved = (
+            _gid(theme_id, "theme_id")
+            if theme_id is not None
+            else self.main_theme()["id"]
+        )
+        return self._theme_settings_text(resolved)
+
+    def commerce_surface(self) -> dict:
+        """Read the sellable-surface facts behind the checkout-absent check.
+
+        `paymentSettings` hangs off `shop`, not the query root. It is reported
+        verbatim and **not** interpreted: `supportedDigitalWallets` is the list
+        of wallets the shop *could* support, which is not evidence that a
+        payment provider is configured, and Shopify exposes no documented field
+        that is. Checkout absence is therefore proven from customer-facing
+        facts in `commerce_verify` -- zero products, no buy/price controls, no
+        product route, no reachable cart or checkout.
         """
         data = self._graphql(
             "VirgilCommerceSurface",
-            """query VirgilCommerceSurface { productsCount { count } paymentSettings { supportedDigitalWallets } shop { id } }""",
+            """query VirgilCommerceSurface { productsCount { count } shop { id paymentSettings { supportedDigitalWallets } } }""",
             {},
         )
         products = _mapping(data.get("productsCount"), "productsCount")
         count = products.get("count")
         if isinstance(count, bool) or not isinstance(count, int) or count < 0:
             raise ShopifyResponseError("Shopify returned an invalid product count")
-        settings = _mapping(data.get("paymentSettings"), "paymentSettings")
+        shop = _mapping(data.get("shop"), "shop")
+        settings = _mapping(shop.get("paymentSettings"), "shop.paymentSettings")
         wallets = _list(
             settings.get("supportedDigitalWallets"),
-            "paymentSettings.supportedDigitalWallets",
+            "shop.paymentSettings.supportedDigitalWallets",
         )
         return {
             "products_count": count,
-            "payment_provider_configured": bool(wallets),
+            "supported_digital_wallets": tuple(
+                _string(
+                    wallet, "shop.paymentSettings.supportedDigitalWallets[]", maximum=64
+                )
+                for wallet in wallets
+            ),
         }
 
     def customer_by_email(self, email: str) -> dict | None:

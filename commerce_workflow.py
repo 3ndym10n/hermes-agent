@@ -70,11 +70,16 @@ Verify = Callable[[Mapping[str, Any], Any, Mapping[str, Any], str], Mapping[str,
 Publish = Callable[[Mapping[str, Any], Any], Mapping[str, Any]]
 
 
-def _error(code: str, *, uncertain: bool = False) -> Exception:
+def _error(
+    code: str,
+    *,
+    uncertain: bool = False,
+    evidence: Mapping[str, Any] | None = None,
+) -> Exception:
     # Imported lazily so commerce_operator can import this module without a cycle.
     from commerce_operator import ProviderStepError
 
-    return ProviderStepError(code, uncertain=uncertain)
+    return ProviderStepError(code, uncertain=uncertain, evidence=evidence)
 
 
 def _step(
@@ -806,12 +811,15 @@ def production_handlers(
             # The registrar has already charged and created the domain, so this
             # is bookkeeping. If it cannot be recorded the money authority and
             # the ledger disagree, which is exactly an uncertain outcome: park
-            # for reconciliation rather than report a clean success.
+            # for reconciliation rather than report a clean success. The safe
+            # registration facts ride along on the error so reconciliation can
+            # retry the completion report instead of losing the order.
+            approval = purchase_approval(job, action)
             try:
                 recorded = record_purchase(
                     job=job,
                     action=action,
-                    approval=purchase_approval(job, action),
+                    approval=approval,
                     order_id=order_id,
                     amount_usd_cents=request["cost_usd_cents"],
                 )
@@ -822,7 +830,19 @@ def production_handlers(
                 }
             except Exception:
                 raise _error(
-                    "registration_completion_unrecorded", uncertain=True
+                    "registration_completion_unrecorded",
+                    uncertain=True,
+                    evidence={
+                        "domain": request["domain"],
+                        "order_id": order_id,
+                        "amount_usd_cents": request["cost_usd_cents"],
+                        "action_fingerprint": str(action.get("action_fingerprint", "")),
+                        "approval_reference": str(
+                            approval.get("approval_reference", "")
+                        ),
+                        "proposal_id": str(approval.get("proposal_id", "")),
+                        "ticket_id": str(approval.get("ticket_id", "")),
+                    },
                 ) from None
         return {
             **payload,
@@ -1469,14 +1489,27 @@ def production_reconcilers(
     *,
     porkbun_factory: Callable[[], Any] = PorkbunClient,
     shopify_factory: Callable[[], Any] | None = None,
+    record_purchase: Callable[..., Mapping[str, Any]] | None = None,
+    store: Any = None,
     clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
 ) -> dict[
     str,
     Callable[[Mapping[str, Any], Mapping[str, Any]], Mapping[str, Any] | None],
 ]:
-    """Read-only reconciliation for every workflow mutation that can be uncertain."""
+    """Read-only reconciliation for every workflow mutation that can be uncertain.
 
-    def registration(_job, action):
+    The registration leg is the exception that also *writes*, to Cogitator
+    only: a domain that Porkbun charged for but the money authority never
+    recorded is not a resolved action, so reconciliation retries the
+    completion report (idempotently, same key) before it will call the
+    registration succeeded.
+    """
+
+    def _uncertain_evidence(action: Mapping[str, Any]) -> Mapping[str, Any]:
+        result = action.get("result")
+        return result if isinstance(result, Mapping) else {}
+
+    def registration(job, action):
         domain = _action_input(action).get("domain")
         domains = porkbun_factory().list_domains().get("domains", [])
         match = next(
@@ -1488,16 +1521,53 @@ def production_reconcilers(
             None,
         )
         if match is not None:
-            return {
-                "status": "succeeded",
-                "evidence": {
-                    "provider_truth_verified": True,
-                    "domain": domain,
-                    "present": True,
-                    "auto_renew": match.get("autoRenew") == 1,
-                    "whois_privacy": match.get("whoisPrivacy") == 1,
-                },
+            carried = _uncertain_evidence(action)
+            evidence = {
+                "provider_truth_verified": True,
+                "domain": domain,
+                "present": True,
+                "auto_renew": match.get("autoRenew") == 1,
+                "whois_privacy": match.get("whoisPrivacy") == 1,
             }
+            for field in ("order_id", "amount_usd_cents"):
+                if carried.get(field) not in (None, ""):
+                    evidence[field] = carried[field]
+            cogitator = carried.get("cogitator")
+            if not isinstance(cogitator, Mapping) and record_purchase is not None:
+                # Porkbun agrees the domain exists; the ledger and the money
+                # authority still disagree. Retry the report with the same
+                # idempotency key so a duplicate is a replay, not a re-charge.
+                try:
+                    recorded = record_purchase(
+                        job=job,
+                        action=action,
+                        approval={
+                            "approval_granted": True,
+                            "proposal_id": carried.get("proposal_id", ""),
+                            "ticket_id": carried.get("ticket_id", ""),
+                            "approval_reference": carried.get("approval_reference", ""),
+                            "action_fingerprint": carried.get("action_fingerprint", ""),
+                        },
+                        order_id=str(carried.get("order_id", "")),
+                        amount_usd_cents=int(carried.get("amount_usd_cents", 0)),
+                    )
+                    cogitator = {
+                        "proposal_id": str(recorded["proposal_id"]),
+                        "approval_id": str(recorded["approval_id"]),
+                        "receipt_ref": str(recorded["receipt_ref"]),
+                    }
+                except Exception:
+                    # Leave the job in reconciliation_required; Cal is notified
+                    # by the watcher rendering that state. Never advance to DNS
+                    # or Shopify on a purchase the authority has not recorded.
+                    return {"status": "pending"}
+            if isinstance(cogitator, Mapping):
+                evidence["cogitator"] = dict(cogitator)
+            elif record_purchase is not None:
+                # A money bridge is configured, so a registration it never
+                # recorded is not reconciled. Stay parked.
+                return {"status": "pending"}
+            return {"status": "succeeded", "evidence": evidence}
         dispatched = action.get("dispatched_at")
         try:
             then = datetime.fromisoformat(str(dispatched).replace("Z", "+00:00"))

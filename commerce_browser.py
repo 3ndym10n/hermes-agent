@@ -326,3 +326,63 @@ def insert_text(session: str, value: Any) -> None:
 
 def switch_tab(session: str, tab_id: Any) -> None:
     browser_json(session, "tab", validate_tab_id(tab_id), timeout=5)
+
+
+MOBILE_VIEWPORT = (390, 844)
+MAX_PAGE_TEXT = 200_000
+
+
+def set_viewport(session: str, width: int, height: int) -> None:
+    """Pin a deterministic viewport before capturing layout evidence."""
+    for value in (width, height):
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or not 1 <= value <= 4096
+        ):
+            raise BrowserLifecycleError("invalid_browser_viewport")
+    browser_json(session, "viewport", str(width), str(height), timeout=10)
+
+
+def open_url(session: str, url: Any) -> None:
+    """Navigate the job's session to a validated, re-enterable entry URL."""
+    browser_json(session, "open", validate_entry_url(url), timeout=30)
+
+
+def page_text(session: str) -> str:
+    """Return the rendered page text, bounded so a hostile page cannot flood."""
+    data = browser_json(session, "get", "text", timeout=15)
+    text = data.get("text") if isinstance(data, dict) else data
+    if not isinstance(text, str):
+        raise BrowserLifecycleError("browser_read_failed")
+    return text[:MAX_PAGE_TEXT]
+
+
+def screenshot(session: str, path: Path | str) -> Path:
+    """Capture one 0600 screenshot into the job's evidence directory."""
+    target = Path(path)
+    if target.is_symlink():
+        raise BrowserLifecycleError("unsafe_screenshot_path")
+    target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    browser_json(session, "screenshot", str(target), timeout=30)
+    if not target.is_file():
+        raise BrowserLifecycleError("browser_screenshot_failed")
+    target.chmod(0o600)
+    return target
+
+
+def fill_field(session: str, selector: str, value: str) -> None:
+    """Fill one selector. Never used for secrets -- those go through the gate."""
+    if not isinstance(selector, str) or not 1 <= len(selector) <= 256:
+        raise BrowserLifecycleError("invalid_browser_selector")
+    if not isinstance(value, str) or not 1 <= len(value) <= 1_024:
+        raise BrowserLifecycleError("invalid_browser_value")
+    browser_json(session, "fill", selector, value, timeout=15)
+
+
+def click_role(session: str, role: str, name: str) -> None:
+    """Click by accessible role and name rather than a brittle CSS path."""
+    for value in (role, name):
+        if not isinstance(value, str) or not 1 <= len(value) <= 128:
+            raise BrowserLifecycleError("invalid_browser_locator")
+    browser_json(session, "find", "role", f"{role}={name}", "click", timeout=15)

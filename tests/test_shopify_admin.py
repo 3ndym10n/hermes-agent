@@ -32,6 +32,7 @@ class FakeShopify:
         self.theme_settings = "{}"
         self.products_count = 0
         self.digital_wallets = []
+        self.documents = []
         self.mutations = []
         self.operations = []
 
@@ -53,13 +54,17 @@ class FakeShopify:
             return self._reply(self.identity)
         if operation == "VirgilCommerceSurface":
             assert variables == {}
+            # Schema-faithful: paymentSettings hangs off shop, not QueryRoot.
+            self.documents.append(document["query"])
             return self._reply({
                 "data": {
                     "productsCount": {"count": self.products_count},
-                    "paymentSettings": {
-                        "supportedDigitalWallets": self.digital_wallets
+                    "shop": {
+                        "id": "gid://shopify/Shop/1",
+                        "paymentSettings": {
+                            "supportedDigitalWallets": self.digital_wallets
+                        },
                     },
-                    "shop": {"id": "gid://shopify/Shop/1"},
                 }
             })
         if operation == "VirgilPages":
@@ -540,6 +545,42 @@ def test_navigation_hard_fails_checkout_and_product_links():
             )
 
 
+def test_commerce_surface_sends_the_schema_faithful_document():
+    """paymentSettings lives under shop; a QueryRoot selection is invalid."""
+    fake = FakeShopify()
+    client = ShopifyAdminClient(
+        "silicon-current.myshopify.com", TOKEN, transport=fake
+    )
+
+    result = client.commerce_surface()
+
+    [document] = fake.documents
+    assert (
+        document
+        == "query VirgilCommerceSurface { productsCount { count } shop { id"
+           " paymentSettings { supportedDigitalWallets } } }"
+    )
+    assert "shop { id paymentSettings" in document
+    assert result == {"products_count": 0, "supported_digital_wallets": ()}
+
+
+def test_commerce_surface_reports_wallets_without_inferring_a_provider():
+    """Supported wallets are reported verbatim, never read as "configured"."""
+    fake = FakeShopify()
+    fake.digital_wallets = ["SHOPIFY_PAY", "APPLE_PAY"]
+    client = ShopifyAdminClient(
+        "silicon-current.myshopify.com", TOKEN, transport=fake
+    )
+
+    result = client.commerce_surface()
+
+    assert result == {
+        "products_count": 0,
+        "supported_digital_wallets": ("SHOPIFY_PAY", "APPLE_PAY"),
+    }
+    assert "payment_provider_configured" not in result
+
+
 def test_commerce_surface_reports_the_zero_checkout_truths():
     fake = FakeShopify()
     client = ShopifyAdminClient(
@@ -548,22 +589,21 @@ def test_commerce_surface_reports_the_zero_checkout_truths():
 
     assert client.commerce_surface() == {
         "products_count": 0,
-        "payment_provider_configured": False,
+        "supported_digital_wallets": (),
     }
     assert "VirgilCommerceSurface" in fake.operations
 
 
-def test_commerce_surface_reports_a_configured_payment_provider():
+def test_commerce_surface_reports_a_nonzero_product_count():
     fake = FakeShopify()
     fake.products_count = 3
-    fake.digital_wallets = ["SHOPIFY_PAY"]
     client = ShopifyAdminClient(
         "silicon-current.myshopify.com", TOKEN, transport=fake
     )
 
     assert client.commerce_surface() == {
         "products_count": 3,
-        "payment_provider_configured": True,
+        "supported_digital_wallets": (),
     }
 
 

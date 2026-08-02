@@ -1079,3 +1079,322 @@ def test_production_operator_runs_without_a_configured_money_bridge(
         make_store(tmp_path), lock_path=tmp_path / "worker.lock"
     )
     assert worker.step_handlers
+
+
+# --- production-assembly gate acceptance -------------------------------------
+#
+# These drive the operator that `production_operator` actually builds. A
+# hand-wired test operator would have stayed green while production shipped
+# `production_gate_verifiers()` with no callbacks at all.
+
+
+def _production_shopify(**overrides):
+    from tests.test_shopify_admin import TOKEN, FakeShopify
+    from shopify_admin import ShopifyAdminClient
+
+    fake = FakeShopify()
+    fake.identity["data"]["shop"].update(overrides.pop("identity", {}))
+    client = ShopifyAdminClient(
+        "silicon-current.myshopify.com", TOKEN, transport=fake
+    )
+    for name, value in overrides.items():
+        setattr(fake, name, value)
+    return client, fake
+
+
+def _gated_job(store, gate_type, *, tmp_path):
+    """Put a real job in awaiting_cal on `gate_type`, the way the worker does."""
+    job = make_job(store, objective=f"gate {gate_type}")
+    for target, expected in (("planning", "requested"), ("ready", "planning")):
+        snapshot = store.get_job(job["job_id"])
+        store.transition(
+            job["job_id"],
+            target,
+            expected_state=expected,
+            expected_version=int(snapshot["row_version"]),
+            actor="test",
+            reason_code="setup",
+            now=NOW,
+        )
+    snapshot = store.get_job(job["job_id"])
+    action = store.record_action(
+        job["job_id"],
+        action_type="shopify_identity",
+        provider="shopify",
+        effect_class="read_only",
+        idempotency_key=f"fake:{gate_type}",
+        request={"step_id": "s06", "input": {}},
+        target_state="executing_read_only",
+        now=NOW,
+    )
+    store.dispatch_and_transition(
+        action["action_id"],
+        expected_state="ready",
+        expected_version=int(snapshot["row_version"]),
+        actor="test",
+        now=NOW,
+    )
+    store.finish_action(
+        action["action_id"],
+        status="succeeded",
+        result={"provider_truth_verified": True},
+        now=NOW,
+    )
+    gate = store.open_gate(
+        job["job_id"],
+        gate_type=gate_type,
+        human_action="Do the thing, then tap DONE.",
+        provider_truth_reference="shopify.shop_identity",
+        opening_evidence={
+            "entry_url": "https://admin.shopify.com/",
+            "source_action_id": action["action_id"],
+        },
+        actor="test",
+        now=NOW,
+    )
+    snapshot = store.get_job(job["job_id"])
+    store.transition(
+        job["job_id"],
+        "awaiting_cal",
+        expected_state="executing_read_only",
+        expected_version=int(snapshot["row_version"]),
+        actor="test",
+        reason_code="provider_human_gate_required",
+        gate_id=gate["gate_id"],
+        now=NOW,
+    )
+    return job, gate
+
+
+def _record_facts(store, job_id):
+    store.record_facts(
+        job_id,
+        {
+            "contact_email": "launch@example.test",
+            "business_identity_sentence": (
+                "Silicon Current is operated by Example Trading."
+            ),
+            "double_opt_in": True,
+            "brand_signoff": True,
+            "privacy_signoff": True,
+        },
+        expected_version=int(store.get_job(job_id)["row_version"]),
+        actor="cal:test",
+        now=NOW,
+    )
+
+
+@pytest.mark.parametrize("gate_type", ["shopify_settings", "shopify_theme"])
+def test_production_gates_verify_from_provider_truth_and_resume(
+    tmp_path, gate_type, monkeypatch
+):
+    """Gate opens -> Cal taps DONE -> provider truth passes -> job resumes."""
+    store = make_store(tmp_path)
+    client, fake = _production_shopify()
+    job, gate = _gated_job(store, gate_type, tmp_path=tmp_path)
+    _record_facts(store, job["job_id"])
+    if gate_type == "shopify_theme":
+        from commerce_content import build_content as _build
+
+        package = _build(store.latest_facts(job["job_id"]))
+        fake.theme_settings = json.dumps({
+            "sections": {
+                "priority-access": {"type": "page"},
+                package["email_signup"]["anchor"]: {"type": "newsletter"},
+            }
+        })
+    plan = dict(store.get_job(job["job_id"])["plan"] or {})
+    plan["content_sha256"] = "0" * 64
+    worker = commerce.production_operator(
+        store,
+        lock_path=tmp_path / "worker.lock",
+        shopify_factory=lambda: client,
+        record_purchase=lambda **_kw: {},
+        evidence_root=tmp_path / "evidence",
+    )
+    # The shipped kill switch is off by default; flip it for this job only,
+    # and stand in for the one boundary a test cannot have: a real browser.
+    worker.enabled_fn = lambda: True
+    worker.browser_ensure = lambda *_a, **_k: {
+        "session": "commerce_test", "profile": str(tmp_path), "reattached": True
+    }
+
+    # Before DONE the verifier must not run at all.
+    worker.tick()
+    assert store.get_gate(gate["gate_id"])["status"] == "open"
+    assert store.get_job(job["job_id"])["current_state"] == "awaiting_cal"
+
+    _, token = store.issue_gate_handoff(gate["gate_id"], actor="test", now=NOW)
+    store.request_gate_done(gate["gate_id"], token, actor="cal:test", now=NOW)
+    worker.tick()
+
+    # The gate closed on provider truth and the SAME job carried on past it.
+    # It may now sit on the *next* gate -- that is the workflow advancing, not
+    # the original gate hanging.
+    closed = store.get_gate(gate["gate_id"])
+    assert closed["status"] in {"completed", "consumed"}
+    assert closed["completion_evidence"]["provider_truth_verified"] is True
+    events = [
+        (event["reason_code"], (event["evidence"] or {}).get("gate_id"))
+        for event in store.list_events(job["job_id"])
+    ]
+    assert ("human_gate_completed", gate["gate_id"]) in events
+    assert store.get_job(job["job_id"])["current_gate_id"] != gate["gate_id"]
+
+
+def test_production_settings_gate_refuses_a_store_that_is_not_australian(tmp_path):
+    """DONE alone is never proof: wrong currency must keep the gate open."""
+    store = make_store(tmp_path)
+    client, _fake = _production_shopify(identity={"currencyCode": "USD"})
+    job, gate = _gated_job(store, "shopify_settings", tmp_path=tmp_path)
+    _record_facts(store, job["job_id"])
+    worker = commerce.production_operator(
+        store,
+        lock_path=tmp_path / "worker.lock",
+        shopify_factory=lambda: client,
+        record_purchase=lambda **_kw: {},
+        evidence_root=tmp_path / "evidence",
+    )
+    worker.enabled_fn = lambda: True
+    worker.browser_ensure = lambda *_a, **_k: {
+        "session": "commerce_test", "profile": str(tmp_path), "reattached": True
+    }
+
+    _, token = store.issue_gate_handoff(gate["gate_id"], actor="test", now=NOW)
+    store.request_gate_done(gate["gate_id"], token, actor="cal:test", now=NOW)
+    worker.tick()
+
+    assert store.get_gate(gate["gate_id"])["status"] == "open"
+    assert store.get_job(job["job_id"])["current_state"] == "awaiting_cal"
+
+
+def test_production_operator_wires_every_gate_the_workflow_can_emit(tmp_path):
+    """Every emitted gate type must have a verifier, or it can never complete."""
+    import re as _re
+
+    source = (ROOT / "commerce_workflow.py").read_text(encoding="utf-8")
+    emitted = set(_re.findall(r'_human_gate\(\s*"([a-z_]+)"', source))
+    worker = commerce.production_operator(
+        make_store(tmp_path), lock_path=tmp_path / "worker.lock"
+    )
+
+    assert emitted, "no gates found in the workflow"
+    assert emitted <= set(worker.gate_verifiers), (
+        emitted - set(worker.gate_verifiers)
+    )
+
+
+def test_production_verify_is_wired_with_both_final_probes(tmp_path):
+    """Without these the final checklist is red forever and the launch cannot end."""
+    import commerce_verify
+
+    seen: dict[str, object] = {}
+    real_verify = commerce_verify.production_verify
+
+    def spy(**kwargs):
+        seen.update(kwargs)
+        return real_verify(**kwargs)
+
+    commerce_verify.production_verify = spy
+    try:
+        commerce.production_operator(
+            make_store(tmp_path), lock_path=tmp_path / "worker.lock"
+        )
+    finally:
+        commerce_verify.production_verify = real_verify
+
+    assert seen.get("waitlist_probe") is not None, "waitlist round trip unwired"
+    assert seen.get("mobile_screenshot") is not None, "mobile probe unwired"
+    assert callable(seen["waitlist_probe"])
+    assert callable(seen["mobile_screenshot"])
+
+
+def test_production_final_verification_completes_and_writes_a_receipt(tmp_path):
+    """The assembly's own verifier must be able to produce the §16 receipt."""
+    import json as _json
+
+    from commerce_content import build_content
+    from commerce_verify import production_verify
+
+    store = make_store(tmp_path)
+    client, _fake = _production_shopify()
+    job = make_job(store, objective="final verify")
+    _record_facts(store, job["job_id"])
+    facts = store.latest_facts(job["job_id"])
+    package = build_content(facts)
+    domain = "siliconcurrent.com"
+    approved = package["pages"]["priority-access"]["body_html"]
+    root = f"<html><body>{approved}</body></html>".encode()
+    pages = {
+        f"https://{domain}/": (200, root, f"https://{domain}/", ()),
+        f"https://www.{domain}/": (200, root, f"https://{domain}/", (f"https://{domain}/",)),
+        f"https://{domain}/policies/privacy-policy": (200, b"<h1>Privacy</h1>", f"https://{domain}/policies/privacy-policy", ()),
+        f"https://{domain}/pages/contact": (200, b"<h1>Contact</h1>", f"https://{domain}/pages/contact", ()),
+        f"https://{domain}/cart": (200, b"<h1>Your cart is empty</h1>", f"https://{domain}/cart", ()),
+        f"https://{domain}/checkout": (200, b"<h1>Your cart is empty</h1>", f"https://{domain}/cart", (f"https://{domain}/cart",)),
+        f"https://{domain}/products/__virgil_missing__": (404, b"nope", f"https://{domain}/products/__virgil_missing__", ()),
+    }
+
+    def fetch(url):
+        from commerce_verify import HTTPResult
+
+        status, body, final, redirects = pages[url]
+        return HTTPResult(status, body, final, redirects)
+
+    def dns(_host, record_type):
+        from commerce_verify import EXPECTED_SHOPIFY_DNS
+
+        values = EXPECTED_SHOPIFY_DNS[record_type]
+        return {"a": values, "b": values}
+
+    verify = production_verify(
+        store=store,
+        porkbun_factory=lambda: type(
+            "P", (), {"list_domains": lambda _s: {"domains": [{"domain": domain}]}}
+        )(),
+        fetch=fetch,
+        dns_lookup=dns,
+        waitlist_probe=lambda *_a: {
+            "customer_found": True,
+            "consent_recorded": True,
+            "confirmation_shown": True,
+            "subscriber_deleted": True,
+            "test_address_digest": "sha256:" + "a" * 64,
+        },
+        mobile_screenshot=lambda *_a: True,
+    )
+    current = dict(store.get_job(job["job_id"]))
+    from commerce_content import content_fingerprint
+
+    current["plan"] = {
+        "domain": domain,
+        "content_sha256": content_fingerprint(package),
+        "shopify": {
+            "shop_id": "gid://shopify/Shop/1",
+            "myshopify_domain": "silicon-current.myshopify.com",
+            "plan": "Basic",
+        },
+    }
+    store.list_actions = lambda _job_id: [{
+        "action_type": "porkbun_register_domain",
+        "action_status": "succeeded",
+        "result": {
+            "order_id": "1234",
+            "amount_usd_cents": 1198,
+            "cogitator": {
+                "proposal_id": "pp_1",
+                "approval_id": "pa_1",
+                "receipt_ref": "purchase-receipts/domain-1",
+            },
+        },
+    }]
+
+    report = verify(current, client, package, "final")
+
+    assert report["all_green"] is True
+    facts_out = report["receipt_facts"]
+    assert facts_out["waitlist_test"]["result"] == "pass"
+    assert facts_out["domain"]["cogitator"]["receipt_ref"] == "purchase-receipts/domain-1"
+    assert facts_out["no_payment_collected"] is True
+    # No email address may reach the receipt -- only its digest.
+    assert "@" not in _json.dumps(facts_out)

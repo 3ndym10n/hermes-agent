@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from html.parser import HTMLParser
 from urllib.parse import urljoin, urlsplit
 
-from commerce_content import scan_forbidden_claims
+from commerce_content import build_content, content_fingerprint, scan_forbidden_claims
 
 MAX_HTML_BYTES = 2_097_152
 MAX_REDIRECTS = 5
@@ -238,7 +238,6 @@ def verify_launch(
     waitlist_probe: Mapping[str, object],
     mobile_screenshot_ok: bool,
     products_count: int,
-    payment_provider_configured: bool,
 ) -> dict:
     """Return a PII-free red/green report; no callback here is allowed to mutate."""
     domain = _host(domain)
@@ -254,8 +253,6 @@ def verify_launch(
         or products_count < 0
     ):
         raise VerificationConfigurationError("products_count is invalid")
-    if not isinstance(payment_provider_configured, bool):
-        raise VerificationConfigurationError("payment provider probe must be boolean")
     waitlist = _no_pii_probe(waitlist_probe)
     allowed_hosts = {domain, f"www.{domain}"}
     cache: dict[str, HTTPResult] = {}
@@ -313,13 +310,16 @@ def verify_launch(
         and cart_empty
     )
     missing_product = get(f"https://{domain}/products/__virgil_missing__")
+    # Checkout absence rests only on customer-facing facts. Shopify exposes no
+    # documented "is a payment provider configured" field, so nothing here
+    # claims one: if a shopper cannot reach a product, a cart or a checkout,
+    # and the shop publishes nothing to sell, no payment can be collected.
     commerce_absent = (
         not root_parser.commerce_controls
         and cart_empty
         and checkout_absent
         and missing_product.status in {404, 410}
         and products_count == 0
-        and payment_provider_configured is False
     )
     waitlist_green = all(waitlist.values())
     dns_green = _dns_green(dns_lookup, domain, expected_dns)
@@ -407,8 +407,11 @@ def https_fetch(url: str, *, timeout: float = FETCH_TIMEOUT_SECONDS) -> HTTPResu
             # instead of an exception, since pending SSL issuance is expected.
             if isinstance(getattr(error, "reason", None), ssl.SSLError):
                 return HTTPResult(
-                    status=0, body=b"", final_url=current,
-                    redirects=tuple(redirects), tls_valid=False,
+                    status=0,
+                    body=b"",
+                    final_url=current,
+                    redirects=tuple(redirects),
+                    tls_valid=False,
                 )
             raise VerificationConfigurationError("verification fetch failed") from None
         except Exception:
@@ -418,8 +421,11 @@ def https_fetch(url: str, *, timeout: float = FETCH_TIMEOUT_SECONDS) -> HTTPResu
         location = headers.get("Location") if 300 <= status < 400 else None
         if not location:
             return HTTPResult(
-                status=status, body=body, final_url=current,
-                redirects=tuple(redirects), tls_valid=True,
+                status=status,
+                body=body,
+                final_url=current,
+                redirects=tuple(redirects),
+                tls_valid=True,
             )
         target = urljoin(current, location)
         if urlsplit(target).scheme != "https":
@@ -453,9 +459,19 @@ def dig_lookup(
     for resolver in resolvers:
         try:
             completed = subprocess.run(
-                [binary, f"@{resolver}", "+short", "+timeout=5", "+tries=2",
-                 host, record_type],
-                capture_output=True, text=True, timeout=timeout, check=False,
+                [
+                    binary,
+                    f"@{resolver}",
+                    "+short",
+                    "+timeout=5",
+                    "+tries=2",
+                    host,
+                    record_type,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=False,
             )
         except subprocess.SubprocessError:
             continue
@@ -482,6 +498,12 @@ def _registration_facts(store: object, job_id: str) -> dict:
         result = action.get("result")
         if not isinstance(result, Mapping):
             break
+        # A reconciled action stores its verdict under "reconciliation" and
+        # keeps the failed attempt beside it, so read the reconciled facts
+        # first and fall back to the direct-success shape.
+        reconciled = result.get("reconciliation")
+        if isinstance(reconciled, Mapping):
+            result = reconciled
         cogitator = result.get("cogitator")
         if not isinstance(cogitator, Mapping):
             raise VerificationConfigurationError(
@@ -511,8 +533,10 @@ def _prepublish_report(
     """Report the pre-publication truths, all readable through the lock."""
     locked = client.storefront_probe("/")  # type: ignore[attr-defined]
     products = int(surface["products_count"])  # type: ignore[arg-type]
-    paid = bool(surface["payment_provider_configured"])
-    commerce_absent = products == 0 and not paid
+    # Behind the password nothing is reachable by a shopper at all, so the
+    # locked storefront plus a zero product count is the whole claim. No
+    # inference is drawn from the shop's supported digital wallets.
+    commerce_absent = products == 0 and locked.get("password_protected") is True
     checks = (
         (
             "storefront_locked",
@@ -520,7 +544,6 @@ def _prepublish_report(
             "storefront still returns the password page",
         ),
         ("no_products", products == 0, "shop publishes zero products"),
-        ("no_payment_provider", not paid, "no payment provider is configured"),
         (
             "dns",
             _dns_green(dns_lookup, domain, EXPECTED_SHOPIFY_DNS),
@@ -543,7 +566,8 @@ def production_verify(
     *,
     store: object | None = None,
     porkbun_factory: Callable[[], object] | None = None,
-    waitlist_probe: Callable[[Mapping, object, str], Mapping[str, object]] | None = None,
+    waitlist_probe: Callable[[Mapping, object, str], Mapping[str, object]]
+    | None = None,
     mobile_screenshot: Callable[[Mapping, str], bool] | None = None,
     fetch: Fetch = https_fetch,
     dns_lookup: DNSLookup = dig_lookup,
@@ -608,10 +632,11 @@ def production_verify(
             registrar_active=registrar_active(domain),
             waitlist_probe=probe,
             mobile_screenshot_ok=(
-                mobile_screenshot(job, domain) if mobile_screenshot is not None else False
+                mobile_screenshot(job, domain)
+                if mobile_screenshot is not None
+                else False
             ),
             products_count=int(surface["products_count"]),
-            payment_provider_configured=bool(surface["payment_provider_configured"]),
         )
         if phase != "final":
             return report
@@ -666,9 +691,7 @@ def production_verify(
                 },
                 {
                     "provider": "shopify",
-                    "amount": (
-                        f"{identity['plan']} billed to Cal's card at trial end"
-                    ),
+                    "amount": (f"{identity['plan']} billed to Cal's card at trial end"),
                 },
             ],
             "unresolved": [".com.au deferred pending ABN"],
@@ -676,3 +699,256 @@ def production_verify(
         return report
 
     return verify
+
+
+# --- production human-gate probes -------------------------------------------
+#
+# Every callback below reads provider truth. None of them treat Cal's DONE as
+# evidence: the operator only completes a gate when its probe independently
+# confirms the change at the provider.
+
+AUSTRALIAN_TIMEZONE_PREFIX = "Australia/"
+_LANDING_HANDLE = "priority-access"
+_SIGNUP_ANCHOR = "priority-signup"
+
+
+def _facts_for(store: object, job: Mapping) -> Mapping[str, object]:
+    try:
+        facts = store.latest_facts(str(job["job_id"]))  # type: ignore[attr-defined]
+    except Exception:
+        return {}
+    return facts if isinstance(facts, Mapping) else {}
+
+
+def production_settings_verify() -> Callable[[Mapping, object], bool]:
+    """Confirm the store settings Shopify's Admin API can actually prove.
+
+    Currency and timezone are read back from the shop itself. The double
+    opt-in choice is deliberately *not* asserted here: Shopify exposes no
+    documented Admin API field for it (`capabilities()` reports
+    `double_opt_in_setting.supported = False`), and scraping the admin UI is
+    the worker-driven provider-page automation the plan rules out. It is
+    proven instead where provider truth exists for it -- the waitlist round
+    trip below reads the resulting customer's marketing state and fails the
+    launch if it contradicts the approved choice.
+    """
+
+    def verify(_job: Mapping, client: object) -> bool:
+        identity = client.shop_identity()  # type: ignore[attr-defined]
+        return identity.get("currency") == "AUD" and str(
+            identity.get("timezone", "")
+        ).startswith(AUSTRALIAN_TIMEZONE_PREFIX)
+
+    return verify
+
+
+def production_content_verify(*, store: object) -> Callable[[Mapping, object], bool]:
+    """Confirm the approved package is what actually exists on the store."""
+
+    def verify(job: Mapping, client: object) -> bool:
+        package = build_content(_facts_for(store, job))
+        if content_fingerprint(package) != job.get("plan", {}).get("content_sha256"):
+            return False
+        pages = package["pages"]
+        for handle, expected in pages.items():
+            page = client.page_by_handle(handle)  # type: ignore[attr-defined]
+            if page is None or page.get("is_published") is not True:
+                return False
+            if page.get("body") != expected["body_html"]:
+                return False
+            body = str(page.get("body", ""))
+            if scan_forbidden_claims(body) or PLACEHOLDER.search(body):
+                return False
+            parsed = _html(body.encode("utf-8"))[1]
+            if parsed.commerce_controls:
+                return False
+        navigation = package["navigation"]
+        menu = client.menu_by_handle(navigation["handle"])  # type: ignore[attr-defined]
+        if menu is None:
+            return False
+        titles = {
+            str(item.get("title", ""))
+            for item in menu.get("items", [])
+            if isinstance(item, Mapping)
+        }
+        return {str(item["title"]) for item in navigation["items"]} <= titles
+
+    return verify
+
+
+def production_theme_verify(*, store: object) -> Callable[[Mapping, object], bool]:
+    """Confirm Dawn is live and carries the landing + signup section."""
+
+    def verify(job: Mapping, client: object) -> bool:
+        if str(client.main_theme().get("name", "")).casefold() != "dawn":  # type: ignore[attr-defined]
+            return False
+        try:
+            settings = client.theme_settings_text()  # type: ignore[attr-defined]
+        except Exception:
+            return False
+        if not isinstance(settings, str) or not settings:
+            return False
+        package = build_content(_facts_for(store, job))
+        anchor = str(package["email_signup"]["anchor"])
+        return _LANDING_HANDLE in settings and anchor in settings
+
+    return verify
+
+
+def production_publication_verify(
+    *, fetch: Fetch = https_fetch
+) -> Callable[[Mapping, object], bool]:
+    """Confirm the storefront is genuinely public and still has no checkout."""
+
+    def verify(job: Mapping, client: object) -> bool:
+        probe = client.storefront_probe("/")  # type: ignore[attr-defined]
+        if probe.get("status") != 200 or probe.get("password_protected") is not False:
+            return False
+        surface = client.commerce_surface()  # type: ignore[attr-defined]
+        if int(surface["products_count"]) != 0:
+            return False
+        domain = _host(str(job.get("plan", {}).get("domain", "")))
+        allowed = {domain, f"www.{domain}"}
+        root = _validated_result(
+            fetch(f"https://{domain}/"), f"https://{domain}/", allowed
+        )
+        if root.status != 200 or not root.tls_valid:
+            return False
+        if _html(root.body)[1].commerce_controls:
+            return False
+        checkout = _validated_result(
+            fetch(f"https://{domain}/checkout"), f"https://{domain}/checkout", allowed
+        )
+        if checkout.status in {404, 410}:
+            return True
+        path = urlsplit(checkout.final_url).path.rstrip("/") or "/"
+        return bool(checkout.redirects) and path in {"/", "/cart"}
+
+    return verify
+
+
+def production_gate_probes(*, store: object, fetch: Fetch = https_fetch) -> dict:
+    """The four verify callbacks `production_gate_verifiers` needs to be usable."""
+    return {
+        "settings_verify": production_settings_verify(),
+        "content_verify": production_content_verify(store=store),
+        "theme_verify": production_theme_verify(store=store),
+        "publication_verify": production_publication_verify(fetch=fetch),
+    }
+
+
+# --- production final-verification probes ------------------------------------
+
+WAITLIST_TEST_PREFIX = "waitlist-test+"
+# Double opt-in leaves a brand-new subscriber pending confirmation; single
+# opt-in subscribes immediately. This is the provider truth that proves which
+# choice is actually applied, which the Admin API cannot report directly.
+_DOUBLE_OPT_IN_STATES = {"PENDING", "NOT_SUBSCRIBED"}
+_SINGLE_OPT_IN_STATES = {"SUBSCRIBED"}
+
+
+def _address_digest(address: str) -> str:
+    import hashlib
+
+    return "sha256:" + hashlib.sha256(address.encode("utf-8")).hexdigest()
+
+
+def production_waitlist_probe(
+    *, store: object, session_for: Callable[[Mapping], str]
+) -> Callable[[Mapping, object, str], dict]:
+    """Round-trip the real public waitlist form with a synthetic subscriber.
+
+    The address is unique per job, always `waitlist-test+...` so the client's
+    deletion guard will accept it, and is never persisted -- only its digest
+    reaches the receipt. The synthetic customer is deleted again whatever the
+    outcome.
+    """
+
+    from commerce_browser import click_role, fill_field, open_url, page_text
+
+    def probe(job: Mapping, client: object, domain: str) -> dict:
+        facts = _facts_for(store, job)
+        contact = str(facts.get("contact_email", ""))
+        mail_domain = contact.partition("@")[2] or domain
+        job_id = str(job["job_id"]).replace("_", "-").lower()
+        address = f"{WAITLIST_TEST_PREFIX}{job_id}@{mail_domain}"
+        package = build_content(facts)
+        signup = package["email_signup"]
+        session = session_for(job)
+
+        result = {
+            "customer_found": False,
+            "consent_recorded": False,
+            "confirmation_shown": False,
+            "subscriber_deleted": False,
+            "test_address_digest": _address_digest(address),
+        }
+        try:
+            open_url(session, f"https://{domain}/#{signup['anchor']}")
+            fill_field(session, 'form[action*="/contact"] input[type="email"]', address)
+            click_role(session, "button", "Subscribe")
+            rendered = " ".join(page_text(session).split()).casefold()
+            result["confirmation_shown"] = (
+                " ".join(str(signup["confirmation"]).split()).casefold() in rendered
+            )
+            customer = client.customer_by_email(address)  # type: ignore[attr-defined]
+            result["customer_found"] = customer is not None
+            if customer is not None:
+                state = str(customer.get("marketing_state", "")).upper()
+                expected = (
+                    _DOUBLE_OPT_IN_STATES
+                    if facts.get("double_opt_in") is True
+                    else _SINGLE_OPT_IN_STATES
+                )
+                result["consent_recorded"] = state in expected
+        finally:
+            try:
+                client.delete_test_customer(address)  # type: ignore[attr-defined]
+                result["subscriber_deleted"] = (
+                    client.customer_by_email(address) is None  # type: ignore[attr-defined]
+                )
+            except Exception:
+                result["subscriber_deleted"] = False
+        return result
+
+    return probe
+
+
+def production_mobile_screenshot(
+    *,
+    session_for: Callable[[Mapping], str],
+    evidence_root: object,
+) -> Callable[[Mapping, str], bool]:
+    """Render the real public landing page at a mobile viewport and keep proof.
+
+    Evidence is one screenshot plus a boolean. No page text is persisted, so
+    no customer information or secret can leak through this path.
+    """
+
+    from pathlib import Path as _Path
+
+    from commerce_browser import (
+        MOBILE_VIEWPORT,
+        open_url,
+        page_text,
+        screenshot,
+        set_viewport,
+    )
+
+    def probe(job: Mapping, domain: str) -> bool:
+        session = session_for(job)
+        try:
+            set_viewport(session, *MOBILE_VIEWPORT)
+            open_url(session, f"https://{domain}/")
+            rendered = " ".join(page_text(session).split()).casefold()
+            if "priority access" not in rendered:
+                return False
+            target = (
+                _Path(str(evidence_root)) / str(job["job_id"]) / "mobile_viewport.png"
+            )
+            screenshot(session, target)
+            return True
+        except Exception:
+            return False
+
+    return probe

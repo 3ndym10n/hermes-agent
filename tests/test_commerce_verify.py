@@ -76,7 +76,6 @@ def _green():
         "waitlist_probe": fixture["waitlist_probe"],
         "mobile_screenshot_ok": True,
         "products_count": 0,
-        "payment_provider_configured": False,
     }
     return arguments, responses
 
@@ -274,15 +273,14 @@ def _registration_action(**result_overrides):
 
 
 class _ShopStub:
-    def __init__(self, password_protected=True, products=0, paid=False):
+    def __init__(self, password_protected=True, products=0):
         self._locked = password_protected
         self._products = products
-        self._paid = paid
 
     def commerce_surface(self):
         return {
             "products_count": self._products,
-            "payment_provider_configured": self._paid,
+            "supported_digital_wallets": ("SHOPIFY_PAY",),
         }
 
     def storefront_probe(self, _path="/"):
@@ -369,7 +367,6 @@ def test_production_verify_prepublish_greens_through_the_storefront_lock():
     assert {check["name"] for check in report["checks"]} == {
         "storefront_locked",
         "no_products",
-        "no_payment_provider",
         "dns",
     }
 
@@ -402,7 +399,7 @@ def test_production_verify_prepublish_is_red_with_a_sellable_product():
     })
 
     report = verify(
-        _production_job(), _ShopStub(products=1, paid=True), package, "prepublish"
+        _production_job(), _ShopStub(products=1), package, "prepublish"
     )
 
     assert report["all_green"] is False

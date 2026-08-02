@@ -73,11 +73,25 @@ class CommerceOperatorError(RuntimeError):
 
 
 class ProviderStepError(CommerceOperatorError):
-    """Typed provider failure; exception prose is never persisted."""
+    """Typed provider failure; exception prose is never persisted.
 
-    def __init__(self, code: str, *, uncertain: bool = False):
+    `evidence` carries the safe provider facts already established before the
+    failure -- an order id and charged amount for a registration that really
+    happened, never a credential or a raw provider response. Without it an
+    irreversible action that failed on bookkeeping alone would leave nothing
+    for reconciliation to work from.
+    """
+
+    def __init__(
+        self,
+        code: str,
+        *,
+        uncertain: bool = False,
+        evidence: Mapping[str, Any] | None = None,
+    ):
         super().__init__(code)
         self.uncertain = bool(uncertain)
+        self.evidence = dict(evidence or {})
 
 
 class WorkerAlreadyRunningError(CommerceOperatorError):
@@ -1057,7 +1071,7 @@ class CommerceOperator:
         self.store.finish_action(
             str(action["action_id"]),
             status="uncertain" if uncertain else "failed",
-            result={"error_code": error.code},
+            result={"error_code": error.code, **error.evidence},
             now=self.clock(),
         )
         self.store.transition(
@@ -1305,15 +1319,33 @@ def production_operator(
     store: CommerceJobStore,
     *,
     lock_path: str | Path | None = None,
+    porkbun_factory: Callable[[], Any] | None = None,
+    shopify_factory: Callable[[], Any] | None = None,
+    record_purchase: Callable[..., Mapping[str, Any]] | None = None,
+    fetch: Callable[[str], Any] | None = None,
+    dns_lookup: Callable[[str, str], Any] | None = None,
+    evidence_root: Path | None = None,
 ) -> CommerceOperator:
     """Assemble the worker against the real providers and money authority.
 
     `publish` is deliberately left unwired: no Shopify Admin mutation removes
     the storefront password in the pinned schema, so publication degrades to
     Cal's viewer gate (plan §9.2.11) instead of an autonomous unlock.
+
+    Every keyword defaults to the production dependency. They exist so tests
+    can substitute the outermost provider boundary and still exercise *this*
+    assembly, rather than hand-wiring a parallel operator that could stay
+    green while production is mis-wired.
     """
 
-    from commerce_verify import production_verify
+    from commerce_verify import (
+        https_fetch,
+        production_gate_probes,
+        production_mobile_screenshot,
+        production_verify,
+        production_waitlist_probe,
+        dig_lookup,
+    )
     from commerce_workflow import (
         production_gate_verifiers,
         production_handlers,
@@ -1322,19 +1354,55 @@ def production_operator(
     )
     from registrar_porkbun import PorkbunClient
 
+    porkbun = porkbun_factory or PorkbunClient
+    fetch = fetch or https_fetch
+    dns_lookup = dns_lookup or dig_lookup
+    root = evidence_root or (get_hermes_home() / "commerce" / "evidence")
+    recorder = record_purchase if record_purchase is not None else _purchase_recorder()
     return CommerceOperator(
         store=store,
         planner=production_plan,
         step_handlers=production_handlers(
             store,
-            verify=production_verify(store=store, porkbun_factory=PorkbunClient),
-            record_purchase=_purchase_recorder(),
+            porkbun_factory=porkbun,
+            shopify_factory=shopify_factory,
+            evidence_root=root,
+            verify=production_verify(
+                store=store,
+                porkbun_factory=porkbun,
+                fetch=fetch,
+                dns_lookup=dns_lookup,
+                waitlist_probe=production_waitlist_probe(
+                    store=store, session_for=browser_session_name
+                ),
+                mobile_screenshot=production_mobile_screenshot(
+                    session_for=browser_session_name, evidence_root=root
+                ),
+            ),
+            record_purchase=recorder,
         ),
-        gate_verifiers=production_gate_verifiers(),
-        reconcilers=production_reconcilers(),
+        # Without these callbacks every settings/content/theme/publication gate
+        # verifier returns None, so the gate never completes and the job sits in
+        # awaiting_cal forever after Cal presses DONE.
+        gate_verifiers=production_gate_verifiers(
+            porkbun_factory=porkbun,
+            shopify_factory=shopify_factory,
+            **production_gate_probes(store=store, fetch=fetch),
+        ),
+        reconcilers=production_reconcilers(
+            porkbun_factory=porkbun,
+            shopify_factory=shopify_factory,
+            record_purchase=recorder,
+            store=store,
+        ),
         completion_handler=_receipt_writer(store),
         lock_path=lock_path,
     )
+
+
+def browser_session_name(job: Mapping[str, Any]) -> str:
+    """The one session name bound to a job, per plan §7."""
+    return f"commerce_{job['job_id']}"
 
 
 def _receipt_writer(
