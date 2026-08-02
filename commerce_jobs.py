@@ -8,9 +8,11 @@ references to those external records. It performs no network or provider work.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import os
 import re
+import secrets
 import sqlite3
 import stat
 import unicodedata
@@ -22,94 +24,93 @@ from typing import Any, Iterator, Mapping
 
 from hermes_constants import get_hermes_home
 
-SCHEMA_VERSION = 1
-STATE_MACHINE_VERSION = 1
+SCHEMA_VERSION = 2
+STATE_MACHINE_VERSION = 2
 BUSY_TIMEOUT_MS = 5_000
 DEFAULT_STATE_TIMEOUT = timedelta(hours=72)
+HANDOFF_TTL = timedelta(minutes=30)
+ACTION_APPROVAL_TTL = timedelta(minutes=15)
 
 STATES = frozenset({
     "requested",
-    "recovering_existing_state",
-    "needs_business_facts",
     "planning",
-    "plan_ready",
-    "awaiting_decision_packet",
-    "ready_to_execute",
-    "registering_domain",
-    "configuring_dns",
-    "awaiting_store_creation",
-    "configuring_shopify",
-    "building_store",
-    "configuring_checkout",
-    "awaiting_payment_activation",
+    "ready",
+    "executing_read_only",
+    "awaiting_purchase_approval",
+    "awaiting_dns_approval",
+    "awaiting_publication_approval",
+    "awaiting_cal",
+    "executing",
+    "resuming",
     "verifying",
-    "verification_failed",
     "uncertain_external_state",
-    "awaiting_reconciliation",
-    "awaiting_public_launch_approval",
-    "launching",
-    "live",
-    "completed",
+    "reconciliation_required",
+    "timed_out",
     "paused",
+    "completed",
     "cancelled",
     "failed",
-    "rolling_back",
-    "rolled_back",
 })
-TERMINAL_STATES = frozenset({"completed", "cancelled", "failed", "rolled_back"})
+TERMINAL_STATES = frozenset({"completed", "cancelled", "failed"})
 UNCERTAINTY_STATES = frozenset({
     "uncertain_external_state",
-    "awaiting_reconciliation",
+    "reconciliation_required",
 })
-TIMEOUT_EXCLUDED_STATES = TERMINAL_STATES | UNCERTAINTY_STATES | {"rolling_back"}
-EXECUTION_STATES = frozenset({
-    "registering_domain",
-    "configuring_dns",
-    "awaiting_store_creation",
-    "configuring_shopify",
-    "building_store",
-    "configuring_checkout",
-    "awaiting_payment_activation",
-    "verifying",
-    "awaiting_public_launch_approval",
-    "launching",
-})
+TIMEOUT_EXCLUDED_STATES = (
+    TERMINAL_STATES | UNCERTAINTY_STATES | {"executing", "timed_out", "paused"}
+)
+EXECUTION_STATES = frozenset({"executing_read_only", "executing"})
 
 _CORE_TRANSITIONS: dict[str, set[str]] = {
-    "requested": {"recovering_existing_state"},
-    "recovering_existing_state": {"needs_business_facts", "planning"},
-    "needs_business_facts": {"planning"},
-    "planning": {"plan_ready"},
-    "plan_ready": {"awaiting_decision_packet"},
-    "awaiting_decision_packet": {"ready_to_execute"},
-    "ready_to_execute": set(EXECUTION_STATES),
-    "registering_domain": {"configuring_dns", "uncertain_external_state"},
-    "configuring_dns": {"awaiting_store_creation", "uncertain_external_state"},
-    "awaiting_store_creation": {"configuring_shopify"},
-    "configuring_shopify": {"building_store"},
-    "building_store": {"configuring_checkout", "uncertain_external_state"},
-    "configuring_checkout": {
-        "awaiting_payment_activation",
-        "uncertain_external_state",
+    "requested": {"planning"},
+    "planning": {"ready", "awaiting_cal"},
+    "ready": {
+        "awaiting_purchase_approval",
+        "executing_read_only",
     },
-    "awaiting_payment_activation": {"verifying"},
-    "verifying": {"awaiting_public_launch_approval", "verification_failed"},
-    "verification_failed": {"planning", "building_store"},
-    "uncertain_external_state": {"awaiting_reconciliation"},
-    "awaiting_reconciliation": {"ready_to_execute", "failed"},
-    "awaiting_public_launch_approval": {"launching"},
-    "launching": {"live", "uncertain_external_state"},
-    "live": {"completed"},
-    "paused": {"ready_to_execute", "cancelled"},
-    "rolling_back": {"rolled_back"},
+    "executing_read_only": {
+        "ready",
+        "awaiting_dns_approval",
+        "executing",
+        "verifying",
+        "completed",
+    },
+    "awaiting_purchase_approval": {"executing", "cancelled"},
+    "awaiting_dns_approval": {"executing", "cancelled"},
+    "awaiting_publication_approval": {"executing", "paused"},
+    "awaiting_cal": {"resuming", "timed_out"},
+    "executing": {
+        "executing_read_only",
+        "ready",
+        "uncertain_external_state",
+        "awaiting_cal",
+    },
+    "resuming": {
+        "planning",
+        "ready",
+        "executing_read_only",
+        "awaiting_purchase_approval",
+        "awaiting_dns_approval",
+        "awaiting_publication_approval",
+        "awaiting_cal",
+        "executing",
+        "verifying",
+    },
+    "verifying": {"awaiting_publication_approval", "ready"},
+    "uncertain_external_state": {"reconciliation_required"},
+    "reconciliation_required": {"ready", "failed"},
+    "timed_out": {"ready", "cancelled"},
+    "paused": {"ready", "cancelled"},
 }
 
-# Pause/cancel/rollback are operator controls, not shortcuts around uncertainty.
+# Pause, cancellation, and timeouts are controls, not shortcuts around uncertainty.
 ALLOWED_TRANSITIONS: dict[str, frozenset[str]] = {}
 for _state in STATES:
     _targets = set(_CORE_TRANSITIONS.get(_state, set()))
-    if _state not in TERMINAL_STATES | UNCERTAINTY_STATES | {"paused", "rolling_back"}:
-        _targets.update({"paused", "cancelled", "rolling_back"})
+    if _state not in (
+        TERMINAL_STATES | UNCERTAINTY_STATES | {"executing", "paused", "timed_out"}
+    ):
+        _targets.update({"paused", "cancelled", "timed_out"})
     ALLOWED_TRANSITIONS[_state] = frozenset(_targets)
 
 _PLAN_FIELDS = (
@@ -195,6 +196,7 @@ _SECRET_VALUE_RE = re.compile(
     r"|\bBearer\s+[A-Za-z0-9._~+/=-]{12,}"
     r"|\b(?:sk|rk|pk)_(?:live|prod)_[A-Za-z0-9]{8,}"
     r"|\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"
+    r"|cgh_[A-Za-z0-9_-]{43}"
     r"|\b(?:sessionid|session_token|auth_token)\s*=\s*[^\s;]+)",
     re.IGNORECASE,
 )
@@ -314,8 +316,6 @@ def action_fingerprint(
     effect_class: str,
     target_state: str,
     request: Mapping[str, Any],
-    approval_reference: str = "",
-    approval_fingerprint: str = "",
 ) -> str:
     envelope = {
         "action_type": _safe_text(
@@ -325,14 +325,6 @@ def action_fingerprint(
         "effect_class": effect_class,
         "target_state": target_state,
         "request": _without_runtime_fields(_mapping(request, "request")),
-        "approval_reference": _safe_text(
-            approval_reference, "approval_reference", max_chars=240
-        ),
-        "approval_fingerprint": _safe_text(
-            approval_fingerprint,
-            "approval_fingerprint",
-            max_chars=128,
-        ),
     }
     if effect_class not in {"read_only", "consequential"}:
         _fail(CommerceActionError, "invalid_effect_class", "effect_class")
@@ -375,6 +367,10 @@ def _reject_text(value: str, field: str) -> None:
 def reject_forbidden_data(value: Any, field: str = "payload") -> None:
     if isinstance(value, Mapping):
         for key, child in value.items():
+            key_field = f"{field}.[key]"
+            if not isinstance(key, str):
+                _fail(CommerceConfigurationError, "invalid_json_key", key_field)
+            _reject_text(key, key_field)
             compact = _key_compact(key)
             if (
                 compact in _SHORT_FORBIDDEN_KEYS
@@ -384,7 +380,7 @@ def reject_forbidden_data(value: Any, field: str = "payload") -> None:
                 _fail(
                     CommerceForbiddenDataError,
                     "forbidden_sensitive_field",
-                    f"{field}.{key}",
+                    key_field,
                 )
             reject_forbidden_data(child, f"{field}.{key}")
     elif isinstance(value, (list, tuple)):
@@ -433,7 +429,8 @@ def _display_json(raw: Any) -> Any:
 
 
 def _new_id(prefix: str) -> str:
-    return f"{prefix}_{uuid.uuid4().hex}"
+    # Break UUIDs at non-PAN separators so generated IDs cannot resemble cards.
+    return f"{prefix}_{str(uuid.uuid4()).replace('-', '_')}"
 
 
 def _state_sql() -> str:
@@ -449,6 +446,9 @@ CREATE TABLE IF NOT EXISTS jobs (
     objective_fingerprint TEXT NOT NULL,
     state_machine_version INTEGER NOT NULL,
     current_state TEXT NOT NULL CHECK(current_state IN ({_state_sql()})),
+    current_step TEXT NOT NULL DEFAULT '',
+    current_gate_id TEXT NOT NULL DEFAULT '',
+    browser_session TEXT NOT NULL,
     substatus TEXT NOT NULL DEFAULT '',
     plan_json TEXT NOT NULL,
     plan_fingerprint TEXT NOT NULL,
@@ -507,10 +507,12 @@ CREATE TABLE IF NOT EXISTS job_actions (
         ('planned','dispatched','recoverable','succeeded','failed','uncertain')),
     idempotency_key TEXT NOT NULL,
     action_fingerprint TEXT NOT NULL,
+    plan_fingerprint TEXT NOT NULL,
     approval_reference TEXT NOT NULL DEFAULT '',
     approval_fingerprint TEXT NOT NULL DEFAULT '',
     approval_status TEXT NOT NULL DEFAULT 'unbound'
         CHECK(approval_status IN ('unbound','live','stale')),
+    approval_expires_at TEXT,
     request_json TEXT NOT NULL,
     result_json TEXT NOT NULL,
     dispatched_at TEXT,
@@ -540,9 +542,14 @@ CREATE TABLE IF NOT EXISTS gates (
     gate_id TEXT PRIMARY KEY,
     job_id TEXT NOT NULL REFERENCES jobs(job_id),
     gate_type TEXT NOT NULL,
-    status TEXT NOT NULL CHECK(status IN ('open','completed','expired','invalidated')),
+    status TEXT NOT NULL CHECK(status IN
+        ('open','completed','consumed','expired','invalidated')),
     human_action TEXT NOT NULL,
     provider_truth_reference TEXT NOT NULL,
+    browser_session TEXT NOT NULL,
+    handoff_token_hash TEXT NOT NULL DEFAULT '',
+    handoff_expires_at TEXT,
+    done_requested_at TEXT,
     approval_reference TEXT NOT NULL DEFAULT '',
     approval_fingerprint TEXT NOT NULL DEFAULT '',
     opening_evidence_json TEXT NOT NULL,
@@ -608,6 +615,15 @@ class CommerceJobStore:
                     "future_schema_version",
                     "user_version",
                 )
+            has_jobs = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='jobs'"
+            ).fetchone()
+            if has_jobs and version < SCHEMA_VERSION:
+                _fail(
+                    CommerceConfigurationError,
+                    "unsupported_schema_version",
+                    "user_version",
+                )
             connection.executescript(
                 "BEGIN IMMEDIATE;\n"
                 + _SCHEMA_SQL
@@ -656,6 +672,30 @@ class CommerceJobStore:
         if row is None:
             _fail(CommerceNotFoundError, "action_not_found", "action_id")
         return row
+
+    @staticmethod
+    def _gate_row(connection: sqlite3.Connection, gate_id: str) -> sqlite3.Row:
+        row = connection.execute(
+            "SELECT * FROM gates WHERE gate_id=?", (gate_id,)
+        ).fetchone()
+        if row is None:
+            _fail(CommerceNotFoundError, "gate_not_found", "gate_id")
+        return row
+
+    @staticmethod
+    def _unresolved_action(
+        connection: sqlite3.Connection, job_id: str
+    ) -> sqlite3.Row | None:
+        rows = connection.execute(
+            """SELECT * FROM job_actions
+               WHERE job_id=?
+                 AND action_status IN ('dispatched','recoverable','uncertain')
+               ORDER BY created_at,action_id LIMIT 2""",
+            (job_id,),
+        ).fetchall()
+        if len(rows) > 1:
+            _fail(CommerceActionError, "multiple_inflight_actions", "job_id")
+        return rows[0] if rows else None
 
     @staticmethod
     def _append_event(
@@ -724,11 +764,72 @@ class CommerceJobStore:
     @staticmethod
     def _decode_gate(row: sqlite3.Row) -> dict[str, Any]:
         result = dict(row)
+        result.pop("handoff_token_hash", None)
         result["opening_evidence"] = _display_json(result.pop("opening_evidence_json"))
         result["completion_evidence"] = _display_json(
             result.pop("completion_evidence_json")
         )
         return result
+
+    @staticmethod
+    def _handoff_digest(token: Any) -> str:
+        if (
+            not isinstance(token, str)
+            or re.fullmatch(r"cgh_[A-Za-z0-9_-]{43}", token) is None
+        ):
+            _fail(CommerceGateError, "invalid_handoff_token", "handoff_token")
+        return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+    def _active_handoff_gate(
+        self,
+        connection: sqlite3.Connection,
+        gate_id: str,
+        *,
+        now: datetime,
+        token: str | None = None,
+    ) -> tuple[sqlite3.Row, sqlite3.Row]:
+        gate = self._gate_row(connection, gate_id)
+        job = self._job_row(connection, gate["job_id"])
+        timestamp = iso_utc(now)
+        token_matches = True
+        if token is not None:
+            supplied_digest = self._handoff_digest(token)
+            stored_digest = str(gate["handoff_token_hash"] or "")
+            comparable_digest = (
+                stored_digest
+                if re.fullmatch(r"[0-9a-f]{64}", stored_digest)
+                else "0" * 64
+            )
+            token_matches = hmac.compare_digest(comparable_digest, supplied_digest)
+        if gate["status"] != "open":
+            _fail(CommerceGateError, "gate_not_open", "status")
+        if gate["gate_type"] == "action_approval":
+            _fail(CommerceGateError, "gate_not_handoff_eligible", "gate_type")
+        if gate["expires_at"] and gate["expires_at"] <= timestamp:
+            _fail(CommerceGateError, "gate_expired", "expires_at")
+        if (
+            not job["active"]
+            or job["current_state"] != "awaiting_cal"
+            or job["current_gate_id"] != gate["gate_id"]
+        ):
+            _fail(CommerceGateError, "gate_not_active_handoff", "gate_id")
+        if gate["browser_session"] != job["browser_session"]:
+            _fail(CommerceGateError, "gate_session_mismatch", "browser_session")
+        if token is not None:
+            if not gate["handoff_expires_at"]:
+                _fail(CommerceGateError, "handoff_not_issued", "handoff_expires_at")
+            if gate["handoff_expires_at"] <= timestamp:
+                _fail(CommerceGateError, "handoff_expired", "handoff_expires_at")
+            if not token_matches:
+                _fail(CommerceGateError, "invalid_handoff_token", "handoff_token")
+        return gate, job
+
+    @staticmethod
+    def _handoff_expiry(gate: sqlite3.Row, now: datetime) -> str:
+        expiry = iso_utc(now + HANDOFF_TTL)
+        if gate["expires_at"] and gate["expires_at"] < expiry:
+            return str(gate["expires_at"])
+        return expiry
 
     def create_or_attach_job(
         self,
@@ -762,9 +863,10 @@ class CommerceJobStore:
                 """INSERT INTO jobs
                    (job_id,requester,original_objective,normalized_objective,
                     objective_fingerprint,state_machine_version,current_state,
-                    substatus,plan_json,plan_fingerprint,paused_from_state,
-                    state_entered_at,deadline_at,active,row_version,created_at,updated_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    current_step,current_gate_id,browser_session,substatus,plan_json,
+                    plan_fingerprint,paused_from_state,state_entered_at,deadline_at,
+                    active,row_version,created_at,updated_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     job_id,
                     requester_text,
@@ -773,6 +875,9 @@ class CommerceJobStore:
                     fingerprint,
                     STATE_MACHINE_VERSION,
                     "requested",
+                    "",
+                    "",
+                    f"commerce_{job_id}",
                     "",
                     canonical_json(empty_plan),
                     plan_fingerprint(empty_plan),
@@ -874,7 +979,7 @@ class CommerceJobStore:
         reason_code: str,
         evidence: Mapping[str, Any] | None,
         action_id: str,
-        approval_reference: str,
+        gate_id: str,
         now: datetime | None,
         event_type: str = "state_transition",
     ) -> dict[str, Any]:
@@ -886,6 +991,7 @@ class CommerceJobStore:
             expected_version=expected_version,
         )
         source = str(row["current_state"])
+        timestamp = _utc(now)
         if to_state not in ALLOWED_TRANSITIONS[source]:
             _fail(
                 CommerceInvalidTransitionError,
@@ -898,8 +1004,72 @@ class CommerceJobStore:
                 "terminal_state",
                 "current_state",
             )
+        if to_state == "timed_out" and (
+            event_type != "state_timed_out"
+            or not row["deadline_at"]
+            or row["deadline_at"] > iso_utc(timestamp)
+        ):
+            _fail(
+                CommerceInvalidTransitionError,
+                "timeout_not_due",
+                "deadline_at",
+            )
+        bound_gate_id = ""
+        if to_state == "awaiting_cal":
+            if not gate_id:
+                _fail(
+                    CommerceInvalidTransitionError,
+                    "open_gate_required",
+                    "gate_id",
+                )
+            bound_gate_id = _safe_text(gate_id, "gate_id", required=True, max_chars=240)
+            opened_gate = connection.execute(
+                """SELECT * FROM gates
+                   WHERE gate_id=? AND job_id=? AND status='open'""",
+                (bound_gate_id, row["job_id"]),
+            ).fetchone()
+            if opened_gate is None or not row["active"]:
+                _fail(
+                    CommerceInvalidTransitionError,
+                    "open_gate_required",
+                    "gate_id",
+                )
+            if opened_gate["gate_type"] == "action_approval":
+                _fail(
+                    CommerceInvalidTransitionError,
+                    "handoff_gate_required",
+                    "gate_type",
+                )
+            if opened_gate["expires_at"] and opened_gate["expires_at"] <= iso_utc(
+                timestamp
+            ):
+                _fail(
+                    CommerceInvalidTransitionError,
+                    "gate_expired",
+                    "expires_at",
+                )
+            if opened_gate["browser_session"] != row["browser_session"]:
+                _fail(
+                    CommerceInvalidTransitionError,
+                    "gate_session_mismatch",
+                    "browser_session",
+                )
+        if source == "awaiting_cal" and to_state == "resuming":
+            bound_gate_id = str(row["current_gate_id"])
+            verified_gate = connection.execute(
+                """SELECT 1 FROM gates
+                   WHERE gate_id=? AND job_id=? AND status='completed'
+                     AND completed_at>=?""",
+                (bound_gate_id, row["job_id"], row["state_entered_at"]),
+            ).fetchone()
+            if not bound_gate_id or verified_gate is None:
+                _fail(
+                    CommerceInvalidTransitionError,
+                    "verified_gate_required",
+                    "current_gate_id",
+                )
         bound_action: sqlite3.Row | None = None
-        if source == "ready_to_execute" and to_state in EXECUTION_STATES:
+        if to_state in EXECUTION_STATES:
             if not action_id:
                 _fail(
                     CommerceInvalidTransitionError,
@@ -913,69 +1083,99 @@ class CommerceJobStore:
                     "stale_action_approval",
                     "action_id",
                 )
+            expected_effect = (
+                "read_only" if to_state == "executing_read_only" else "consequential"
+            )
             if (
                 bound_action["job_id"] != row["job_id"]
                 or bound_action["target_state"] != to_state
-                or bound_action["action_status"] not in {"planned", "dispatched"}
+                or bound_action["effect_class"] != expected_effect
+                or bound_action["action_status"] != "dispatched"
             ):
                 _fail(
                     CommerceInvalidTransitionError,
                     "action_not_bound",
                     "action_id",
                 )
-        if to_state == "rolling_back":
-            approval = _safe_text(
-                approval_reference,
-                "approval_reference",
-                required=True,
-                max_chars=240,
-            )
-            if not action_id:
+            if to_state == "executing" and bound_action["approval_status"] != "live":
                 _fail(
                     CommerceInvalidTransitionError,
-                    "rollback_action_required",
+                    "action_approval_required",
                     "action_id",
                 )
-            bound_action = self._action_row(connection, action_id)
-            if bound_action["approval_status"] == "stale":
-                _fail(
-                    CommerceInvalidTransitionError,
-                    "stale_action_approval",
-                    "action_id",
-                )
-            if (
-                bound_action["job_id"] != row["job_id"]
-                or bound_action["action_type"] != "rollback"
-                or bound_action["target_state"] != "rolling_back"
-                or bound_action["action_status"] not in {"planned", "dispatched"}
-            ):
-                _fail(
-                    CommerceInvalidTransitionError,
-                    "rollback_action_not_bound",
-                    "action_id",
-                )
-            if bound_action["approval_reference"] != approval:
-                _fail(
-                    CommerceInvalidTransitionError,
-                    "rollback_approval_mismatch",
-                    "approval_reference",
-                )
-        timestamp = _utc(now)
+        unresolved_action = self._unresolved_action(connection, row["job_id"])
+        if unresolved_action is not None:
+            if unresolved_action["action_status"] == "uncertain":
+                if to_state not in UNCERTAINTY_STATES:
+                    _fail(
+                        CommerceInvalidTransitionError,
+                        "unresolved_action",
+                        "action_id",
+                    )
+            else:
+                wrapper_states = EXECUTION_STATES | {"awaiting_cal", "resuming"}
+                if (
+                    source in wrapper_states
+                    and to_state not in EXECUTION_STATES
+                    and row["current_step"] != unresolved_action["action_type"]
+                ):
+                    _fail(
+                        CommerceInvalidTransitionError,
+                        "inflight_action_not_bound",
+                        "current_step",
+                    )
+                if to_state in EXECUTION_STATES:
+                    if (
+                        bound_action is None
+                        or bound_action["action_id"] != unresolved_action["action_id"]
+                    ):
+                        _fail(
+                            CommerceInvalidTransitionError,
+                            "inflight_action_not_bound",
+                            "action_id",
+                        )
+                elif to_state not in {"awaiting_cal", "resuming"}:
+                    _fail(
+                        CommerceInvalidTransitionError,
+                        "inflight_action_not_terminal",
+                        "action_id",
+                    )
         entered = iso_utc(timestamp)
         active = 0 if to_state in TERMINAL_STATES else 1
         deadline = (
             None
-            if to_state in TERMINAL_STATES | {"paused"}
+            if to_state in TERMINAL_STATES | {"paused", "timed_out"}
             else iso_utc(timestamp + DEFAULT_STATE_TIMEOUT)
         )
         paused_from = source if to_state == "paused" else row["paused_from_state"]
+        current_step = (
+            str(bound_action["action_type"])
+            if bound_action
+            else (
+                str(row["current_step"])
+                if to_state
+                in {
+                    "awaiting_cal",
+                    "resuming",
+                    "uncertain_external_state",
+                    "reconciliation_required",
+                    "paused",
+                    "timed_out",
+                }
+                else ""
+            )
+        )
+        current_gate_id = bound_gate_id if to_state == "awaiting_cal" else ""
         cursor = connection.execute(
             """UPDATE jobs
-               SET current_state=?,paused_from_state=?,state_entered_at=?,
-                   deadline_at=?,active=?,row_version=row_version+1,updated_at=?
+               SET current_state=?,current_step=?,current_gate_id=?,paused_from_state=?,
+                   state_entered_at=?,deadline_at=?,active=?,
+                   row_version=row_version+1,updated_at=?
                WHERE job_id=? AND row_version=?""",
             (
                 to_state,
+                current_step,
+                current_gate_id,
                 paused_from,
                 entered,
                 deadline,
@@ -990,6 +1190,23 @@ class CommerceJobStore:
                 CommerceStaleVersionError,
                 "stale_row_version",
                 "expected_version",
+            )
+        if row["current_gate_id"] and source == "awaiting_cal":
+            gate_status = "consumed" if to_state == "resuming" else "invalidated"
+            connection.execute(
+                """UPDATE gates SET status=?,handoff_token_hash='',
+                   handoff_expires_at=NULL
+                   WHERE gate_id=? AND status IN ('open','completed')""",
+                (gate_status, row["current_gate_id"]),
+            )
+        if to_state in TERMINAL_STATES | {"paused", "timed_out"}:
+            connection.execute(
+                """UPDATE gates
+                   SET status=CASE WHEN status IN ('open','completed')
+                                   THEN 'invalidated' ELSE status END,
+                       handoff_token_hash='',handoff_expires_at=NULL
+                   WHERE job_id=?""",
+                (row["job_id"],),
             )
         self._append_event(
             connection,
@@ -1015,7 +1232,7 @@ class CommerceJobStore:
         reason_code: str,
         evidence: Mapping[str, Any] | None = None,
         action_id: str = "",
-        approval_reference: str = "",
+        gate_id: str = "",
         now: datetime | None = None,
     ) -> dict[str, Any]:
         with self._write() as connection:
@@ -1030,7 +1247,7 @@ class CommerceJobStore:
                 reason_code=reason_code,
                 evidence=evidence,
                 action_id=action_id,
-                approval_reference=approval_reference,
+                gate_id=gate_id,
                 now=now,
             )
 
@@ -1056,7 +1273,7 @@ class CommerceJobStore:
                 reason_code="operator_pause",
                 evidence={"reason": safe_reason},
                 action_id="",
-                approval_reference="",
+                gate_id="",
                 now=now,
             )
 
@@ -1068,15 +1285,27 @@ class CommerceJobStore:
         actor: str,
         now: datetime | None = None,
     ) -> dict[str, Any]:
-        return self.transition(
-            job_id,
-            "ready_to_execute",
-            expected_state="paused",
-            expected_version=expected_version,
-            actor=actor,
-            reason_code="operator_resume",
-            now=now,
-        )
+        with self._write() as connection:
+            row = self._job_row(connection, job_id)
+            if row["current_state"] not in {"paused", "timed_out"}:
+                _fail(
+                    CommerceInvalidTransitionError,
+                    "job_not_resumable",
+                    "current_state",
+                )
+            return self._transition_in_tx(
+                connection,
+                row=row,
+                to_state="ready",
+                expected_state=row["current_state"],
+                expected_version=expected_version,
+                actor=actor,
+                reason_code="operator_resume",
+                evidence={},
+                action_id="",
+                gate_id="",
+                now=now,
+            )
 
     def cancel(
         self,
@@ -1119,7 +1348,7 @@ class CommerceJobStore:
                 reason_code="operator_cancel",
                 evidence={"reason": safe_reason},
                 action_id="",
-                approval_reference="",
+                gate_id="",
                 now=now,
             )
 
@@ -1155,14 +1384,21 @@ class CommerceJobStore:
                 connection.execute(
                     """UPDATE job_actions SET approval_status='stale',updated_at=?
                        WHERE job_id=? AND approval_status='live'
-                         AND approval_fingerprint=?""",
+                         AND plan_fingerprint=?""",
                     (timestamp, job_id, old_fingerprint),
                 )
                 connection.execute(
-                    """UPDATE gates SET status='invalidated'
+                    """UPDATE gates SET status='invalidated',handoff_token_hash='',
+                       handoff_expires_at=NULL
                        WHERE job_id=? AND status IN ('open','completed')
-                         AND approval_fingerprint=?""",
-                    (job_id, old_fingerprint),
+                         AND (
+                           approval_fingerprint=?
+                           OR approval_fingerprint IN (
+                             SELECT action_fingerprint FROM job_actions
+                             WHERE job_id=? AND plan_fingerprint=?
+                           )
+                         )""",
+                    (job_id, old_fingerprint, job_id, old_fingerprint),
                 )
             self._append_event(
                 connection,
@@ -1231,8 +1467,6 @@ class CommerceJobStore:
         idempotency_key: str,
         request: Mapping[str, Any],
         target_state: str = "",
-        approval_reference: str = "",
-        approval_fingerprint: str = "",
         now: datetime | None = None,
     ) -> dict[str, Any]:
         action_name = _safe_text(
@@ -1242,12 +1476,6 @@ class CommerceJobStore:
         key = _safe_text(
             idempotency_key, "idempotency_key", required=True, max_chars=240
         )
-        approval_ref = _safe_text(
-            approval_reference, "approval_reference", max_chars=240
-        )
-        approval_fp = _safe_text(
-            approval_fingerprint, "approval_fingerprint", max_chars=128
-        )
         payload = _mapping(request, "request")
         fingerprint = action_fingerprint(
             action_type=action_name,
@@ -1255,12 +1483,10 @@ class CommerceJobStore:
             effect_class=effect_class,
             target_state=target_state,
             request=payload,
-            approval_reference=approval_ref,
-            approval_fingerprint=approval_fp,
         )
         timestamp = iso_utc(now)
         with self._write() as connection:
-            self._job_row(connection, job_id)
+            job = self._job_row(connection, job_id)
             existing = connection.execute(
                 "SELECT * FROM job_actions WHERE job_id=? AND idempotency_key=?",
                 (job_id, key),
@@ -1276,14 +1502,14 @@ class CommerceJobStore:
                 result["idempotent_replay"] = True
                 return result
             action_id = _new_id("ca")
-            approval_status = "live" if approval_ref else "unbound"
             connection.execute(
                 """INSERT INTO job_actions
                    (action_id,job_id,action_type,provider,effect_class,target_state,
-                    action_status,idempotency_key,action_fingerprint,
+                    action_status,idempotency_key,action_fingerprint,plan_fingerprint,
                     approval_reference,approval_fingerprint,approval_status,
+                    approval_expires_at,
                     request_json,result_json,uncertainty,created_at,updated_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     action_id,
                     job_id,
@@ -1294,9 +1520,11 @@ class CommerceJobStore:
                     "planned",
                     key,
                     fingerprint,
-                    approval_ref,
-                    approval_fp,
-                    approval_status,
+                    job["plan_fingerprint"],
+                    "",
+                    "",
+                    "unbound",
+                    None,
                     canonical_json(payload),
                     canonical_json({}),
                     0,
@@ -1315,6 +1543,96 @@ class CommerceJobStore:
         finally:
             connection.close()
 
+    def authorize_action(
+        self,
+        action_id: str,
+        *,
+        gate_id: str,
+        actor: str,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        safe_gate_id = _safe_text(gate_id, "gate_id", required=True, max_chars=240)
+        timestamp = iso_utc(now)
+        with self._write() as connection:
+            action = self._action_row(connection, action_id)
+            if action["effect_class"] != "consequential":
+                _fail(CommerceActionError, "approval_not_required", "effect_class")
+            if action["action_status"] != "planned":
+                _fail(
+                    CommerceActionError,
+                    "action_not_approvable",
+                    "action_status",
+                )
+            approval_expired = action["approval_status"] == "live" and (
+                not action["approval_expires_at"]
+                or action["approval_expires_at"] <= timestamp
+            )
+            if action["approval_status"] != "unbound" and not approval_expired:
+                _fail(
+                    CommerceActionError,
+                    "action_already_approved",
+                    "approval_status",
+                )
+            gate = connection.execute(
+                "SELECT * FROM gates WHERE gate_id=?", (safe_gate_id,)
+            ).fetchone()
+            if gate is None:
+                _fail(CommerceNotFoundError, "gate_not_found", "gate_id")
+            if (
+                gate["job_id"] != action["job_id"]
+                or gate["gate_type"] != "action_approval"
+                or gate["status"] != "completed"
+            ):
+                _fail(CommerceActionError, "approval_gate_not_bound", "gate_id")
+            if not gate["expires_at"] or gate["expires_at"] <= timestamp:
+                _fail(CommerceActionError, "approval_gate_expired", "gate_id")
+            if gate["approval_fingerprint"] != action["action_fingerprint"]:
+                _fail(
+                    CommerceActionError,
+                    "approval_fingerprint_mismatch",
+                    "gate_id",
+                )
+            completion = json.loads(gate["completion_evidence_json"])
+            if completion.get("approval_granted") is not True:
+                _fail(CommerceActionError, "approval_not_granted", "gate_id")
+            job = self._job_row(connection, action["job_id"])
+            if action["plan_fingerprint"] != job["plan_fingerprint"]:
+                _fail(
+                    CommerceActionError,
+                    "stale_action_approval",
+                    "action_id",
+                )
+            connection.execute(
+                """UPDATE job_actions
+                   SET approval_reference=?,approval_fingerprint=?,
+                       approval_status='live',approval_expires_at=?,updated_at=?
+                   WHERE action_id=?""",
+                (
+                    gate["approval_reference"],
+                    action["action_fingerprint"],
+                    gate["expires_at"],
+                    timestamp,
+                    action_id,
+                ),
+            )
+            connection.execute(
+                """UPDATE gates SET status='consumed',handoff_token_hash='',
+                   handoff_expires_at=NULL WHERE gate_id=?""",
+                (safe_gate_id,),
+            )
+            self._append_event(
+                connection,
+                job_id=action["job_id"],
+                event_type="action_approved",
+                from_state=job["current_state"],
+                to_state=job["current_state"],
+                actor=actor,
+                reason_code="action_fingerprint_approved",
+                evidence={"action_id": action_id, "gate_id": safe_gate_id},
+                now=now,
+            )
+            return self._decode_action(self._action_row(connection, action_id))
+
     def dispatch_action(
         self,
         action_id: str,
@@ -1324,18 +1642,52 @@ class CommerceJobStore:
         timestamp = iso_utc(now)
         with self._write() as connection:
             row = self._action_row(connection, action_id)
+            job = self._job_row(connection, row["job_id"])
+            unresolved_action = self._unresolved_action(connection, row["job_id"])
+            if (
+                unresolved_action is not None
+                and unresolved_action["action_id"] != action_id
+            ):
+                _fail(CommerceActionError, "inflight_action_exists", "job_id")
+            recovery_redispatch = (
+                row["action_status"] == "recoverable"
+                and row["effect_class"] == "read_only"
+                and job["current_state"] == row["target_state"]
+                and job["current_step"] == row["action_type"]
+            )
+            if row["action_status"] != "planned" and not (
+                row["action_status"] == "recoverable"
+                and row["effect_class"] == "read_only"
+            ):
+                _fail(
+                    CommerceActionError,
+                    "action_not_dispatchable",
+                    "action_status",
+                )
+            if row["target_state"] not in EXECUTION_STATES or (
+                row["target_state"] not in ALLOWED_TRANSITIONS[job["current_state"]]
+                and not recovery_redispatch
+            ):
+                _fail(
+                    CommerceActionError,
+                    "job_not_ready_for_action",
+                    "current_state",
+                )
             if row["approval_status"] == "stale":
                 _fail(
                     CommerceActionError,
                     "stale_action_approval",
                     "action_id",
                 )
-            if row["action_status"] != "planned":
-                _fail(
-                    CommerceActionError,
-                    "action_not_dispatchable",
-                    "action_status",
-                )
+            if row["effect_class"] == "consequential" and (
+                row["approval_status"] != "live"
+            ):
+                _fail(CommerceActionError, "action_approval_required", "action_id")
+            if row["effect_class"] == "consequential" and (
+                not row["approval_expires_at"]
+                or row["approval_expires_at"] <= timestamp
+            ):
+                _fail(CommerceActionError, "action_approval_expired", "action_id")
             connection.execute(
                 """UPDATE job_actions SET action_status='dispatched',
                    dispatched_at=?,started_at=?,updated_at=?
@@ -1378,6 +1730,109 @@ class CommerceJobStore:
             )
             return self._decode_action(self._action_row(connection, action_id))
 
+    def resolve_uncertain_action(
+        self,
+        action_id: str,
+        *,
+        status: str,
+        evidence: Mapping[str, Any],
+        expected_version: int,
+        actor: str,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        if status not in {"succeeded", "failed"}:
+            _fail(CommerceActionError, "invalid_resolution_status", "status")
+        payload = _mapping(evidence, "reconciliation_evidence")
+        if payload.get("provider_truth_verified") is not True:
+            _fail(
+                CommerceActionError,
+                "reconciliation_verification_required",
+                "reconciliation_evidence",
+            )
+        target_state = "ready" if status == "succeeded" else "failed"
+        timestamp = _utc(now)
+        with self._write() as connection:
+            action = self._action_row(connection, action_id)
+            job = self._job_row(connection, action["job_id"])
+            current_result = json.loads(action["result_json"])
+            if action["action_status"] == status:
+                resolution_event = connection.execute(
+                    """SELECT 1 FROM job_events
+                       WHERE job_id=? AND event_type='action_reconciled'
+                         AND evidence_json=? LIMIT 1""",
+                    (
+                        job["job_id"],
+                        canonical_json({"action_id": action_id, "status": status}),
+                    ),
+                ).fetchone()
+                if (
+                    current_result.get("reconciliation") == payload
+                    and resolution_event is not None
+                ):
+                    decoded_action = self._decode_action(action)
+                    decoded_action["idempotent_replay"] = True
+                    return {
+                        "action": decoded_action,
+                        "job": self._decode_job(job),
+                    }
+                _fail(CommerceActionError, "resolution_conflict", "action_id")
+            if (
+                action["action_status"] != "uncertain"
+                or job["current_state"] != "reconciliation_required"
+                or job["current_step"] != action["action_type"]
+            ):
+                _fail(CommerceActionError, "action_not_reconcilable", "action_id")
+            unresolved = self._unresolved_action(connection, job["job_id"])
+            if unresolved is None or unresolved["action_id"] != action_id:
+                _fail(CommerceActionError, "action_not_reconcilable", "action_id")
+            resolved_result = {
+                "uncertain_result": current_result,
+                "reconciliation": payload,
+            }
+            resolved_at = iso_utc(timestamp)
+            connection.execute(
+                """UPDATE job_actions
+                   SET action_status=?,result_json=?,terminal_at=?,
+                       uncertainty=0,updated_at=?
+                   WHERE action_id=?""",
+                (
+                    status,
+                    canonical_json(resolved_result),
+                    resolved_at,
+                    resolved_at,
+                    action_id,
+                ),
+            )
+            self._append_event(
+                connection,
+                job_id=job["job_id"],
+                event_type="action_reconciled",
+                from_state=job["current_state"],
+                to_state=job["current_state"],
+                actor=actor,
+                reason_code=f"uncertain_action_{status}",
+                evidence={"action_id": action_id, "status": status},
+                now=timestamp,
+            )
+            resolved_job = self._transition_in_tx(
+                connection,
+                row=job,
+                to_state=target_state,
+                expected_state="reconciliation_required",
+                expected_version=expected_version,
+                actor=actor,
+                reason_code=f"reconciliation_{status}",
+                evidence={"action_id": action_id},
+                action_id="",
+                gate_id="",
+                now=timestamp,
+            )
+            decoded_action = self._decode_action(
+                self._action_row(connection, action_id)
+            )
+            decoded_action["idempotent_replay"] = False
+            return {"action": decoded_action, "job": resolved_job}
+
     def open_gate(
         self,
         job_id: str,
@@ -1403,22 +1858,82 @@ class CommerceJobStore:
             max_chars=1_000,
         )
         approval = _safe_text(approval_reference, "approval_reference", max_chars=240)
-        approval_fp = _safe_text(
-            approval_fingerprint, "approval_fingerprint", max_chars=128
-        )
+        if not isinstance(approval_fingerprint, str):
+            _fail(CommerceConfigurationError, "invalid_text", "approval_fingerprint")
+        approval_fp = approval_fingerprint.strip()
+        if bool(approval) != bool(approval_fp):
+            _fail(
+                CommerceGateError,
+                "approval_binding_incomplete",
+                "approval_reference",
+            )
+        if approval_fp and re.fullmatch(r"[0-9a-f]{64}", approval_fp) is None:
+            _fail(
+                CommerceGateError,
+                "invalid_approval_fingerprint",
+                "approval_fingerprint",
+            )
         evidence = _mapping(opening_evidence, "opening_evidence")
         timestamp = _utc(now)
-        expiry = iso_utc(expires_at) if expires_at else None
+        if gate_name == "action_approval":
+            latest_expiry = timestamp + ACTION_APPROVAL_TTL
+            if expires_at is not None and _utc(expires_at) > latest_expiry:
+                _fail(
+                    CommerceGateError,
+                    "action_approval_ttl_exceeded",
+                    "expires_at",
+                )
+            expiry = iso_utc(expires_at or latest_expiry)
+        else:
+            expiry = iso_utc(expires_at) if expires_at else None
         with self._write() as connection:
             row = self._job_row(connection, job_id)
+            if not row["active"] or row["current_state"] in {
+                "paused",
+                "timed_out",
+            }:
+                _fail(CommerceGateError, "gate_job_inactive", "job_id")
+            if gate_name == "action_approval":
+                expired_gates = connection.execute(
+                    """SELECT gate_id FROM gates
+                       WHERE job_id=? AND gate_type='action_approval'
+                         AND status IN ('open','completed')
+                         AND expires_at IS NOT NULL AND expires_at<=?""",
+                    (job_id, iso_utc(timestamp)),
+                ).fetchall()
+                for expired_gate in expired_gates:
+                    expired_gate_id = str(expired_gate["gate_id"])
+                    connection.execute(
+                        """UPDATE gates SET status='expired',
+                           handoff_token_hash='',handoff_expires_at=NULL
+                           WHERE gate_id=?""",
+                        (expired_gate_id,),
+                    )
+                    self._append_event(
+                        connection,
+                        job_id=job_id,
+                        event_type="gate_expired",
+                        from_state=row["current_state"],
+                        to_state=row["current_state"],
+                        actor=actor,
+                        reason_code="action_approval_expired",
+                        evidence={"gate_id": expired_gate_id},
+                        now=timestamp,
+                    )
+            if connection.execute(
+                "SELECT 1 FROM gates WHERE job_id=? AND status IN ('open','completed')",
+                (job_id,),
+            ).fetchone():
+                _fail(CommerceGateError, "active_gate_exists", "job_id")
             gate_id = _new_id("cg")
             connection.execute(
                 """INSERT INTO gates
                    (gate_id,job_id,gate_type,status,human_action,
-                    provider_truth_reference,approval_reference,
+                    provider_truth_reference,browser_session,handoff_token_hash,
+                    handoff_expires_at,done_requested_at,approval_reference,
                     approval_fingerprint,opening_evidence_json,
                     completion_evidence_json,opened_at,expires_at,completed_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,NULL)""",
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL)""",
                 (
                     gate_id,
                     job_id,
@@ -1426,6 +1941,10 @@ class CommerceJobStore:
                     "open",
                     action,
                     truth,
+                    row["browser_session"],
+                    "",
+                    None,
+                    None,
                     approval,
                     approval_fp,
                     canonical_json(evidence),
@@ -1450,6 +1969,133 @@ class CommerceJobStore:
             ).fetchone()
             return self._decode_gate(gate)
 
+    def get_gate(self, gate_id: str) -> dict[str, Any]:
+        connection = self._read()
+        try:
+            return self._decode_gate(self._gate_row(connection, gate_id))
+        finally:
+            connection.close()
+
+    def issue_gate_handoff(
+        self,
+        gate_id: str,
+        *,
+        actor: str = "system",
+        now: datetime | None = None,
+    ) -> tuple[dict[str, Any], str]:
+        timestamp = _utc(now)
+        with self._write() as connection:
+            gate, job = self._active_handoff_gate(connection, gate_id, now=timestamp)
+            token = f"cgh_{secrets.token_urlsafe(32)}"
+            connection.execute(
+                """UPDATE gates SET handoff_token_hash=?,handoff_expires_at=?
+                   WHERE gate_id=?""",
+                (
+                    hashlib.sha256(token.encode("utf-8")).hexdigest(),
+                    self._handoff_expiry(gate, timestamp),
+                    gate_id,
+                ),
+            )
+            self._append_event(
+                connection,
+                job_id=job["job_id"],
+                event_type="gate_handoff_issued",
+                from_state=job["current_state"],
+                to_state=job["current_state"],
+                actor=actor,
+                reason_code="gate_handoff_issued",
+                evidence={"gate_id": gate_id},
+                now=timestamp,
+            )
+            updated = self._gate_row(connection, gate_id)
+            return self._decode_gate(updated), token
+
+    def authorize_gate_handoff(
+        self,
+        gate_id: str,
+        token: str,
+        *,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        timestamp = _utc(now)
+        connection = self._read()
+        try:
+            gate, _ = self._active_handoff_gate(
+                connection, gate_id, now=timestamp, token=token
+            )
+            return self._decode_gate(gate)
+        finally:
+            connection.close()
+
+    def renew_gate_handoff(
+        self,
+        gate_id: str,
+        token: str,
+        *,
+        actor: str = "system",
+        now: datetime | None = None,
+    ) -> tuple[dict[str, Any], str]:
+        timestamp = _utc(now)
+        with self._write() as connection:
+            gate, job = self._active_handoff_gate(
+                connection, gate_id, now=timestamp, token=token
+            )
+            renewed_token = f"cgh_{secrets.token_urlsafe(32)}"
+            connection.execute(
+                """UPDATE gates SET handoff_token_hash=?,handoff_expires_at=?
+                   WHERE gate_id=?""",
+                (
+                    hashlib.sha256(renewed_token.encode("utf-8")).hexdigest(),
+                    self._handoff_expiry(gate, timestamp),
+                    gate_id,
+                ),
+            )
+            self._append_event(
+                connection,
+                job_id=job["job_id"],
+                event_type="gate_handoff_renewed",
+                from_state=job["current_state"],
+                to_state=job["current_state"],
+                actor=actor,
+                reason_code="gate_handoff_renewed",
+                evidence={"gate_id": gate_id},
+                now=timestamp,
+            )
+            updated = self._gate_row(connection, gate_id)
+            return self._decode_gate(updated), renewed_token
+
+    def request_gate_done(
+        self,
+        gate_id: str,
+        token: str,
+        *,
+        actor: str,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        timestamp = _utc(now)
+        with self._write() as connection:
+            gate, job = self._active_handoff_gate(
+                connection, gate_id, now=timestamp, token=token
+            )
+            if gate["done_requested_at"]:
+                return self._decode_gate(gate)
+            connection.execute(
+                "UPDATE gates SET done_requested_at=? WHERE gate_id=?",
+                (iso_utc(timestamp), gate_id),
+            )
+            self._append_event(
+                connection,
+                job_id=job["job_id"],
+                event_type="gate_done_requested",
+                from_state=job["current_state"],
+                to_state=job["current_state"],
+                actor=actor,
+                reason_code="human_requested_gate_verification",
+                evidence={"gate_id": gate_id},
+                now=timestamp,
+            )
+            return self._decode_gate(self._gate_row(connection, gate_id))
+
     def complete_gate(
         self,
         gate_id: str,
@@ -1459,23 +2105,36 @@ class CommerceJobStore:
         now: datetime | None = None,
     ) -> dict[str, Any]:
         payload = _mapping(evidence, "completion_evidence")
+        if payload.get("provider_truth_verified") is not True:
+            _fail(
+                CommerceGateError,
+                "provider_truth_verification_required",
+                "completion_evidence",
+            )
         timestamp = _utc(now)
         with self._write() as connection:
-            gate = connection.execute(
-                "SELECT * FROM gates WHERE gate_id=?", (gate_id,)
-            ).fetchone()
-            if gate is None:
-                _fail(CommerceNotFoundError, "gate_not_found", "gate_id")
+            gate = self._gate_row(connection, gate_id)
             if gate["status"] != "open":
                 _fail(CommerceGateError, "gate_not_open", "status")
             if gate["expires_at"] and gate["expires_at"] <= iso_utc(timestamp):
                 _fail(CommerceGateError, "gate_expired", "expires_at")
+            job = self._job_row(connection, gate["job_id"])
+            if gate["gate_type"] != "action_approval":
+                if (
+                    not job["active"]
+                    or job["current_state"] != "awaiting_cal"
+                    or job["current_gate_id"] != gate["gate_id"]
+                    or gate["browser_session"] != job["browser_session"]
+                ):
+                    _fail(CommerceGateError, "gate_not_active_handoff", "gate_id")
+                if not gate["done_requested_at"]:
+                    _fail(CommerceGateError, "gate_done_required", "gate_id")
             connection.execute(
                 """UPDATE gates SET status='completed',completion_evidence_json=?,
-                   completed_at=? WHERE gate_id=?""",
+                   completed_at=?,handoff_token_hash='',handoff_expires_at=NULL
+                   WHERE gate_id=?""",
                 (canonical_json(payload), iso_utc(timestamp), gate_id),
             )
-            job = self._job_row(connection, gate["job_id"])
             self._append_event(
                 connection,
                 job_id=gate["job_id"],
@@ -1501,17 +2160,15 @@ class CommerceJobStore:
     ) -> dict[str, Any]:
         timestamp = _utc(now)
         with self._write() as connection:
-            gate = connection.execute(
-                "SELECT * FROM gates WHERE gate_id=?", (gate_id,)
-            ).fetchone()
-            if gate is None:
-                _fail(CommerceNotFoundError, "gate_not_found", "gate_id")
+            gate = self._gate_row(connection, gate_id)
             if gate["status"] != "open":
                 _fail(CommerceGateError, "gate_not_open", "status")
             if not gate["expires_at"] or gate["expires_at"] > iso_utc(timestamp):
                 _fail(CommerceGateError, "gate_not_expired", "expires_at")
             connection.execute(
-                "UPDATE gates SET status='expired' WHERE gate_id=?", (gate_id,)
+                """UPDATE gates SET status='expired',handoff_token_hash='',
+                   handoff_expires_at=NULL WHERE gate_id=?""",
+                (gate_id,),
             )
             job = self._job_row(connection, gate["job_id"])
             self._append_event(
@@ -1596,7 +2253,7 @@ class CommerceJobStore:
 
     def sweep_timeouts(self, *, now: datetime, actor: str = "system") -> list[str]:
         timestamp = _utc(now)
-        paused: list[str] = []
+        timed_out: list[str] = []
         with self._write() as connection:
             rows = connection.execute(
                 """SELECT * FROM jobs
@@ -1605,24 +2262,27 @@ class CommerceJobStore:
                 (iso_utc(timestamp),),
             ).fetchall()
             for row in rows:
-                if row["current_state"] in TIMEOUT_EXCLUDED_STATES | {"paused"}:
+                if (
+                    row["current_state"] in TIMEOUT_EXCLUDED_STATES
+                    or self._unresolved_action(connection, row["job_id"]) is not None
+                ):
                     continue
                 self._transition_in_tx(
                     connection,
                     row=row,
-                    to_state="paused",
+                    to_state="timed_out",
                     expected_state=row["current_state"],
                     expected_version=int(row["row_version"]),
                     actor=actor,
                     reason_code="state_timeout",
                     evidence={},
                     action_id="",
-                    approval_reference="",
+                    gate_id="",
                     now=timestamp,
-                    event_type="timeout_pause",
+                    event_type="state_timed_out",
                 )
-                paused.append(row["job_id"])
-        return paused
+                timed_out.append(row["job_id"])
+        return timed_out
 
     def recover(self, *, now: datetime, actor: str = "system") -> dict[str, int]:
         timestamp = _utc(now)
@@ -1690,21 +2350,31 @@ class CommerceJobStore:
                             action["action_id"],
                         ),
                     )
-                if job["current_state"] != "uncertain_external_state":
+                if job["current_state"] not in UNCERTAINTY_STATES:
                     entered = iso_utc(timestamp)
                     connection.execute(
                         """UPDATE jobs
                            SET current_state='uncertain_external_state',
+                               current_step=?,current_gate_id='',
                                state_entered_at=?,deadline_at=?,
                                row_version=row_version+1,updated_at=?
                            WHERE job_id=? AND row_version=?""",
                         (
+                            action["action_type"],
                             entered,
                             iso_utc(timestamp + DEFAULT_STATE_TIMEOUT),
                             entered,
                             job["job_id"],
                             int(job["row_version"]),
                         ),
+                    )
+                    connection.execute(
+                        """UPDATE gates
+                           SET status=CASE WHEN status IN ('open','completed')
+                                           THEN 'invalidated' ELSE status END,
+                               handoff_token_hash='',handoff_expires_at=NULL
+                           WHERE job_id=?""",
+                        (job["job_id"],),
                     )
                     self._append_event(
                         connection,
