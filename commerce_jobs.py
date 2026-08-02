@@ -68,6 +68,11 @@ _CORE_TRANSITIONS: dict[str, set[str]] = {
     "ready": {
         "awaiting_purchase_approval",
         "executing_read_only",
+        # Idempotent writes need no approval, so `ready` must be able to begin
+        # one directly -- otherwise resuming a paused/timed-out job whose next
+        # step is a write dead-ends. Consequential actions are still barred
+        # here: dispatch requires a live approval row (_dispatch_action_in_tx).
+        "executing",
     },
     "executing_read_only": {
         "ready",

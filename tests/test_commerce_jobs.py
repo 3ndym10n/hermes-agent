@@ -451,7 +451,7 @@ def test_v2_state_machine_contract():
     core = {
         "requested": {"planning"},
         "planning": {"ready", "awaiting_cal"},
-        "ready": {"awaiting_purchase_approval", "executing_read_only"},
+        "ready": {"awaiting_purchase_approval", "executing_read_only", "executing"},
         "executing_read_only": {
             "ready",
             "awaiting_dns_approval",

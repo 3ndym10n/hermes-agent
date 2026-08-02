@@ -13,7 +13,7 @@ import commerce_operator as commerce
 
 import commerce_browser as browser
 from commerce_browser import BrowserLifecycleError
-from commerce_jobs import CommerceJobStore
+from commerce_jobs import CommerceActionError, CommerceJobStore
 from commerce_operator import (
     CommerceOperator,
     WorkerAlreadyRunningError,
@@ -155,6 +155,83 @@ def test_read_and_idempotent_steps_dispatch_in_order(tmp_path):
         action["request"]["provider_idempotency_key"].startswith("fake:")
         for action in actions
     )
+
+
+def test_ready_dispatches_an_idempotent_write_without_dead_ending(tmp_path):
+    """A resumed job whose next step is a write must not park as out-of-order."""
+    store = make_store(tmp_path)
+    job = make_job(store)
+    plan = {
+        "provider_account": "fake-provider",
+        "steps": [step("page", "upsert_page", "idempotent_write")],
+    }
+    calls: list[str] = []
+
+    def handler(_job, action):
+        calls.append(action["action_type"])
+        return {"result_code": "provider_truth_verified"}
+
+    operator(
+        store,
+        tmp_path,
+        planner=lambda _job, _facts: plan,
+        handlers={"upsert_page": handler},
+    ).tick()
+
+    assert calls == ["upsert_page"]
+    snapshot = store.get_job(job["job_id"])
+    assert snapshot["current_state"] == "ready"
+    assert [event["reason_code"] for event in store.list_events(job["job_id"])].count(
+        "operator_pause"
+    ) == 0
+
+
+def test_ready_still_refuses_an_unapproved_consequential_action(tmp_path):
+    """`ready -> executing` must not become a way around the approval gate."""
+    store = make_store(tmp_path)
+    job = make_job(store)
+    store.transition(
+        job["job_id"],
+        "planning",
+        expected_state="requested",
+        expected_version=int(job["row_version"]),
+        actor="test",
+        reason_code="claimed",
+        now=NOW,
+    )
+    snapshot = store.get_job(job["job_id"])
+    store.transition(
+        job["job_id"],
+        "ready",
+        expected_state="planning",
+        expected_version=int(snapshot["row_version"]),
+        actor="test",
+        reason_code="planned",
+        now=NOW,
+    )
+    snapshot = store.get_job(job["job_id"])
+    action = store.record_action(
+        job["job_id"],
+        action_type="register_domain",
+        provider="fake-provider",
+        effect_class="consequential",
+        idempotency_key="fake:register",
+        request={"step_id": "buy", "input": {}},
+        target_state="executing",
+        now=NOW,
+    )
+
+    with pytest.raises(CommerceActionError) as raised:
+        store.dispatch_and_transition(
+            action["action_id"],
+            expected_state="ready",
+            expected_version=int(snapshot["row_version"]),
+            actor="test",
+            now=NOW,
+        )
+
+    assert raised.value.code == "action_approval_required"
+    assert store.get_job(job["job_id"])["current_state"] == "ready"
 
 
 def test_completed_exact_approval_is_consumed_but_worker_never_grants_it(tmp_path):
