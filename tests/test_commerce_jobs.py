@@ -3289,3 +3289,35 @@ def test_initialize_reads_table_presence_before_schema_version(tmp_path):
         and "=" not in sql
     )
     assert presence < version, statements
+
+
+# A real sha256 whose digits contain a Luhn-valid 17-digit run bounded by hex
+# letters. Roughly one receipt in twenty carries a digest like this, which is
+# what made the acceptance rehearsal fail intermittently.
+LUHN_COLLIDING_DIGEST = (
+    "15f2dd6ac97954004419818681e5a30ade16e5d5d4b4238d3eb5fb29c8a535e9"
+)
+
+
+def test_hex_digests_are_not_mistaken_for_card_numbers():
+    """The card screen must not reject an ordinary content fingerprint."""
+    commerce.reject_forbidden_data(
+        {
+            "content_sha256": LUHN_COLLIDING_DIGEST,
+            "evidence_ref": f"evidence/cj_1/porkbun-{LUHN_COLLIDING_DIGEST[:16]}.json",
+        },
+        "snapshot",
+    )
+
+
+def test_delimited_card_numbers_are_still_rejected():
+    """Narrowing the boundary must not blind the screen to real card data."""
+    for payload in (
+        {"note": "4111111111111111"},
+        {"note": "card: 4111111111111111"},
+        {"note": "4111-1111-1111-1111"},
+        {"note": "pan=4111 1111 1111 1111"},
+        {"note": '"4111111111111111"'},
+    ):
+        with pytest.raises(commerce.CommerceForbiddenDataError):
+            commerce.reject_forbidden_data(payload, "snapshot")

@@ -1154,17 +1154,24 @@ class CommerceOperator:
                 return self._pause(current, "receipt_completion_invalid")
             if self.completion_handler is None:
                 return self._pause(current, "receipt_writer_missing")
+            # Park visibly instead of raising. A raise here is swallowed by
+            # tick() into an error counter, and because the action is already
+            # succeeded the next tick retries the same failing write -- the job
+            # spins in executing_read_only forever, one transition short of
+            # completed, with no durable trace of why. Pausing still blocks
+            # `completed` until the receipt exists (plan §13) but says so, and
+            # `/store resume` retries once the cause is fixed.
             try:
                 receipt = self.completion_handler(str(job["job_id"]), completion)
             except Exception:
-                raise CommerceOperatorError("receipt_persistence_failed") from None
+                return self._pause(current, "receipt_persistence_failed")
             receipt_ref = (
                 _reference(receipt.get("receipt_ref"))
                 if isinstance(receipt, Mapping)
                 else ""
             )
             if not receipt_ref:
-                raise CommerceOperatorError("receipt_persistence_failed")
+                return self._pause(current, "receipt_persistence_failed")
             self.store.transition(
                 str(job["job_id"]),
                 "completed",

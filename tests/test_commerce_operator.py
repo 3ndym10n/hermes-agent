@@ -1398,3 +1398,128 @@ def test_production_final_verification_completes_and_writes_a_receipt(tmp_path):
     assert facts_out["no_payment_collected"] is True
     # No email address may reach the receipt -- only its digest.
     assert "@" not in _json.dumps(facts_out)
+
+
+def _final_verify_state(store, tmp_path, *, facts=None):
+    """Recreate the reported stall exactly: every action succeeded, completion
+    payload present, job still in the final execution state."""
+    job = make_job(store, objective="final stall")
+    plan = {
+        "provider_account": "fake-provider",
+        "steps": [step("s15_final", "commerce_final_verify", "read_only")],
+    }
+    for target, expected, extra in (
+        ("planning", "requested", {}),
+        ("ready", "planning", {"plan": plan}),
+    ):
+        snapshot = store.get_job(job["job_id"])
+        if extra.get("plan") is not None:
+            store.set_plan(
+                job["job_id"],
+                extra["plan"],
+                expected_version=int(snapshot["row_version"]),
+                actor="test",
+                now=NOW,
+            )
+            snapshot = store.get_job(job["job_id"])
+        store.transition(
+            job["job_id"],
+            target,
+            expected_state=expected,
+            expected_version=int(snapshot["row_version"]),
+            actor="test",
+            reason_code="setup",
+            now=NOW,
+        )
+    snapshot = store.get_job(job["job_id"])
+    action = store.record_action(
+        job["job_id"],
+        action_type="commerce_final_verify",
+        provider="fake-provider",
+        effect_class="read_only",
+        idempotency_key="fake:s15_final",
+        request={"step_id": "s15_final", "input": {}},
+        target_state="executing_read_only",
+        now=NOW,
+    )
+    store.dispatch_and_transition(
+        action["action_id"],
+        expected_state="ready",
+        expected_version=int(snapshot["row_version"]),
+        actor="test",
+        now=NOW,
+    )
+    store.finish_action(
+        action["action_id"],
+        status="succeeded",
+        result={
+            "provider_truth_verified": True,
+            "all_green": True,
+            "operator_control": {
+                "completion": {"verified_facts": facts or {"ok": True}}
+            },
+        },
+        now=NOW,
+    )
+    return job
+
+
+def test_completed_final_verify_completes_on_the_very_next_tick(tmp_path):
+    """The reported stall state must be recoverable by one more tick.
+
+    All actions succeeded including commerce_final_verify, the completion
+    payload is present, and the job is still in executing_read_only. If a tick
+    cannot finish that, the job is wedged and no tick budget would ever save it.
+    """
+    store = make_store(tmp_path)
+    job = _final_verify_state(store, tmp_path)
+    written: list[str] = []
+
+    snapshot = store.get_job(job["job_id"])
+    assert snapshot["current_state"] == "executing_read_only"
+    assert [a["action_status"] for a in store.list_actions(job["job_id"])] == [
+        "succeeded"
+    ]
+
+    worker = operator(
+        store,
+        tmp_path,
+        planner=lambda _job, _facts: {"provider_account": "fake-provider", "steps": []},
+        handlers={},
+        completion_handler=lambda job_id, payload: (
+            written.append(job_id) or {"receipt_ref": f"receipts/{job_id}.json"}
+        ),
+    )
+    worker.tick()
+
+    assert written == [job["job_id"]], "receipt was not persisted"
+    assert store.get_job(job["job_id"])["current_state"] == "completed"
+
+
+def test_a_failing_receipt_write_parks_visibly_instead_of_wedging(tmp_path):
+    """A receipt writer that always fails must not spin silently forever."""
+    store = make_store(tmp_path)
+    job = _final_verify_state(store, tmp_path)
+
+    def boom(_job_id, _payload):
+        raise RuntimeError("receipt store unavailable")
+
+    worker = operator(
+        store,
+        tmp_path,
+        planner=lambda _job, _facts: {"provider_account": "fake-provider", "steps": []},
+        handlers={},
+        completion_handler=boom,
+    )
+    for _ in range(3):
+        worker.tick()
+
+    snapshot = store.get_job(job["job_id"])
+    reasons = [event["reason_code"] for event in store.list_events(job["job_id"])]
+    assert snapshot["current_state"] != "completed"
+    # Whatever it does, it must leave a durable trace of why -- a job that
+    # neither completes nor records a reason is the silent wedge itself.
+    assert snapshot["current_state"] == "paused" or "operator_pause" in reasons, (
+        snapshot["current_state"],
+        reasons,
+    )

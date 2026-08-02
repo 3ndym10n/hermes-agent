@@ -188,7 +188,12 @@ _FORBIDDEN_KEY_PARTS = frozenset({
     "driverlicense",
     "customercard",
 })
-_PAN_RE = re.compile(r"(?<!\d)(?:\d[ -]?){13,19}(?!\d)")
+# Boundaries are non-alphanumeric, not merely non-digit. A 13-19 digit run
+# buried inside a longer hex token is a sha256 or an evidence digest, not a
+# card number -- roughly 5% of receipts carry one that also passes Luhn, and
+# screening those out rejected legitimate receipts. Real card data is always
+# delimited (quote, colon, equals, space), so it still matches.
+_PAN_RE = re.compile(r"(?<![0-9A-Za-z])(?:\d[ -]?){13,19}(?![0-9A-Za-z])")
 _EXPIRY_RE = re.compile(r"(?<![\d/-])(?:0[1-9]|1[0-2])\s*[/\-]\s*\d{2,4}(?![\d/-])")
 _CVV_RE = re.compile(
     r"\b(?:cvv|cvc|security\s*code)\s*[:=]?\s*\d{3,4}\b", re.IGNORECASE

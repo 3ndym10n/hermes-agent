@@ -221,9 +221,14 @@ def assert_decision_packet(
         binding = buttons.resolve(
             raw, user_id="4242", chat_id="-10042", message_id="501"
         )
-        require(binding.action_fingerprint == action["action_fingerprint"], "token binding")
+        require(
+            binding.action_fingerprint == action["action_fingerprint"], "token binding"
+        )
     require(
-        all(isinstance(digest, bytes) and len(digest) == 32 for digest in buttons._entries),
+        all(
+            isinstance(digest, bytes) and len(digest) == 32
+            for digest in buttons._entries
+        ),
         "button store retains SHA-256 digests only",
     )
 
@@ -239,7 +244,10 @@ def request_human_gate_done(
     finally:
         commerce_watcher.attention_public_url = original
     require(len(re.findall(r"https://", card)) == 1, "gate card has one HTTPS link")
-    require("password" not in card.casefold() and "secret" not in card.casefold(), "gate card has no secret request")
+    require(
+        "password" not in card.casefold() and "secret" not in card.casefold(),
+        "gate card has no secret request",
+    )
     normalized = re.sub(
         r"/gate/cg_[A-Za-z0-9_]+\?t=cgh_[A-Za-z0-9_-]+",
         "/gate/cg_fixture?t=cgh_fixture",
@@ -253,6 +261,81 @@ def request_human_gate_done(
     store.request_gate_done(gate_id, token, actor="cal:fake-viewer")
 
 
+# Progress-aware driver ------------------------------------------------------
+#
+# A fixed tick count cannot tell "still working" from "wedged": it fails late,
+# with no diagnosis, and it flakes whenever the flow legitimately needs one
+# more pass. Drive on durable progress instead -- keep ticking while the job
+# row, its actions or its gates change, and stop the moment they stop.
+
+MAX_NO_PROGRESS_TICKS = 3
+# Safety net only. Reaching this is itself a failure, never the way we finish.
+ABSOLUTE_TICK_CEILING = 400
+
+
+def durable_fingerprint(store: CommerceJobStore, job_id: str) -> tuple:
+    """Everything that must change for the job to be making real progress."""
+    job = store.get_job(job_id)
+    return (
+        job["current_state"],
+        int(job["row_version"]),
+        job["current_step"],
+        job.get("current_gate_id") or "",
+        tuple(
+            (item["action_id"], item["action_status"])
+            for item in store.list_actions(job_id)
+        ),
+        tuple(
+            (item["gate_id"], item["status"], bool(item.get("done_requested_at")))
+            for item in store.list_gates(job_id)
+        ),
+    )
+
+
+def stall_report(store: CommerceJobStore, job_id: str, reason: str, ticks: int) -> str:
+    job = store.get_job(job_id)
+    return (
+        f"{reason} after {ticks} ticks: "
+        f"state={job['current_state']} step={job['current_step']!r} "
+        f"gate={job.get('current_gate_id') or None} version={job['row_version']}\n"
+        f"  actions={[(i['action_type'], i['action_status']) for i in store.list_actions(job_id)]}\n"
+        f"  gates={[(i['gate_type'], i['status'], bool(i.get('done_requested_at'))) for i in store.list_gates(job_id)]}\n"
+        f"  events={[(i['to_state'], i['reason_code']) for i in store.list_events(job_id)[-8:]]}"
+    )
+
+
+def drive_to_completion(worker, store: CommerceJobStore, job_id: str, on_state) -> int:
+    """Tick until `completed`, failing precisely when durable progress stops."""
+    stalls = 0
+    for tick_index in range(ABSOLUTE_TICK_CEILING):
+        before = durable_fingerprint(store, job_id)
+        worker.tick()
+        on_state(store.get_job(job_id)["current_state"])
+        after = durable_fingerprint(store, job_id)
+        if store.get_job(job_id)["current_state"] == "completed":
+            return tick_index + 1
+        if after == before:
+            stalls += 1
+            if stalls >= MAX_NO_PROGRESS_TICKS:
+                raise SystemExit(
+                    "COMMERCE FAKE E2E FAIL: "
+                    + stall_report(
+                        store,
+                        job_id,
+                        f"no durable progress for {stalls} consecutive ticks",
+                        tick_index + 1,
+                    )
+                )
+        else:
+            stalls = 0
+    raise SystemExit(
+        "COMMERCE FAKE E2E FAIL: "
+        + stall_report(
+            store, job_id, "absolute tick ceiling reached", ABSOLUTE_TICK_CEILING
+        )
+    )
+
+
 def make_browser_ensure(port: int, received: queue.Queue, attaches: list[str]):
     def ensure(job_id: str, session: str, _entry_url: str) -> dict:
         validate_browser_binding(job_id, session)
@@ -261,8 +344,12 @@ def make_browser_ensure(port: int, received: queue.Queue, attaches: list[str]):
             for _ in range(3):
                 raw = upstream.recv()
                 require(isinstance(raw, str), "native stream sends text")
-                safe = gate_routes._valid_frame(raw) or gate_routes._valid_native_notice(raw)
-                require(safe is not None, "gate viewer accepts fake native stream message")
+                safe = gate_routes._valid_frame(
+                    raw
+                ) or gate_routes._valid_native_notice(raw)
+                require(
+                    safe is not None, "gate viewer accepts fake native stream message"
+                )
                 payload = json.loads(safe)
                 seen.add(payload["type"])
                 require("url" not in safe, "tab URL is stripped")
@@ -276,7 +363,10 @@ def make_browser_ensure(port: int, received: queue.Queue, attaches: list[str]):
             })
             require(event is not None, "viewer input validates")
             upstream.send(json.dumps(event, separators=(",", ":")))
-            require(received.get(timeout=3)["type"] == "input_keyboard", "input reaches fake CDP")
+            require(
+                received.get(timeout=3)["type"] == "input_keyboard",
+                "input reaches fake CDP",
+            )
         attaches.append(session)
         return {"profile": "fake", "reattached": True, "session": session}
 
@@ -284,8 +374,12 @@ def make_browser_ensure(port: int, received: queue.Queue, attaches: list[str]):
 
 
 def assert_actual_receipt(actual: dict, golden: dict, request: dict) -> None:
-    require(actual["objective"] == request["text"], "Telegram objective reaches receipt")
-    require(len(actual["actions_completed"]) == 15, "all production workflow steps complete")
+    require(
+        actual["objective"] == request["text"], "Telegram objective reaches receipt"
+    )
+    require(
+        len(actual["actions_completed"]) == 15, "all production workflow steps complete"
+    )
     require(
         [item["step"] for item in actual["actions_completed"]]
         == [
@@ -330,7 +424,9 @@ def main() -> int:
     request = load_json("telegram_request.json")
     decision = load_json("decision_packet.json")
     golden = load_json("receipt.json")
-    require(request["text"] == "Set up the AMD GPU waitlist store.", "acceptance sentence")
+    require(
+        request["text"] == "Set up the AMD GPU waitlist store.", "acceptance sentence"
+    )
 
     with tempfile.TemporaryDirectory(prefix="commerce-fake-e2e-") as directory:
         root = Path(directory)
@@ -370,9 +466,7 @@ def main() -> int:
                 "checklist": "9.3",
             }
             if phase == "final":
-                report["receipt_facts"] = receipt_facts(
-                    golden, current_job["job_id"]
-                )
+                report["receipt_facts"] = receipt_facts(golden, current_job["job_id"])
             return report
 
         persisted: dict[str, object] = {}
@@ -421,18 +515,18 @@ def main() -> int:
                 gate_verifiers=verifiers,
                 completion_handler=complete,
             )
-            # Breaks on `completed`, so headroom is free; 20 was one tick from
-            # the nominal path and flaked whenever a step needed an extra pass.
-            for _ in range(40):
-                worker.tick()
+
+            def respond(state: str) -> None:
+                """Play Cal: approvals and gate DONEs, exactly once each."""
+                nonlocal decision_checked, human_gates_checked
                 current = store.get_job(job["job_id"])
-                state = current["current_state"]
                 if state == "awaiting_purchase_approval":
                     if not decision_checked:
                         assert_decision_packet(decision, store, current, evidence_root)
                         decision_checked = True
                     gate = next(
-                        item for item in store.list_gates(job["job_id"])
+                        item
+                        for item in store.list_gates(job["job_id"])
                         if item["status"] == "open"
                     )
                     store.complete_gate(
@@ -447,7 +541,8 @@ def main() -> int:
                     )
                 elif state == "awaiting_publication_approval":
                     gate = next(
-                        item for item in store.list_gates(job["job_id"])
+                        item
+                        for item in store.list_gates(job["job_id"])
                         if item["status"] == "open"
                     )
                     store.complete_gate(
@@ -463,8 +558,8 @@ def main() -> int:
                         store, job["job_id"], match_fixture=human_gates_checked == 0
                     )
                     human_gates_checked += 1
-                elif state == "completed":
-                    break
+
+            ticks = drive_to_completion(worker, store, job["job_id"], respond)
             final = store.get_job(job["job_id"])
 
         require(
@@ -489,23 +584,28 @@ def main() -> int:
         assert_actual_receipt(actual, golden, request)
 
         sensitive = (TOKEN, FACTS["contact_email"])
-        disk = b"".join(
-            path.read_bytes() for path in root.rglob("*") if path.is_file()
-        )
+        disk = b"".join(path.read_bytes() for path in root.rglob("*") if path.is_file())
         require(
             all(value.encode("utf-8") not in disk for value in sensitive),
             "no fake token or contact address persisted",
         )
-        print(json.dumps({
-            "fake_e2e": "PASS",
-            "actions": len(actual["actions_completed"]),
-            "browser_handoffs": len(attaches),
-            "candidate_domains": len(decision["availability"]),
-            "dns_writes": porkbun.writes,
-            "golden_receipt": "exact",
-            "network": "loopback-only",
-            "provider_mutations": "fake-only",
-        }, sort_keys=True))
+        print(
+            json.dumps(
+                {
+                    "fake_e2e": "PASS",
+                    "ticks_to_complete": ticks,
+                    "tick_ceiling": ABSOLUTE_TICK_CEILING,
+                    "actions": len(actual["actions_completed"]),
+                    "browser_handoffs": len(attaches),
+                    "candidate_domains": len(decision["availability"]),
+                    "dns_writes": porkbun.writes,
+                    "golden_receipt": "exact",
+                    "network": "loopback-only",
+                    "provider_mutations": "fake-only",
+                },
+                sort_keys=True,
+            )
+        )
     return 0
 
 

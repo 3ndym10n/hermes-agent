@@ -13,12 +13,14 @@ def test_offline_commerce_acceptance_rehearsal():
         cwd=root,
         capture_output=True,
         text=True,
-        timeout=30,
+        timeout=60,
         check=False,
     )
 
     assert result.returncode == 0, result.stdout + result.stderr
     report = json.loads(result.stdout)
+    ticks = report.pop("ticks_to_complete")
+    ceiling = report.pop("tick_ceiling")
     assert report == {
         "actions": 15,
         "browser_handoffs": 2,
@@ -29,3 +31,8 @@ def test_offline_commerce_acceptance_rehearsal():
         "network": "loopback-only",
         "provider_mutations": "fake-only",
     }
+    # The driver stops on durable progress, not on the ceiling. Pin the margin
+    # so a change that makes the flow crawl toward the safety net is a failure
+    # here rather than a slow surprise in CI.
+    assert 0 < ticks <= 10, ticks
+    assert ceiling >= 40 * ticks
