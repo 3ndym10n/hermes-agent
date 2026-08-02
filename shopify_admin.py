@@ -908,6 +908,31 @@ class ShopifyAdminClient:
             else None,
         }
 
+    def commerce_surface(self) -> dict:
+        """Read the two provider truths that prove checkout cannot be reached.
+
+        V1 publishes no products and configures no payment provider, so both
+        counts must be zero for the §9.3 `checkout_absent` check to pass.
+        """
+        data = self._graphql(
+            "VirgilCommerceSurface",
+            """query VirgilCommerceSurface { productsCount { count } paymentSettings { supportedDigitalWallets } shop { id } }""",
+            {},
+        )
+        products = _mapping(data.get("productsCount"), "productsCount")
+        count = products.get("count")
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            raise ShopifyResponseError("Shopify returned an invalid product count")
+        settings = _mapping(data.get("paymentSettings"), "paymentSettings")
+        wallets = _list(
+            settings.get("supportedDigitalWallets"),
+            "paymentSettings.supportedDigitalWallets",
+        )
+        return {
+            "products_count": count,
+            "payment_provider_configured": bool(wallets),
+        }
+
     def customer_by_email(self, email: str) -> dict | None:
         if (
             not isinstance(email, str)

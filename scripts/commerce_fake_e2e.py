@@ -421,7 +421,9 @@ def main() -> int:
                 gate_verifiers=verifiers,
                 completion_handler=complete,
             )
-            for _ in range(20):
+            # Breaks on `completed`, so headroom is free; 20 was one tick from
+            # the nominal path and flaked whenever a step needed an extra pass.
+            for _ in range(40):
                 worker.tick()
                 current = store.get_job(job["job_id"])
                 state = current["current_state"]

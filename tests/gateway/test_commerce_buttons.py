@@ -847,3 +847,115 @@ def test_governance_bridge_rejection_returns_only_stable_safe_code(
     assert RAW_EXECUTION_TICKET not in output.out + output.err
     assert fake.operator_actions == ["create_purchase_proposal"]
     assert fake.executor_actions == []
+
+
+class _CompletionBridge:
+    """Records exactly what the completion report sends to Cogitator."""
+
+    def __init__(self, response: dict | None = None, status: int = 200):
+        self.calls: list[tuple[str, dict]] = []
+        self.status = status
+        self.response = response if response is not None else {
+            "status": "ok",
+            "requested_action": "record_completed_purchase",
+            "receipt_ref": "purchase-receipts/domain-1",
+        }
+
+    def __call__(self, action, context, user_intent):
+        assert user_intent
+        self.calls.append((action, deepcopy(context)))
+        return self.status, self.response
+
+
+def _completion_approval(**overrides: object) -> dict[str, object]:
+    return {
+        "approval_granted": True,
+        "proposal_id": PROPOSAL_ID,
+        "ticket_id": TICKET_ID,
+        "approval_reference": APPROVAL_REFERENCE,
+        "action_fingerprint": GOVERNANCE_ACTION_FINGERPRINT,
+        **overrides,
+    }
+
+
+def _completion_governance(bridge: _CompletionBridge) -> CommercePurchaseGovernance:
+    return CommercePurchaseGovernance(
+        bridge_url="https://cogitator.invalid",
+        operator_call=lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("completion must not use the operator role")
+        ),
+        executor_call=bridge,
+    )
+
+
+def test_record_completion_reports_exact_terms_and_returns_receipt_refs():
+    bridge = _CompletionBridge()
+
+    result = _completion_governance(bridge).record_completion(
+        job=_governance_job(),
+        action=_governance_action(),
+        approval=_completion_approval(),
+        order_id="1234",
+        amount_usd_cents=1200,
+    )
+
+    assert result == {
+        "proposal_id": PROPOSAL_ID,
+        "approval_id": APPROVAL_REFERENCE,
+        "receipt_ref": "purchase-receipts/domain-1",
+    }
+    [(action, context)] = bridge.calls
+    assert action == "record_completed_purchase"
+    assert context["proposal_id"] == PROPOSAL_ID
+    assert context["ticket_id"] == TICKET_ID
+    assert context["final_amount"] == "12.00"
+    assert context["currency"] == "USD"
+    assert context["receipt"] == {"order_id": "1234", "domain": "siliconcurrent.com"}
+    # The registrar response never travels to the money authority verbatim.
+    assert set(context["receipt"]) == {"order_id", "domain"}
+
+
+def test_record_completion_refuses_an_amount_that_is_not_the_approved_one():
+    bridge = _CompletionBridge()
+
+    with pytest.raises(CommerceGovernanceError) as raised:
+        _completion_governance(bridge).record_completion(
+            job=_governance_job(),
+            action=_governance_action(),
+            approval=_completion_approval(),
+            order_id="1234",
+            amount_usd_cents=1201,
+        )
+
+    assert raised.value.code == "governance_completion_amount_mismatch"
+    assert bridge.calls == []
+
+
+def test_record_completion_refuses_an_approval_bound_to_another_action():
+    bridge = _CompletionBridge()
+
+    with pytest.raises(CommerceGovernanceError):
+        _completion_governance(bridge).record_completion(
+            job=_governance_job(),
+            action=_governance_action(),
+            approval=_completion_approval(action_fingerprint="f" * 64),
+            order_id="1234",
+            amount_usd_cents=1200,
+        )
+
+    assert bridge.calls == []
+
+
+def test_record_completion_fails_closed_when_the_bridge_rejects_the_report():
+    bridge = _CompletionBridge(response={"status": "error"}, status=200)
+
+    with pytest.raises(CommerceGovernanceError) as raised:
+        _completion_governance(bridge).record_completion(
+            job=_governance_job(),
+            action=_governance_action(),
+            approval=_completion_approval(),
+            order_id="1234",
+            amount_usd_cents=1200,
+        )
+
+    assert raised.value.code == "governance_completion_failed"

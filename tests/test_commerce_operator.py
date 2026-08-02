@@ -1037,3 +1037,45 @@ def test_plan_replacement_and_receipt_control_are_durable(tmp_path):
     assert final_action["result"]["operator_control"]["completion"] == {
         "verification": "all_green"
     }
+
+
+def test_production_operator_wires_real_handlers_verifiers_and_receipt_writer(
+    tmp_path, monkeypatch
+):
+    """`main()` without --fake-provider must not build an inert worker."""
+    monkeypatch.delenv("COGITATOR_BRIDGE_TOKEN", raising=False)
+    store = make_store(tmp_path)
+
+    worker = commerce.production_operator(store, lock_path=tmp_path / "worker.lock")
+
+    assert worker.planner is not commerce.default_planner
+    assert worker.planner is not commerce.fake_planner
+    # Every workflow step the plan can emit must have a handler behind it.
+    assert {
+        "porkbun_discover",
+        "porkbun_register_domain",
+        "porkbun_dns_snapshot",
+        "porkbun_dns_apply",
+        "shopify_credentials",
+        "shopify_identity",
+        "shopify_build",
+        "commerce_prepublish_verify",
+        "shopify_publish",
+        "commerce_final_verify",
+    } <= set(worker.step_handlers)
+    assert worker.gate_verifiers
+    assert worker.reconcilers
+    assert worker.completion_handler is not None
+
+
+def test_production_operator_runs_without_a_configured_money_bridge(
+    tmp_path, monkeypatch
+):
+    """An unconfigured bridge must not stop the worker from starting."""
+    monkeypatch.delenv("COGITATOR_BRIDGE_TOKEN", raising=False)
+
+    assert commerce._purchase_recorder() is None
+    worker = commerce.production_operator(
+        make_store(tmp_path), lock_path=tmp_path / "worker.lock"
+    )
+    assert worker.step_handlers

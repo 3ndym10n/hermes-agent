@@ -550,6 +550,7 @@ def production_handlers(
     verify: Verify | None = None,
     publish: Publish | None = None,
     theme_verify: Callable[[Mapping[str, Any], Any], bool] | None = None,
+    record_purchase: Callable[..., Mapping[str, Any]] | None = None,
     clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
     sleep: Callable[[float], None] = time.sleep,
     check_interval: float = 10.0,
@@ -716,6 +717,24 @@ def production_handlers(
             )
         return result
 
+    def purchase_approval(job: Mapping[str, Any], action: Mapping[str, Any]) -> dict:
+        """Return the approval refs Cal's completed purchase gate recorded."""
+        fingerprint = action.get("action_fingerprint")
+        try:
+            gates = store.list_gates(str(job["job_id"]))
+        except Exception:
+            raise _error("registration_approval_unreadable") from None
+        for gate in gates:
+            if (
+                gate.get("gate_type") == "action_approval"
+                and gate.get("approval_fingerprint") == fingerprint
+                and gate.get("status") in {"completed", "consumed"}
+            ):
+                evidence = gate.get("completion_evidence")
+                if isinstance(evidence, Mapping) and evidence.get("approval_granted"):
+                    return dict(evidence)
+        raise _error("registration_approval_unreadable")
+
     def register(
         job: Mapping[str, Any], action: Mapping[str, Any]
     ) -> Mapping[str, Any]:
@@ -783,6 +802,28 @@ def production_handlers(
             "order_id": order_id,
             "amount_usd_cents": request["cost_usd_cents"],
         }
+        if record_purchase is not None:
+            # The registrar has already charged and created the domain, so this
+            # is bookkeeping. If it cannot be recorded the money authority and
+            # the ledger disagree, which is exactly an uncertain outcome: park
+            # for reconciliation rather than report a clean success.
+            try:
+                recorded = record_purchase(
+                    job=job,
+                    action=action,
+                    approval=purchase_approval(job, action),
+                    order_id=order_id,
+                    amount_usd_cents=request["cost_usd_cents"],
+                )
+                payload["cogitator"] = {
+                    "proposal_id": str(recorded["proposal_id"]),
+                    "approval_id": str(recorded["approval_id"]),
+                    "receipt_ref": str(recorded["receipt_ref"]),
+                }
+            except Exception:
+                raise _error(
+                    "registration_completion_unrecorded", uncertain=True
+                ) from None
         return {
             **payload,
             "provider_truth_verified": True,

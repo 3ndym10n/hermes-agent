@@ -242,3 +242,128 @@ def test_verifier_rejects_malformed_http_result_fields():
     arguments["domain"] = "bad.-host.example"
     with pytest.raises(VerificationConfigurationError, match="domain"):
         verify_launch(**arguments)
+
+
+class _LedgerStub:
+    """Only the ledger surface production_verify reads."""
+
+    def __init__(self, actions):
+        self._actions = actions
+
+    def list_actions(self, _job_id):
+        return list(self._actions)
+
+
+def _registration_action(**result_overrides):
+    result = {
+        "domain": DOMAIN,
+        "order_id": "1234",
+        "amount_usd_cents": 1198,
+        "cogitator": {
+            "proposal_id": "pp_1",
+            "approval_id": "pa_1",
+            "receipt_ref": "purchase-receipts/domain-1",
+        },
+    }
+    result.update(result_overrides)
+    return {
+        "action_type": "porkbun_register_domain",
+        "action_status": "succeeded",
+        "result": result,
+    }
+
+
+class _ShopStub:
+    def commerce_surface(self):
+        return {"products_count": 0, "payment_provider_configured": False}
+
+
+def _production_job():
+    return {
+        "job_id": "cj_verify_01",
+        "plan": {
+            "domain": DOMAIN,
+            "shopify": {
+                "shop_id": "gid://shopify/Shop/1",
+                "myshopify_domain": "silicon-current.myshopify.com",
+                "plan": "Basic",
+            },
+        },
+    }
+
+
+def _production_verify(actions, **overrides):
+    from commerce_verify import production_verify
+
+    arguments, _responses = _green()
+    return production_verify(
+        store=_LedgerStub(actions),
+        porkbun_factory=lambda: type(
+            "P", (), {"list_domains": lambda _self: {"domains": [{"domain": DOMAIN}]}}
+        )(),
+        waitlist_probe=lambda *_a: {
+            **json.loads(FIXTURE.read_text())["waitlist_probe"],
+            "test_address_digest": "sha256:" + "a" * 64,
+        },
+        mobile_screenshot=lambda *_a: True,
+        fetch=arguments["fetch"],
+        dns_lookup=arguments["dns_lookup"],
+        **overrides,
+    )
+
+
+def test_production_verify_builds_receipt_facts_from_the_ledger():
+    verify = _production_verify([_registration_action()])
+    package = build_content({
+        "contact_email": "launch@example.test",
+        "business_identity_sentence": "Silicon Current is operated by Example Trading.",
+        "double_opt_in": True,
+        "brand_signoff": True,
+        "privacy_signoff": True,
+    })
+
+    report = verify(_production_job(), _ShopStub(), package, "final")
+
+    assert report["all_green"] is True
+    facts = report["receipt_facts"]
+    assert facts["domain"]["order_id"] == "1234"
+    assert facts["domain"]["spend"] == {
+        "amount_usd_cents": 1198,
+        "display": "US$11.98",
+    }
+    assert facts["domain"]["cogitator"]["receipt_ref"] == "purchase-receipts/domain-1"
+    assert facts["public_url"] == f"https://{DOMAIN}/"
+    assert facts["no_payment_collected"] is True
+    assert facts["checkout_absent_verified"] is True
+    assert facts["waitlist_test"]["test_subscriber_deleted"] is True
+
+
+def test_production_verify_prepublish_emits_no_receipt_facts():
+    verify = _production_verify([_registration_action()])
+    package = build_content({
+        "contact_email": "launch@example.test",
+        "business_identity_sentence": "Silicon Current is operated by Example Trading.",
+        "double_opt_in": True,
+        "brand_signoff": True,
+        "privacy_signoff": True,
+    })
+
+    report = verify(_production_job(), _ShopStub(), package, "prepublish")
+
+    assert "receipt_facts" not in report
+
+
+def test_production_verify_refuses_a_registration_the_money_authority_never_saw():
+    action = _registration_action()
+    del action["result"]["cogitator"]
+    verify = _production_verify([action])
+    package = build_content({
+        "contact_email": "launch@example.test",
+        "business_identity_sentence": "Silicon Current is operated by Example Trading.",
+        "double_opt_in": True,
+        "brand_signoff": True,
+        "privacy_signoff": True,
+    })
+
+    with pytest.raises(VerificationConfigurationError):
+        verify(_production_job(), _ShopStub(), package, "final")

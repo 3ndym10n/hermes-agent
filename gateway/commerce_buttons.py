@@ -24,6 +24,8 @@ MAX_DOMAIN_COST_USD_CENTS = 3_000
 
 _FINGERPRINT_RE = re.compile(r"^[0-9a-f]{64}$")
 _SAFE_REF_RE = re.compile(r"^[A-Za-z0-9._:-]{1,160}$")
+# Matches commerce_receipt._ID_RE so a recorded ref survives the receipt build.
+_RECEIPT_REF_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,239}\Z")
 _DOMAIN_RE = re.compile(
     r"(?=.{1,253}\Z)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}"
 )
@@ -58,6 +60,7 @@ _OPERATOR_INTENTS = {
     "revoke_unexecuted_approval": "Revoke an unexecuted approval and release its reservation.",
 }
 _EXECUTOR_INTENT = "Claim one governed domain-registration execution ticket."
+_COMPLETION_INTENT = "Record the finished governed domain registration."
 
 
 class CommerceButtonError(ValueError):
@@ -463,6 +466,88 @@ class CommercePurchaseGovernance:
         except Exception:
             self._cleanup(packet, proposal_id, approval_attempted, claimed)
             raise CommerceGovernanceError(failure_code) from None
+
+    def record_completion(
+        self,
+        *,
+        job: Mapping[str, Any],
+        action: Mapping[str, Any],
+        approval: Mapping[str, Any],
+        order_id: str,
+        amount_usd_cents: int,
+    ) -> dict[str, Any]:
+        """Report one finished registration and return its Cogitator refs.
+
+        Called after the registrar has confirmed the order, so this is a
+        report, not an authorisation: it moves no money and grants nothing.
+        The refs it returns are what the §16 receipt cites.
+        """
+
+        packet = _purchase_packet(job, action)
+        if amount_usd_cents != packet.cost_usd_cents:
+            _governance_fail("governance_completion_amount_mismatch")
+        proposal_id = _governance_ref(
+            approval.get("proposal_id"), "governance_completion_failed"
+        )
+        ticket_id = _governance_ref(
+            approval.get("ticket_id"), "governance_completion_failed"
+        )
+        approval_reference = _governance_ref(
+            approval.get("approval_reference"), "governance_completion_failed"
+        )
+        if approval.get("action_fingerprint") != packet.action_fingerprint:
+            _governance_fail("governance_completion_failed")
+        recurrence = self._expected_recurrence(packet)
+        status, result = self._executor_call(
+            "record_completed_purchase",
+            {
+                "proposal_id": proposal_id,
+                "ticket_id": ticket_id,
+                "idempotency_key": self._key(packet, "complete"),
+                "merchant_display_name": "Porkbun",
+                "merchant_domain": "porkbun.com",
+                "product_or_service": packet.item,
+                "quantity": 1,
+                "final_amount": _money(packet.cost_usd_cents),
+                "currency": "USD",
+                "commitment_type": recurrence["commitment_type"],
+                "billing_interval": recurrence["billing_interval"],
+                "renewal_amount": recurrence["renewal_amount"],
+                "renewal_date": recurrence["renewal_date"],
+                "cancellation_deadline": recurrence["cancellation_deadline"],
+                "contract_duration": recurrence["contract_duration"],
+                "auto_renew": recurrence["auto_renew"],
+                "cancellation_terms": recurrence["cancellation_terms"],
+                # Order id only -- never a registrar credential or raw response.
+                "receipt": {
+                    "order_id": _governance_ref(
+                        order_id, "governance_completion_failed"
+                    ),
+                    "domain": packet.domain,
+                },
+            },
+            _COMPLETION_INTENT,
+        )
+        if (
+            status != 200
+            or not isinstance(result, dict)
+            or result.get("status") != "ok"
+        ):
+            _governance_fail("governance_completion_failed")
+        # Cogitator's receipt refs are path-shaped, which the identifier guard
+        # above deliberately rejects; hold this one field to the receipt
+        # schema's own character class instead of widening that guard.
+        receipt_ref = _governance_text(
+            result.get("receipt_ref") or result.get("purchase_receipt_id"),
+            "governance_completion_failed",
+        )
+        if _RECEIPT_REF_RE.fullmatch(receipt_ref) is None:
+            _governance_fail("governance_completion_failed")
+        return {
+            "proposal_id": proposal_id,
+            "approval_id": approval_reference,
+            "receipt_ref": receipt_ref,
+        }
 
     def _operator(self, action: str, context: dict[str, Any]) -> dict[str, Any]:
         result = self._operator_call(

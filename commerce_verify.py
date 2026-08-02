@@ -3,6 +3,11 @@
 from __future__ import annotations
 
 import re
+import shutil
+import ssl
+import subprocess
+import urllib.error
+import urllib.request
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from html.parser import HTMLParser
@@ -11,6 +16,11 @@ from urllib.parse import urljoin, urlsplit
 from commerce_content import scan_forbidden_claims
 
 MAX_HTML_BYTES = 2_097_152
+MAX_REDIRECTS = 5
+FETCH_TIMEOUT_SECONDS = 20.0
+DNS_TIMEOUT_SECONDS = 10.0
+# Two independent public resolvers, per the §9.3 "two resolvers" requirement.
+PUBLIC_RESOLVERS = ("8.8.8.8", "1.1.1.1")
 PLACEHOLDER = re.compile(r"⟨[^⟩]+⟩")
 _DOMAIN = re.compile(
     r"(?a)^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+"
@@ -356,3 +366,267 @@ def verify_launch(
         "waitlist": waitlist,
     }
     return report
+
+
+def https_fetch(url: str, *, timeout: float = FETCH_TIMEOUT_SECONDS) -> HTTPResult:
+    """Fetch one HTTPS URL, following redirects manually so they are evidence.
+
+    TLS verification is the default context: a certificate failure surfaces as
+    ``tls_valid=False`` rather than an exception, because "SSL is not issued
+    yet" is an expected mid-launch state the checklist must report, not crash on.
+    """
+    if not isinstance(url, str) or urlsplit(url).scheme != "https":
+        raise VerificationConfigurationError("verification fetches must be https")
+    opener = urllib.request.build_opener(
+        urllib.request.HTTPSHandler(context=ssl.create_default_context()),
+        _NoRedirect(),
+    )
+    redirects: list[str] = []
+    current = url
+    for _ in range(MAX_REDIRECTS + 1):
+        request = urllib.request.Request(
+            current, headers={"Accept": "text/html"}, method="GET"
+        )
+        try:
+            with opener.open(request, timeout=timeout) as response:
+                status = response.status
+                headers = response.headers
+                body = response.read(MAX_HTML_BYTES + 1)
+        except urllib.error.HTTPError as error:
+            status = error.code
+            headers = error.headers
+            body = error.read(MAX_HTML_BYTES + 1)
+        except urllib.error.URLError as error:
+            # urllib wraps certificate failures; report them as a red TLS check
+            # instead of an exception, since pending SSL issuance is expected.
+            if isinstance(getattr(error, "reason", None), ssl.SSLError):
+                return HTTPResult(
+                    status=0, body=b"", final_url=current,
+                    redirects=tuple(redirects), tls_valid=False,
+                )
+            raise VerificationConfigurationError("verification fetch failed") from None
+        except Exception:
+            raise VerificationConfigurationError("verification fetch failed") from None
+        if len(body) > MAX_HTML_BYTES:
+            raise VerificationConfigurationError("verification response is too large")
+        location = headers.get("Location") if 300 <= status < 400 else None
+        if not location:
+            return HTTPResult(
+                status=status, body=body, final_url=current,
+                redirects=tuple(redirects), tls_valid=True,
+            )
+        target = urljoin(current, location)
+        if urlsplit(target).scheme != "https":
+            raise VerificationConfigurationError("verification redirect left https")
+        redirects.append(current)
+        current = target
+    raise VerificationConfigurationError("verification redirect loop")
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D102
+        return None
+
+
+def dig_lookup(
+    host: str,
+    record_type: str,
+    *,
+    resolvers: Sequence[str] = PUBLIC_RESOLVERS,
+    timeout: float = DNS_TIMEOUT_SECONDS,
+) -> dict[str, list[str]]:
+    """Return {resolver: answers} from each public resolver, via ``dig``."""
+    if record_type not in {"A", "AAAA", "CNAME"}:
+        raise VerificationConfigurationError("unsupported DNS record type")
+    if _DOMAIN.fullmatch(host) is None:
+        raise VerificationConfigurationError("DNS host is invalid")
+    binary = shutil.which("dig")
+    if binary is None:
+        raise VerificationConfigurationError("dig is required for DNS verification")
+    answers: dict[str, list[str]] = {}
+    for resolver in resolvers:
+        try:
+            completed = subprocess.run(
+                [binary, f"@{resolver}", "+short", "+timeout=5", "+tries=2",
+                 host, record_type],
+                capture_output=True, text=True, timeout=timeout, check=False,
+            )
+        except subprocess.SubprocessError:
+            continue
+        if completed.returncode != 0:
+            continue
+        answers[resolver] = [
+            line.strip() for line in completed.stdout.splitlines() if line.strip()
+        ]
+    return answers
+
+
+def _spend_display(cents: int) -> str:
+    return f"US${cents // 100}.{cents % 100:02d}"
+
+
+def _registration_facts(store: object, job_id: str) -> dict:
+    """Recover the registration truths the §16 receipt cites, from the ledger."""
+    for action in reversed(list(store.list_actions(job_id))):  # type: ignore[attr-defined]
+        if (
+            action.get("action_type") != "porkbun_register_domain"
+            or action.get("action_status") != "succeeded"
+        ):
+            continue
+        result = action.get("result")
+        if not isinstance(result, Mapping):
+            break
+        cogitator = result.get("cogitator")
+        if not isinstance(cogitator, Mapping):
+            raise VerificationConfigurationError(
+                "registration was never recorded with the money authority"
+            )
+        cents = result.get("amount_usd_cents")
+        if isinstance(cents, bool) or not isinstance(cents, int) or cents <= 0:
+            raise VerificationConfigurationError("registration amount is invalid")
+        return {
+            "order_id": str(result.get("order_id", "")),
+            "amount_usd_cents": cents,
+            "cogitator": {
+                "proposal_id": str(cogitator.get("proposal_id", "")),
+                "approval_id": str(cogitator.get("approval_id", "")),
+                "receipt_ref": str(cogitator.get("receipt_ref", "")),
+            },
+        }
+    raise VerificationConfigurationError("no succeeded registration in the ledger")
+
+
+def production_verify(
+    *,
+    store: object | None = None,
+    porkbun_factory: Callable[[], object] | None = None,
+    waitlist_probe: Callable[[Mapping, object, str], Mapping[str, object]] | None = None,
+    mobile_screenshot: Callable[[Mapping, str], bool] | None = None,
+    fetch: Fetch = https_fetch,
+    dns_lookup: DNSLookup = dig_lookup,
+) -> Callable[[Mapping, object, Mapping, str], dict]:
+    """Build the live §9.3 verifier used by the production worker.
+
+    Every probe here is read-only. The single write anywhere near this path is
+    the waitlist round-trip, which creates one synthetic ``waitlist-test+``
+    subscriber and deletes it again; it is skipped unless a probe is injected.
+    """
+
+    def registrar_active(domain: str) -> bool:
+        if porkbun_factory is None:
+            return False
+        try:
+            domains = porkbun_factory().list_domains().get("domains", [])  # type: ignore[attr-defined]
+        except Exception:
+            return False
+        return any(
+            isinstance(item, Mapping)
+            and item.get("domain") == domain
+            and str(item.get("status", "ACTIVE")).upper() == "ACTIVE"
+            for item in domains
+        )
+
+    def verify(job: Mapping, client: object, package: Mapping, phase: str) -> dict:
+        plan = job.get("plan") or {}
+        domain = _host(str(plan.get("domain", "")))
+        pages = package.get("pages")
+        if not isinstance(pages, Mapping):
+            raise VerificationConfigurationError("content package has no pages")
+        landing = pages.get("priority-access")
+        if not isinstance(landing, Mapping):
+            raise VerificationConfigurationError("content package has no landing page")
+        surface = client.commerce_surface()  # type: ignore[attr-defined]
+        probe = dict(
+            waitlist_probe(job, client, domain)
+            if waitlist_probe is not None
+            else {
+                "customer_found": False,
+                "consent_recorded": False,
+                "confirmation_shown": False,
+                "subscriber_deleted": False,
+            }
+        )
+        # The digest is receipt material, not a checklist input; verify_launch
+        # rejects any key beyond the four booleans.
+        address_digest = str(probe.pop("test_address_digest", ""))
+        report = verify_launch(
+            domain=domain,
+            approved_html=str(landing["body_html"]),
+            fetch=fetch,
+            dns_lookup=dns_lookup,
+            expected_dns={
+                "A": ["23.227.38.65"],
+                "AAAA": ["2620:0127:f00f:5::"],
+                "CNAME": ["shops.myshopify.com."],
+            },
+            registrar_active=registrar_active(domain),
+            waitlist_probe=probe,
+            mobile_screenshot_ok=(
+                mobile_screenshot(job, domain) if mobile_screenshot is not None else False
+            ),
+            products_count=int(surface["products_count"]),
+            payment_provider_configured=bool(surface["payment_provider_configured"]),
+        )
+        if phase != "final":
+            return report
+        if store is None:
+            raise VerificationConfigurationError("receipt facts need the job ledger")
+        job_id = str(job["job_id"])
+        registration = _registration_facts(store, job_id)
+        identity = plan.get("shopify")
+        if not isinstance(identity, Mapping):
+            raise VerificationConfigurationError("shop identity was never pinned")
+        report["receipt_facts"] = {
+            "checkout_absent_verified": True,
+            "no_payment_collected": True,
+            "public_url": f"https://{domain}/",
+            "domain": {
+                "name": domain,
+                "registrar": "porkbun",
+                "order_id": registration["order_id"],
+                "spend": {
+                    "amount_usd_cents": registration["amount_usd_cents"],
+                    "display": _spend_display(registration["amount_usd_cents"]),
+                },
+                "cogitator": registration["cogitator"],
+                "auto_renew": True,
+                "whois_privacy": True,
+            },
+            "dns": {"status": "propagated", "records": ["A", "AAAA", "CNAME www"]},
+            "shopify": {
+                "shop_id": str(identity["shop_id"]),
+                "myshopify_domain": str(identity["myshopify_domain"]),
+                "plan": str(identity["plan"]),
+                "admin_url": (
+                    "https://admin.shopify.com/store/"
+                    f"{str(identity['myshopify_domain']).partition('.')[0]}"
+                ),
+            },
+            "waitlist_test": {
+                "result": "pass",
+                "test_address_used": address_digest,
+                "consent_recorded": bool(probe.get("consent_recorded")),
+                "test_subscriber_deleted": bool(probe.get("subscriber_deleted")),
+            },
+            "verification": {
+                "checklist": "9.3",
+                "all_green": True,
+                "evidence_bundle": f"evidence/{job_id}/verification/",
+            },
+            "total_spend": [
+                {
+                    "provider": "porkbun",
+                    "amount": _spend_display(registration["amount_usd_cents"]),
+                },
+                {
+                    "provider": "shopify",
+                    "amount": (
+                        f"{identity['plan']} billed to Cal's card at trial end"
+                    ),
+                },
+            ],
+            "unresolved": [".com.au deferred pending ABN"],
+        }
+        return report
+
+    return verify

@@ -1287,6 +1287,79 @@ class CommerceOperator:
         return True
 
 
+def _purchase_recorder() -> Callable[..., Mapping[str, Any]] | None:
+    """Return the Cogitator completion reporter, or None if unconfigured.
+
+    Absent configuration is not fatal here: the registration step simply
+    records no Cogitator refs, and the receipt build fails loudly later
+    rather than the worker refusing to start.
+    """
+
+    from gateway.commerce_buttons import CommercePurchaseGovernance
+
+    bridge_url = str(
+        cfg_get(load_config_readonly(), "intake", "base_url", default="") or ""
+    ).strip()
+    bridge_token = str(os.environ.get(TOKEN_ENV, "") or "").strip()
+    if not bridge_url or not bridge_token:
+        return None
+    governance = CommercePurchaseGovernance.from_runtime(
+        bridge_url=bridge_url,
+        bridge_token=bridge_token,
+    )
+    return governance.record_completion
+
+
+def production_operator(
+    store: CommerceJobStore,
+    *,
+    lock_path: str | Path | None = None,
+) -> CommerceOperator:
+    """Assemble the worker against the real providers and money authority.
+
+    `publish` is deliberately left unwired: no Shopify Admin mutation removes
+    the storefront password in the pinned schema, so publication degrades to
+    Cal's viewer gate (plan §9.2.11) instead of an autonomous unlock.
+    """
+
+    from commerce_verify import production_verify
+    from commerce_workflow import (
+        production_gate_verifiers,
+        production_handlers,
+        production_plan,
+        production_reconcilers,
+    )
+    from registrar_porkbun import PorkbunClient
+
+    return CommerceOperator(
+        store=store,
+        planner=production_plan,
+        step_handlers=production_handlers(
+            store,
+            verify=production_verify(store=store, porkbun_factory=PorkbunClient),
+            record_purchase=_purchase_recorder(),
+        ),
+        gate_verifiers=production_gate_verifiers(),
+        reconcilers=production_reconcilers(),
+        completion_handler=_receipt_writer(store),
+        lock_path=lock_path,
+    )
+
+
+def _receipt_writer(
+    store: CommerceJobStore,
+) -> Callable[[str, Mapping[str, Any]], Mapping[str, Any]]:
+    from commerce_receipt import persist_execution_receipt
+
+    def write(job_id: str, payload: Mapping[str, Any]) -> Mapping[str, Any]:
+        path = persist_execution_receipt(
+            store, job_id, verified_facts=payload["verified_facts"]
+        )
+        return {"receipt_ref": f"receipts/{path.name}"}
+
+    return write
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run the Virgil commerce worker")
     parser.add_argument("--db", type=Path)
@@ -1299,11 +1372,13 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
-    operator = CommerceOperator(
-        store=CommerceJobStore(args.db) if args.db else None,
-        planner=fake_planner if args.fake_provider else default_planner,
-        lock_path=args.lock,
-    )
+    store = CommerceJobStore(args.db) if args.db else CommerceJobStore()
+    if args.fake_provider:
+        operator = CommerceOperator(
+            store=store, planner=fake_planner, lock_path=args.lock
+        )
+    else:
+        operator = production_operator(store, lock_path=args.lock)
     try:
         result = operator.run(once=args.once, poll_seconds=args.poll_seconds)
     except WorkerAlreadyRunningError as error:

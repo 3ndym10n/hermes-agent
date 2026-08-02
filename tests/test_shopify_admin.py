@@ -30,6 +30,8 @@ class FakeShopify:
         self.pages = {}
         self.menus = {}
         self.theme_settings = "{}"
+        self.products_count = 0
+        self.digital_wallets = []
         self.mutations = []
         self.operations = []
 
@@ -49,6 +51,17 @@ class FakeShopify:
 
         if operation == "VirgilShopIdentity":
             return self._reply(self.identity)
+        if operation == "VirgilCommerceSurface":
+            assert variables == {}
+            return self._reply({
+                "data": {
+                    "productsCount": {"count": self.products_count},
+                    "paymentSettings": {
+                        "supportedDigitalWallets": self.digital_wallets
+                    },
+                    "shop": {"id": "gid://shopify/Shop/1"},
+                }
+            })
         if operation == "VirgilPages":
             handle = variables["query"].split(":", 1)[1]
             nodes = [self.pages[handle]] if handle in self.pages else []
@@ -525,3 +538,41 @@ def test_navigation_hard_fails_checkout_and_product_links():
                 title="Footer",
                 items=[{"title": "Forbidden", "type": "HTTP", "url": path}],
             )
+
+
+def test_commerce_surface_reports_the_zero_checkout_truths():
+    fake = FakeShopify()
+    client = ShopifyAdminClient(
+        "silicon-current.myshopify.com", TOKEN, transport=fake
+    )
+
+    assert client.commerce_surface() == {
+        "products_count": 0,
+        "payment_provider_configured": False,
+    }
+    assert "VirgilCommerceSurface" in fake.operations
+
+
+def test_commerce_surface_reports_a_configured_payment_provider():
+    fake = FakeShopify()
+    fake.products_count = 3
+    fake.digital_wallets = ["SHOPIFY_PAY"]
+    client = ShopifyAdminClient(
+        "silicon-current.myshopify.com", TOKEN, transport=fake
+    )
+
+    assert client.commerce_surface() == {
+        "products_count": 3,
+        "payment_provider_configured": True,
+    }
+
+
+def test_commerce_surface_rejects_a_nonsense_product_count():
+    fake = FakeShopify()
+    fake.products_count = -1
+    client = ShopifyAdminClient(
+        "silicon-current.myshopify.com", TOKEN, transport=fake
+    )
+
+    with pytest.raises(ShopifyResponseError):
+        client.commerce_surface()
