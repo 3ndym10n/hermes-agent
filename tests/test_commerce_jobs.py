@@ -81,7 +81,9 @@ def record_action(
 ) -> dict:
     if not target_state:
         target_state = (
-            "executing" if effect_class == "consequential" else "executing_read_only"
+            "executing"
+            if effect_class in {"consequential", "idempotent_write"}
+            else "executing_read_only"
         )
     action = store.record_action(
         job_id,
@@ -224,6 +226,117 @@ def test_new_jobs_use_the_v2_state_machine_and_empty_current_step(tmp_path):
     assert job["browser_session"] == f"commerce_{job['job_id']}"
 
 
+def test_job_origin_is_persisted_once_and_attach_retains_original(tmp_path):
+    store = make_store(tmp_path)
+    original_origin = {
+        "platform": "telegram",
+        "chat_id": "chat-123",
+        "thread_id": "thread-7",
+        "user_id": "user-42",
+        "message_id": "message-9",
+    }
+    first = store.create_or_attach_job(
+        requester="cal",
+        objective="Launch the governed GPU store",
+        origin=original_origin,
+        now=NOW,
+    )
+    attached = store.create_or_attach_job(
+        requester="cal",
+        objective=" Launch   the governed GPU store ",
+        origin={"platform": "discord", "chat_id": "different-chat"},
+        now=NOW + timedelta(minutes=1),
+    )
+
+    assert first["attached"] is False
+    assert attached["attached"] is True
+    assert attached["job_id"] == first["job_id"]
+    events = store.list_events(first["job_id"])
+    assert len(events) == 1
+    assert events[0]["event_type"] == "job_created"
+    assert events[0]["evidence"] == {"origin": original_origin}
+
+
+def test_job_origin_rejects_forbidden_data_before_persistence(tmp_path):
+    store = make_store(tmp_path)
+
+    with pytest.raises(
+        commerce.CommerceForbiddenDataError, match="forbidden_sensitive_field"
+    ):
+        store.create_or_attach_job(
+            requester="cal",
+            objective="Launch the governed GPU store",
+            origin={"platform": "telegram", "password": "do-not-store"},
+            now=NOW,
+        )
+
+    assert store.list_jobs() == []
+
+
+def test_facts_are_append_only_versioned_and_latest_is_readable(tmp_path):
+    store = make_store(tmp_path)
+    job = make_job(store)
+    assert store.latest_facts(job["job_id"]) == {}
+
+    first = store.record_facts(
+        job["job_id"],
+        {"brand_name": "Silicon Current", "currency": "GBP"},
+        expected_version=0,
+        actor="cal",
+        now=NOW + timedelta(minutes=1),
+    )
+    second_facts = {"brand_name": "Silicon Current", "currency": "USD"}
+    second = store.record_facts(
+        job["job_id"],
+        second_facts,
+        expected_version=first["row_version"],
+        actor="cal",
+        now=NOW + timedelta(minutes=2),
+    )
+
+    assert first["row_version"] == 1
+    assert second["row_version"] == 2
+    assert store.latest_facts(job["job_id"]) == second_facts
+    fact_events = [
+        event
+        for event in store.list_events(job["job_id"])
+        if event["event_type"] == "facts_answered"
+    ]
+    assert [event["evidence"]["facts"] for event in fact_events] == [
+        {"brand_name": "Silicon Current", "currency": "GBP"},
+        second_facts,
+    ]
+
+
+def test_facts_reject_forbidden_data_and_stale_versions_without_changes(tmp_path):
+    store = make_store(tmp_path)
+    job = make_job(store)
+    initial_events = store.list_events(job["job_id"])
+
+    with pytest.raises(
+        commerce.CommerceForbiddenDataError, match="forbidden_sensitive_field"
+    ):
+        store.record_facts(
+            job["job_id"],
+            {"password": "do-not-store"},
+            expected_version=0,
+            actor="cal",
+            now=NOW,
+        )
+    with pytest.raises(commerce.CommerceStaleVersionError, match="stale_row_version"):
+        store.record_facts(
+            job["job_id"],
+            {"brand_name": "Silicon Current"},
+            expected_version=7,
+            actor="cal",
+            now=NOW,
+        )
+
+    assert store.get_job(job["job_id"])["row_version"] == 0
+    assert store.latest_facts(job["job_id"]) == {}
+    assert store.list_events(job["job_id"]) == initial_events
+
+
 def test_connection_enables_foreign_keys_and_bounded_busy_timeout(tmp_path):
     store = make_store(tmp_path)
     connection = store._connect()
@@ -338,10 +451,11 @@ def test_v2_state_machine_contract():
     core = {
         "requested": {"planning"},
         "planning": {"ready", "awaiting_cal"},
-        "ready": {"awaiting_purchase_approval", "executing_read_only"},
+        "ready": {"awaiting_purchase_approval", "executing_read_only", "executing"},
         "executing_read_only": {
             "ready",
             "awaiting_dns_approval",
+            "awaiting_cal",
             "executing",
             "verifying",
             "completed",
@@ -580,6 +694,174 @@ def test_state_update_rolls_back_when_event_insert_fails(tmp_path):
     assert current["current_state"] == "requested"
     assert current["row_version"] == 0
     assert len(store.list_events(job["job_id"])) == 1
+
+
+def test_read_action_dispatch_and_execution_binding_are_atomic(tmp_path):
+    store = make_store(tmp_path)
+    job = make_job(store)
+    seed_state(store, job["job_id"], "ready")
+    action = record_action(
+        store,
+        job["job_id"],
+        effect_class="read_only",
+        action_type="read_inventory",
+    )
+    before_events = len(store.list_events(job["job_id"]))
+
+    result = store.dispatch_and_transition(
+        action["action_id"],
+        expected_state="ready",
+        expected_version=0,
+        actor="worker",
+        now=NOW,
+    )
+
+    assert result["redispatched"] is False
+    assert result["action"]["action_status"] == "dispatched"
+    assert result["job"]["current_state"] == "executing_read_only"
+    assert result["job"]["current_step"] == "read_inventory"
+    assert result["job"]["row_version"] == 1
+    events = store.list_events(job["job_id"])
+    assert len(events) == before_events + 1
+    assert events[-1]["event_type"] == "state_transition"
+    assert events[-1]["evidence"] == {"action_id": action["action_id"]}
+
+
+def test_atomic_dispatch_rolls_back_action_and_job_when_event_insert_fails(tmp_path):
+    store = make_store(tmp_path)
+    job = make_job(store)
+    seed_state(store, job["job_id"], "ready")
+    action = record_action(store, job["job_id"], effect_class="read_only")
+    before_events = store.list_events(job["job_id"])
+    with raw_connection(store) as connection:
+        connection.execute(
+            """CREATE TRIGGER fail_atomic_event BEFORE INSERT ON job_events
+               BEGIN SELECT RAISE(ABORT, 'forced_atomic_event_failure'); END"""
+        )
+
+    with pytest.raises(sqlite3.IntegrityError, match="forced_atomic_event_failure"):
+        store.dispatch_and_transition(
+            action["action_id"],
+            expected_state="ready",
+            expected_version=0,
+            actor="worker",
+            now=NOW,
+        )
+
+    unchanged_action = store.get_action(action["action_id"])
+    unchanged_job = store.get_job(job["job_id"])
+    assert unchanged_action["action_status"] == "planned"
+    assert unchanged_action["dispatched_at"] is None
+    assert unchanged_job["current_state"] == "ready"
+    assert unchanged_job["row_version"] == 0
+    assert store.list_events(job["job_id"]) == before_events
+
+
+def test_consequential_atomic_dispatch_requires_and_binds_exact_approval(tmp_path):
+    store = make_store(tmp_path)
+    job = make_job(store)
+    seed_state(store, job["job_id"], "awaiting_purchase_approval")
+    unapproved = record_action(
+        store,
+        job["job_id"],
+        effect_class="consequential",
+        action_type="register_domain",
+        key="unapproved-domain",
+        approve=False,
+    )
+
+    with pytest.raises(commerce.CommerceActionError, match="action_approval_required"):
+        store.dispatch_and_transition(
+            unapproved["action_id"],
+            expected_state="awaiting_purchase_approval",
+            expected_version=0,
+            actor="worker",
+            now=NOW,
+        )
+
+    assert store.get_action(unapproved["action_id"])["action_status"] == "planned"
+    assert store.get_job(job["job_id"])["current_state"] == (
+        "awaiting_purchase_approval"
+    )
+    approved = record_action(
+        store,
+        job["job_id"],
+        effect_class="consequential",
+        action_type="register_domain",
+        key="approved-domain",
+    )
+    result = store.dispatch_and_transition(
+        approved["action_id"],
+        expected_state="awaiting_purchase_approval",
+        expected_version=0,
+        actor="worker",
+        now=NOW,
+    )
+
+    assert result["action"]["action_status"] == "dispatched"
+    assert result["job"]["current_state"] == "executing"
+    assert result["job"]["current_step"] == "register_domain"
+    assert {action["action_id"] for action in store.list_actions(job["job_id"])} == {
+        unapproved["action_id"],
+        approved["action_id"],
+    }
+    gates = store.list_gates(job["job_id"])
+    assert len(gates) == 1
+    assert gates[0]["gate_type"] == "action_approval"
+    assert gates[0]["status"] == "consumed"
+
+
+def test_idempotent_write_dispatches_without_approval_and_recovers_for_redispatch(
+    tmp_path,
+):
+    store = make_store(tmp_path)
+    job = make_job(store)
+    seed_state(store, job["job_id"], "resuming")
+    action = record_action(
+        store,
+        job["job_id"],
+        effect_class="idempotent_write",
+        action_type="ensure_draft_product",
+        key="draft-product-1",
+    )
+
+    first = store.dispatch_and_transition(
+        action["action_id"],
+        expected_state="resuming",
+        expected_version=0,
+        actor="worker",
+        now=NOW,
+    )
+    assert first["action"]["approval_status"] == "unbound"
+    assert first["action"]["action_status"] == "dispatched"
+    assert first["job"]["current_state"] == "executing"
+    assert first["job"]["current_step"] == "ensure_draft_product"
+    assert first["job"]["row_version"] == 1
+
+    recovered = store.recover(now=NOW + timedelta(minutes=1))
+    assert recovered == {"recoverable": 1, "uncertain": 0, "inconsistent": 0}
+    assert store.get_action(action["action_id"])["action_status"] == "recoverable"
+    event_count = len(store.list_events(job["job_id"]))
+    second = store.dispatch_and_transition(
+        action["action_id"],
+        expected_state="executing",
+        expected_version=1,
+        actor="worker",
+        now=NOW + timedelta(minutes=2),
+    )
+
+    assert second["redispatched"] is True
+    assert second["action"]["action_status"] == "dispatched"
+    assert second["job"]["current_state"] == "executing"
+    assert second["job"]["row_version"] == 1
+    assert len(store.list_events(job["job_id"])) == event_count
+    finished = store.finish_action(
+        action["action_id"],
+        status="succeeded",
+        result={"provider_truth_verified": True},
+        now=NOW + timedelta(minutes=3),
+    )
+    assert finished["action_status"] == "succeeded"
 
 
 @pytest.mark.parametrize("terminal", sorted(commerce.TERMINAL_STATES))
@@ -2949,3 +3231,116 @@ def test_dormancy_and_gate_open_race_leaves_no_active_gate(tmp_path, state):
             (job["job_id"],),
         ).fetchone()[0]
     assert active_gate_count == 0
+
+
+def test_delivery_snapshot_and_checkpoint_are_durable_and_idempotent(tmp_path):
+    store = make_store(tmp_path)
+    job = make_job(store)
+
+    snapshot = store.delivery_snapshot(job["job_id"])
+
+    assert snapshot["job"]["job_id"] == job["job_id"]
+    assert snapshot["actions"] == []
+    assert snapshot["gates"] == []
+    assert store.record_delivery(job["job_id"], "a" * 64, actor="gateway") is True
+    assert store.record_delivery(job["job_id"], "a" * 64, actor="gateway") is False
+    delivered = [
+        event
+        for event in store.list_events(job["job_id"])
+        if event["event_type"] == "commerce_gateway_delivered"
+    ]
+    assert len(delivered) == 1
+    assert delivered[0]["evidence"] == {"delivery_key": "a" * 64}
+
+    with pytest.raises(commerce.CommerceJobError, match="delivery_key"):
+        store.record_delivery(job["job_id"], "not-a-digest", actor="gateway")
+
+
+def test_initialize_reads_table_presence_before_schema_version(tmp_path):
+    """Pin the read order that keeps concurrent initializers from false-failing.
+
+    A concurrent initializer creates the tables and stamps `user_version` in
+    one transaction. Reading the version first and the table second can
+    observe (old version, new table) — indistinguishable from a downgraded
+    database — and fails a perfectly healthy fresh one. Reading the table
+    first makes the version no older than it, so that pairing is impossible.
+    """
+    store = commerce.CommerceJobStore(tmp_path / "order.db")
+    statements: list[str] = []
+    real_connect = store._connect
+
+    def recording_connect():
+        connection = real_connect()
+        connection.set_trace_callback(
+            lambda sql: statements.append(" ".join(str(sql).split()))
+        )
+        return connection
+
+    store._connect = recording_connect
+    store.initialize()
+
+    presence = next(
+        index for index, sql in enumerate(statements) if "sqlite_master" in sql
+    )
+    version = next(
+        index
+        for index, sql in enumerate(statements)
+        if sql.upper().startswith("PRAGMA USER_VERSION") and "=" not in sql
+    )
+    assert presence < version, statements
+
+
+# A real sha256 whose digits contain a Luhn-valid 17-digit run. Roughly one
+# receipt in twenty carries a digest like this, which is what made the
+# acceptance rehearsal fail intermittently.
+LUHN_COLLIDING_DIGEST = (
+    "15f2dd6ac97954004419818681e5a30ade16e5d5d4b4238d3eb5fb29c8a535e9"
+)
+VALID_PAN = "4111111111111111"
+# The PAN itself buried in an exact 64-character hex token.
+PAN_INSIDE_SHA256 = "a" * 24 + VALID_PAN + "b" * 24
+
+
+@pytest.mark.parametrize(
+    "payload",
+    (
+        LUHN_COLLIDING_DIGEST,
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855",
+        PAN_INSIDE_SHA256,
+    ),
+)
+def test_exact_sha256_tokens_are_not_mistaken_for_card_numbers(payload):
+    """Only a complete 64-character hex token is exempt from the card screen."""
+    assert len(payload) == commerce.SHA256_HEX_LENGTH
+    commerce.reject_forbidden_data({"content_sha256": payload}, "snapshot")
+
+
+@pytest.mark.parametrize(
+    ("label", "payload"),
+    (
+        ("bare", VALID_PAN),
+        ("spaced", "4111 1111 1111 1111"),
+        ("hyphenated", "4111-1111-1111-1111"),
+        ("labelled", f"card: {VALID_PAN}"),
+        ("quoted", f'"{VALID_PAN}"'),
+        ("letter prefix word", f"card{VALID_PAN}"),
+        ("single letter prefix", f"x{VALID_PAN}"),
+        ("letter suffix", f"{VALID_PAN}suffix"),
+        ("short hex blob", f"abc{VALID_PAN}def"),
+        ("hex token one short of sha256", "a" * 23 + VALID_PAN + "b" * 24),
+        ("hex token one over sha256", "a" * 25 + VALID_PAN + "b" * 24),
+    ),
+)
+def test_card_numbers_are_rejected_however_they_are_embedded(label, payload):
+    """Adjacency to letters must never buy a PAN an exemption."""
+    with pytest.raises(commerce.CommerceForbiddenDataError):
+        commerce.reject_forbidden_data({"note": payload}, "snapshot")
+
+
+def test_sha256_exemption_needs_the_whole_token_not_just_hex_adjacency():
+    """A digest-shaped prefix does not launder a PAN in a longer token."""
+    oversized = "a" * 24 + VALID_PAN + "b" * 40
+    assert len(oversized) > commerce.SHA256_HEX_LENGTH
+    with pytest.raises(commerce.CommerceForbiddenDataError):
+        commerce.reject_forbidden_data({"note": oversized}, "snapshot")

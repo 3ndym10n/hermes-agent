@@ -557,6 +557,11 @@ _CATEGORY_MERGE: Dict[str, str] = {
     # with the other messaging-platform config (discord) so it isn't an
     # orphan tab of one field.
     "telegram": "discord",
+    # `commerce.enabled` is the governed operator's kill switch (plan §14/§19)
+    # and is the only user-facing commerce setting — the rest of that surface is
+    # credentials, which never reach config. It belongs with the other
+    # fail-closed gates rather than in an orphan tab of one field.
+    "commerce": "security",
 }
 
 # Display order for tabs — unlisted categories sort alphabetically after these.

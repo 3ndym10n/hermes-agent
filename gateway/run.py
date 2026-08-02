@@ -1447,6 +1447,7 @@ from gateway.session import (
 )
 from gateway.delivery import DeliveryRouter
 from gateway.authz_mixin import GatewayAuthorizationMixin
+from gateway.commerce_watcher import GatewayCommerceWatcherMixin
 from gateway.kanban_watchers import GatewayKanbanWatchersMixin
 from gateway.slash_commands import GatewaySlashCommandsMixin
 from gateway.platforms.base import (
@@ -2261,7 +2262,12 @@ async def _dispose_unused_adapter(adapter: "BasePlatformAdapter | None") -> None
         )
 
 
-class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, GatewaySlashCommandsMixin):
+class GatewayRunner(
+    GatewayAuthorizationMixin,
+    GatewayCommerceWatcherMixin,
+    GatewayKanbanWatchersMixin,
+    GatewaySlashCommandsMixin,
+):
     """
     Main gateway controller.
 
@@ -5554,6 +5560,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if self._research_delivery_configured():
             asyncio.create_task(self._research_delivery_watcher())
 
+        # Cheap config-gated ledger watcher; no model/toolset mutation.
+        asyncio.create_task(self._commerce_watcher())
+
         # Start background async-delegation watcher — drains completion events
         # from delegate_task(background=true) subagents and injects each
         # result back into its originating session as a new turn, covering the
@@ -6964,6 +6973,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             and not _intelligent_flags["forwarded"]
             and not _intelligent_flags["transcript"]
         )
+        if _direct_intelligent_control:
+            from gateway.commerce_watcher import is_commerce_acceptance_event
+
+            if is_commerce_acceptance_event(event):
+                from tools.commerce_tool import commerce_control_from_origin
+
+                commerce_origin = {
+                    "platform": "telegram",
+                    "chat_id": str(source.chat_id),
+                    "thread_id": str(source.thread_id or ""),
+                    "user_id": str(source.user_id),
+                    "message_id": str(event.message_id or ""),
+                }
+                commerce_result = await asyncio.to_thread(
+                    commerce_control_from_origin,
+                    "start_or_resume",
+                    origin=commerce_origin,
+                    objective=event.text,
+                )
+                if not commerce_result.get("ok"):
+                    if commerce_result.get("error") == "commerce_disabled":
+                        return "The commerce operator is disabled."
+                    return "Commerce launch routing failed safely."
+                return (
+                    "🛒 Virgil Commerce\n"
+                    "Checking what already exists…\n"
+                    f"Job: {commerce_result.get('job_id', '')}\n"
+                    f"State: {commerce_result.get('state', '')}"
+                )
         if _direct_intelligent_control and _intelligent_review is not None:
             return await self.handle_intelligent_review(
                 event, _intelligent_review
@@ -7493,6 +7531,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     return await self._handle_x_batch_command(event)
                 if _cmd_def_inner.name == "profile":
                     return await self._handle_profile_command(event)
+                if _cmd_def_inner.name == "store":
+                    return await self._handle_store_command(event)
                 if _cmd_def_inner.name == "update":
                     return await self._handle_update_command(event)
                 if _cmd_def_inner.name == "version":
@@ -7781,6 +7821,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if canonical == "status":
             return await self._handle_status_command(event)
+
+        if canonical == "store":
+            return await self._handle_store_command(event)
 
         if canonical == "agents":
             return await self._handle_agents_command(event)

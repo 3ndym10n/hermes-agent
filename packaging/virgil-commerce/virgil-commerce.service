@@ -1,0 +1,33 @@
+[Unit]
+Description=Virgil Commerce Operator
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=AGENT_BROWSER_SOCKET_DIR=/home/v0id/.hermes/commerce/ab
+WorkingDirectory=/home/v0id/.hermes/hermes-agent
+EnvironmentFile=-/home/v0id/.hermes/.env
+EnvironmentFile=-/home/v0id/.hermes/secrets/porkbun.env
+EnvironmentFile=-/home/v0id/.hermes/secrets/shopify.env
+ExecStart=/home/v0id/.hermes/hermes-agent/venv/bin/python /home/v0id/.hermes/hermes-agent/commerce_operator.py
+Restart=on-failure
+RestartSec=3
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/v0id/.hermes/commerce
+ReadWritePaths=/home/v0id/.hermes/browser-profiles/commerce
+ReadOnlyPaths=/home/v0id/.hermes/hermes-agent
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+TimeoutStartSec=30
+TimeoutStopSec=15
+
+[Install]
+WantedBy=default.target

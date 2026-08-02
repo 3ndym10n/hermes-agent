@@ -148,6 +148,7 @@ def _xai_credentials_present() -> bool:
 # server admin, Slack workspace admin, etc.).  Keeps every other platform's
 # checklist from filling up with irrelevant toggles.
 _TOOLSET_PLATFORM_RESTRICTIONS: Dict[str, Set[str]] = {
+    "commerce": {"telegram"},
     "discord": {"discord"},
     "discord_admin": {"discord"},
 }
@@ -1525,6 +1526,22 @@ def _get_platform_tools(
             enabled_toolsets.update(enabled_mcp_servers)
     else:
         enabled_toolsets.update(explicit_mcp_servers)
+
+    # Commerce is an operator control plane, not a general configurable
+    # capability. Keep it absent everywhere unless this immutable agent
+    # session is a configured Telegram session. The handler independently
+    # rechecks the kill switch before every write.
+    commerce_enabled = (
+        platform == "telegram"
+        and _parse_enabled_flag(
+            (config.get("commerce") or {}).get("enabled", False),
+            default=False,
+        )
+    )
+    if commerce_enabled:
+        enabled_toolsets.add("commerce")
+    else:
+        enabled_toolsets.discard("commerce")
 
     # Honor agent.disabled_toolsets from config.yaml — allows users to
     # globally suppress specific toolsets (e.g. "memory") across all

@@ -60,6 +60,7 @@ TIMEOUT_EXCLUDED_STATES = (
     TERMINAL_STATES | UNCERTAINTY_STATES | {"executing", "timed_out", "paused"}
 )
 EXECUTION_STATES = frozenset({"executing_read_only", "executing"})
+RECOVERABLE_EFFECT_CLASSES = frozenset({"read_only", "idempotent_write"})
 
 _CORE_TRANSITIONS: dict[str, set[str]] = {
     "requested": {"planning"},
@@ -67,11 +68,17 @@ _CORE_TRANSITIONS: dict[str, set[str]] = {
     "ready": {
         "awaiting_purchase_approval",
         "executing_read_only",
+        # Idempotent writes need no approval, so `ready` must be able to begin
+        # one directly -- otherwise resuming a paused/timed-out job whose next
+        # step is a write dead-ends. Consequential actions are still barred
+        # here: dispatch requires a live approval row (_dispatch_action_in_tx).
+        "executing",
     },
     "executing_read_only": {
         "ready",
         "awaiting_dns_approval",
         "executing",
+        "awaiting_cal",
         "verifying",
         "completed",
     },
@@ -182,6 +189,8 @@ _FORBIDDEN_KEY_PARTS = frozenset({
     "customercard",
 })
 _PAN_RE = re.compile(r"(?<!\d)(?:\d[ -]?){13,19}(?!\d)")
+_HEX_CHARS = frozenset("0123456789abcdefABCDEF")
+SHA256_HEX_LENGTH = 64
 _EXPIRY_RE = re.compile(r"(?<![\d/-])(?:0[1-9]|1[0-2])\s*[/\-]\s*\d{2,4}(?![\d/-])")
 _CVV_RE = re.compile(
     r"\b(?:cvv|cvc|security\s*code)\s*[:=]?\s*\d{3,4}\b", re.IGNORECASE
@@ -326,7 +335,7 @@ def action_fingerprint(
         "target_state": target_state,
         "request": _without_runtime_fields(_mapping(request, "request")),
     }
-    if effect_class not in {"read_only", "consequential"}:
+    if effect_class not in RECOVERABLE_EFFECT_CLASSES | {"consequential"}:
         _fail(CommerceActionError, "invalid_effect_class", "effect_class")
     if target_state and target_state not in STATES:
         _fail(CommerceActionError, "unknown_state", "target_state")
@@ -350,6 +359,29 @@ def _luhn(digits: str) -> bool:
     return total % 10 == 0
 
 
+def _inside_sha256_token(value: str, start: int, end: int) -> bool:
+    """True only when the candidate sits inside an exact SHA-256 hex token.
+
+    Ordinary digests carry a Luhn-valid 13-19 digit run often enough
+    (~0.5% each) that screening them rejected legitimate receipts. The
+    exemption is deliberately narrow: the *complete* contiguous hex token
+    around the candidate must be exactly 64 characters. Any other adjacency
+    -- `card4111111111111111`, a short hex blob, a padded token of the wrong
+    length -- stays a card candidate and is still rejected.
+    """
+
+    if any(character not in _HEX_CHARS for character in value[start:end]):
+        # Spaced or hyphenated digits cannot be part of one hex token.
+        return False
+    left = start
+    while left > 0 and value[left - 1] in _HEX_CHARS:
+        left -= 1
+    right = end
+    while right < len(value) and value[right] in _HEX_CHARS:
+        right += 1
+    return right - left == SHA256_HEX_LENGTH
+
+
 def _reject_text(value: str, field: str) -> None:
     if (
         _EXPIRY_RE.search(value)
@@ -360,8 +392,11 @@ def _reject_text(value: str, field: str) -> None:
         _fail(CommerceForbiddenDataError, "forbidden_sensitive_value", field)
     for match in _PAN_RE.finditer(value):
         digits = re.sub(r"\D", "", match.group(0))
-        if 13 <= len(digits) <= 19 and _luhn(digits):
-            _fail(CommerceForbiddenDataError, "forbidden_card_value", field)
+        if not (13 <= len(digits) <= 19 and _luhn(digits)):
+            continue
+        if _inside_sha256_token(value, match.start(), match.end()):
+            continue
+        _fail(CommerceForbiddenDataError, "forbidden_card_value", field)
 
 
 def reject_forbidden_data(value: Any, field: str = "payload") -> None:
@@ -501,7 +536,8 @@ CREATE TABLE IF NOT EXISTS job_actions (
     job_id TEXT NOT NULL REFERENCES jobs(job_id),
     action_type TEXT NOT NULL,
     provider TEXT NOT NULL DEFAULT '',
-    effect_class TEXT NOT NULL CHECK(effect_class IN ('read_only','consequential')),
+    effect_class TEXT NOT NULL CHECK(effect_class IN
+        ('read_only','idempotent_write','consequential')),
     target_state TEXT NOT NULL DEFAULT '',
     action_status TEXT NOT NULL CHECK(action_status IN
         ('planned','dispatched','recoverable','succeeded','failed','uncertain')),
@@ -608,6 +644,17 @@ class CommerceJobStore:
         self._prepare_path()
         connection = self._connect()
         try:
+            # Read the table before the version, never the other way round.
+            # A concurrent initializer creates the tables and stamps
+            # user_version in one transaction, so a stale `has_jobs` is
+            # harmless but a stale `version` read before a fresh `has_jobs`
+            # read looks exactly like a downgrade and fails a healthy fresh
+            # database. Reading in this order makes `version` no older than
+            # `has_jobs`, so that false positive cannot occur; a genuinely
+            # stale database still fails both checks below.
+            has_jobs = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='jobs'"
+            ).fetchone()
             version = int(connection.execute("PRAGMA user_version").fetchone()[0])
             if version > SCHEMA_VERSION:
                 _fail(
@@ -615,9 +662,6 @@ class CommerceJobStore:
                     "future_schema_version",
                     "user_version",
                 )
-            has_jobs = connection.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='jobs'"
-            ).fetchone()
             if has_jobs and version < SCHEMA_VERSION:
                 _fail(
                     CommerceConfigurationError,
@@ -836,12 +880,16 @@ class CommerceJobStore:
         *,
         requester: str,
         objective: str,
+        origin: Mapping[str, Any] | None = None,
         now: datetime | None = None,
     ) -> dict[str, Any]:
         requester_text = _safe_text(
             requester, "requester", required=True, max_chars=200
         )
         original = _safe_text(objective, "objective", required=True, max_chars=4_000)
+        origin_payload = (
+            dict(_mapping(origin, "origin")) if origin is not None else None
+        )
         normalized = normalize_objective(original)
         fingerprint = _fingerprint({"normalized_objective": normalized})
         timestamp = _utc(now)
@@ -898,7 +946,9 @@ class CommerceJobStore:
                 to_state="requested",
                 actor=requester_text,
                 reason_code="request_accepted",
-                evidence={},
+                evidence=(
+                    {"origin": origin_payload} if origin_payload is not None else {}
+                ),
                 now=timestamp,
             )
             row = self._job_row(connection, job_id)
@@ -938,6 +988,171 @@ class CommerceJobStore:
                 item["evidence"] = _display_json(item.pop("evidence_json"))
                 result.append(item)
             return result
+        finally:
+            connection.close()
+
+    def delivery_snapshot(self, job_id: str) -> dict[str, Any]:
+        """Read one internally consistent job/watcher snapshot."""
+        connection = self._read()
+        try:
+            connection.execute("BEGIN")
+            job = self._decode_job(self._job_row(connection, job_id))
+            action_rows = connection.execute(
+                """SELECT * FROM job_actions
+                   WHERE job_id=? ORDER BY created_at,action_id""",
+                (job_id,),
+            ).fetchall()
+            gate_rows = connection.execute(
+                """SELECT * FROM gates
+                   WHERE job_id=? ORDER BY opened_at,gate_id""",
+                (job_id,),
+            ).fetchall()
+            event_rows = connection.execute(
+                "SELECT * FROM job_events WHERE job_id=? ORDER BY sequence",
+                (job_id,),
+            ).fetchall()
+            events: list[dict[str, Any]] = []
+            for row in event_rows:
+                event = dict(row)
+                event["evidence"] = _display_json(event.pop("evidence_json"))
+                events.append(event)
+            return {
+                "job": job,
+                "actions": [self._decode_action(row) for row in action_rows],
+                "gates": [self._decode_gate(row) for row in gate_rows],
+                "events": events,
+            }
+        finally:
+            connection.close()
+
+    def record_delivery(
+        self,
+        job_id: str,
+        delivery_key: str,
+        *,
+        actor: str,
+        now: datetime | None = None,
+    ) -> bool:
+        """Persist an at-least-once gateway cursor without changing job state."""
+        key = _safe_text(
+            delivery_key,
+            "delivery_key",
+            required=True,
+            max_chars=64,
+        )
+        if re.fullmatch(r"[0-9a-f]{64}", key) is None:
+            _fail(CommerceConfigurationError, "invalid_delivery_key", "delivery_key")
+        timestamp = _utc(now)
+        with self._write() as connection:
+            job = self._job_row(connection, job_id)
+            latest = connection.execute(
+                """SELECT evidence_json FROM job_events
+                   WHERE job_id=? AND event_type='commerce_gateway_delivered'
+                   ORDER BY sequence DESC LIMIT 1""",
+                (job_id,),
+            ).fetchone()
+            if latest is not None:
+                evidence = _display_json(latest["evidence_json"])
+                if isinstance(evidence, dict) and evidence.get("delivery_key") == key:
+                    return False
+            self._append_event(
+                connection,
+                job_id=job_id,
+                event_type="commerce_gateway_delivered",
+                from_state=job["current_state"],
+                to_state=job["current_state"],
+                actor=actor,
+                reason_code="commerce_status_delivered",
+                evidence={"delivery_key": key},
+                now=timestamp,
+            )
+            return True
+
+    def list_actions(self, job_id: str) -> list[dict[str, Any]]:
+        connection = self._read()
+        try:
+            self._job_row(connection, job_id)
+            rows = connection.execute(
+                """SELECT * FROM job_actions
+                   WHERE job_id=? ORDER BY created_at,action_id""",
+                (job_id,),
+            ).fetchall()
+            return [self._decode_action(row) for row in rows]
+        finally:
+            connection.close()
+
+    def list_gates(self, job_id: str) -> list[dict[str, Any]]:
+        connection = self._read()
+        try:
+            self._job_row(connection, job_id)
+            rows = connection.execute(
+                """SELECT * FROM gates
+                   WHERE job_id=? ORDER BY opened_at,gate_id""",
+                (job_id,),
+            ).fetchall()
+            return [self._decode_gate(row) for row in rows]
+        finally:
+            connection.close()
+
+    def record_facts(
+        self,
+        job_id: str,
+        facts: Mapping[str, Any],
+        *,
+        expected_version: int,
+        actor: str,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        payload = dict(_mapping(facts, "facts"))
+        timestamp = _utc(now)
+        updated_at = iso_utc(timestamp)
+        with self._write() as connection:
+            row = self._job_row(connection, job_id)
+            if int(row["row_version"]) != expected_version:
+                _fail(
+                    CommerceStaleVersionError,
+                    "stale_row_version",
+                    "expected_version",
+                )
+            cursor = connection.execute(
+                """UPDATE jobs SET row_version=row_version+1,updated_at=?
+                   WHERE job_id=? AND row_version=?""",
+                (updated_at, job_id, expected_version),
+            )
+            if cursor.rowcount != 1:
+                _fail(
+                    CommerceStaleVersionError,
+                    "stale_row_version",
+                    "expected_version",
+                )
+            self._append_event(
+                connection,
+                job_id=job_id,
+                event_type="facts_answered",
+                from_state=row["current_state"],
+                to_state=row["current_state"],
+                actor=actor,
+                reason_code="trusted_facts_recorded",
+                evidence={"facts": payload},
+                now=timestamp,
+            )
+            return self._decode_job(self._job_row(connection, job_id))
+
+    def latest_facts(self, job_id: str) -> dict[str, Any]:
+        connection = self._read()
+        try:
+            self._job_row(connection, job_id)
+            row = connection.execute(
+                """SELECT evidence_json FROM job_events
+                   WHERE job_id=? AND event_type='facts_answered'
+                   ORDER BY sequence DESC LIMIT 1""",
+                (job_id,),
+            ).fetchone()
+            if row is None:
+                return {}
+            evidence = _display_json(row["evidence_json"])
+            facts = evidence.get("facts") if isinstance(evidence, dict) else None
+            return dict(facts) if isinstance(facts, dict) else {}
         finally:
             connection.close()
 
@@ -1083,13 +1298,15 @@ class CommerceJobStore:
                     "stale_action_approval",
                     "action_id",
                 )
-            expected_effect = (
-                "read_only" if to_state == "executing_read_only" else "consequential"
+            expected_effects = (
+                {"read_only"}
+                if to_state == "executing_read_only"
+                else {"idempotent_write", "consequential"}
             )
             if (
                 bound_action["job_id"] != row["job_id"]
                 or bound_action["target_state"] != to_state
-                or bound_action["effect_class"] != expected_effect
+                or bound_action["effect_class"] not in expected_effects
                 or bound_action["action_status"] != "dispatched"
             ):
                 _fail(
@@ -1097,7 +1314,11 @@ class CommerceJobStore:
                     "action_not_bound",
                     "action_id",
                 )
-            if to_state == "executing" and bound_action["approval_status"] != "live":
+            if (
+                to_state == "executing"
+                and bound_action["effect_class"] == "consequential"
+                and bound_action["approval_status"] != "live"
+            ):
                 _fail(
                     CommerceInvalidTransitionError,
                     "action_approval_required",
@@ -1633,6 +1854,67 @@ class CommerceJobStore:
             )
             return self._decode_action(self._action_row(connection, action_id))
 
+    def _dispatch_action_in_tx(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        row: sqlite3.Row,
+        job: sqlite3.Row,
+        timestamp: str,
+    ) -> tuple[sqlite3.Row, bool]:
+        action_id = str(row["action_id"])
+        unresolved_action = self._unresolved_action(connection, row["job_id"])
+        if (
+            unresolved_action is not None
+            and unresolved_action["action_id"] != action_id
+        ):
+            _fail(CommerceActionError, "inflight_action_exists", "job_id")
+        recoverable_action = (
+            row["action_status"] == "recoverable"
+            and row["effect_class"] in RECOVERABLE_EFFECT_CLASSES
+        )
+        recovery_redispatch = (
+            recoverable_action
+            and job["current_state"] == row["target_state"]
+            and job["current_step"] == row["action_type"]
+        )
+        if row["action_status"] != "planned" and not recoverable_action:
+            _fail(
+                CommerceActionError,
+                "action_not_dispatchable",
+                "action_status",
+            )
+        if row["target_state"] not in EXECUTION_STATES or (
+            row["target_state"] not in ALLOWED_TRANSITIONS[job["current_state"]]
+            and not recovery_redispatch
+        ):
+            _fail(
+                CommerceActionError,
+                "job_not_ready_for_action",
+                "current_state",
+            )
+        if row["approval_status"] == "stale":
+            _fail(
+                CommerceActionError,
+                "stale_action_approval",
+                "action_id",
+            )
+        if row["effect_class"] == "consequential" and (
+            row["approval_status"] != "live"
+        ):
+            _fail(CommerceActionError, "action_approval_required", "action_id")
+        if row["effect_class"] == "consequential" and (
+            not row["approval_expires_at"] or row["approval_expires_at"] <= timestamp
+        ):
+            _fail(CommerceActionError, "action_approval_expired", "action_id")
+        connection.execute(
+            """UPDATE job_actions SET action_status='dispatched',
+               dispatched_at=?,started_at=?,updated_at=?
+               WHERE action_id=?""",
+            (timestamp, timestamp, timestamp, action_id),
+        )
+        return self._action_row(connection, action_id), recovery_redispatch
+
     def dispatch_action(
         self,
         action_id: str,
@@ -1643,58 +1925,69 @@ class CommerceJobStore:
         with self._write() as connection:
             row = self._action_row(connection, action_id)
             job = self._job_row(connection, row["job_id"])
-            unresolved_action = self._unresolved_action(connection, row["job_id"])
-            if (
-                unresolved_action is not None
-                and unresolved_action["action_id"] != action_id
-            ):
-                _fail(CommerceActionError, "inflight_action_exists", "job_id")
-            recovery_redispatch = (
-                row["action_status"] == "recoverable"
-                and row["effect_class"] == "read_only"
-                and job["current_state"] == row["target_state"]
-                and job["current_step"] == row["action_type"]
+            dispatched, _ = self._dispatch_action_in_tx(
+                connection,
+                row=row,
+                job=job,
+                timestamp=timestamp,
             )
-            if row["action_status"] != "planned" and not (
-                row["action_status"] == "recoverable"
-                and row["effect_class"] == "read_only"
-            ):
-                _fail(
-                    CommerceActionError,
-                    "action_not_dispatchable",
-                    "action_status",
-                )
-            if row["target_state"] not in EXECUTION_STATES or (
-                row["target_state"] not in ALLOWED_TRANSITIONS[job["current_state"]]
-                and not recovery_redispatch
-            ):
-                _fail(
-                    CommerceActionError,
-                    "job_not_ready_for_action",
-                    "current_state",
-                )
-            if row["approval_status"] == "stale":
-                _fail(
-                    CommerceActionError,
-                    "stale_action_approval",
-                    "action_id",
-                )
-            if row["effect_class"] == "consequential" and (
-                row["approval_status"] != "live"
-            ):
-                _fail(CommerceActionError, "action_approval_required", "action_id")
-            if row["effect_class"] == "consequential" and (
-                not row["approval_expires_at"]
-                or row["approval_expires_at"] <= timestamp
-            ):
-                _fail(CommerceActionError, "action_approval_expired", "action_id")
-            connection.execute(
-                """UPDATE job_actions SET action_status='dispatched',
-                   dispatched_at=?,started_at=?,updated_at=?
-                   WHERE action_id=?""",
-                (timestamp, timestamp, timestamp, action_id),
+            return self._decode_action(dispatched)
+
+    def dispatch_and_transition(
+        self,
+        action_id: str,
+        *,
+        expected_state: str,
+        expected_version: int,
+        actor: str,
+        reason_code: str = "action_dispatched",
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Atomically dispatch an action and bind its execution state.
+
+        A recovered idempotent action is already bound to its execution state,
+        so redispatch changes only the action row and leaves the job version
+        untouched. Initial dispatch updates both rows in one transaction.
+        """
+        timestamp = _utc(now)
+        with self._write() as connection:
+            row = self._action_row(connection, action_id)
+            job = self._job_row(connection, row["job_id"])
+            self._validate_version(
+                job,
+                expected_state=expected_state,
+                expected_version=expected_version,
             )
-            return self._decode_action(self._action_row(connection, action_id))
+            dispatched, recovery_redispatch = self._dispatch_action_in_tx(
+                connection,
+                row=row,
+                job=job,
+                timestamp=iso_utc(timestamp),
+            )
+            if recovery_redispatch:
+                return {
+                    "action": self._decode_action(dispatched),
+                    "job": self._decode_job(job),
+                    "redispatched": True,
+                }
+            updated_job = self._transition_in_tx(
+                connection,
+                row=job,
+                to_state=str(dispatched["target_state"]),
+                expected_state=expected_state,
+                expected_version=expected_version,
+                actor=actor,
+                reason_code=reason_code,
+                evidence={"action_id": action_id},
+                action_id=action_id,
+                gate_id="",
+                now=timestamp,
+            )
+            return {
+                "action": self._decode_action(self._action_row(connection, action_id)),
+                "job": updated_job,
+                "redispatched": False,
+            }
 
     def finish_action(
         self,
@@ -2127,7 +2420,7 @@ class CommerceJobStore:
                     or gate["browser_session"] != job["browser_session"]
                 ):
                     _fail(CommerceGateError, "gate_not_active_handoff", "gate_id")
-                if not gate["done_requested_at"]:
+                if gate["gate_type"] != "facts" and not gate["done_requested_at"]:
                     _fail(CommerceGateError, "gate_done_required", "gate_id")
             connection.execute(
                 """UPDATE gates SET status='completed',completion_evidence_json=?,
@@ -2320,7 +2613,7 @@ class CommerceJobStore:
                     counts["inconsistent"] += 1
                     inconsistent_job = job["job_id"]
                     continue
-                if action["effect_class"] == "read_only":
+                if action["effect_class"] in RECOVERABLE_EFFECT_CLASSES:
                     connection.execute(
                         """UPDATE job_actions SET action_status='recoverable',
                            updated_at=? WHERE action_id=?""",
@@ -2333,7 +2626,11 @@ class CommerceJobStore:
                         from_state=job["current_state"],
                         to_state=job["current_state"],
                         actor=actor,
-                        reason_code="read_action_interrupted",
+                        reason_code=(
+                            "read_action_interrupted"
+                            if action["effect_class"] == "read_only"
+                            else "idempotent_write_interrupted"
+                        ),
                         evidence={"action_id": action["action_id"]},
                         now=timestamp,
                     )

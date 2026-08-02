@@ -1,0 +1,89 @@
+{
+  "actions_completed": [
+    {
+      "at": "2026-08-02T12:20:00.000000Z",
+      "evidence": "evidence/cj_42424242_4242_4242_abcd_efabcdefabcd/domain-registration.json",
+      "step": "porkbun_register_and_dns"
+    },
+    {
+      "at": "2026-08-02T12:30:00.000000Z",
+      "evidence": "evidence/cj_42424242_4242_4242_abcd_efabcdefabcd/verification.json",
+      "step": "shopify_verify_launch"
+    }
+  ],
+  "checkout_absent_verified": true,
+  "completed_at": "2026-08-02T12:30:00.000000Z",
+  "dns": {
+    "records": [
+      "A",
+      "AAAA",
+      "CNAME www"
+    ],
+    "status": "propagated"
+  },
+  "domain": {
+    "auto_renew": true,
+    "cogitator": {
+      "approval_id": "pa_receipt_test",
+      "proposal_id": "pp_receipt_test",
+      "receipt_ref": "purchase-receipts/domain-1"
+    },
+    "name": "siliconcurrent.com",
+    "order_id": "porkbun-order-1",
+    "registrar": "porkbun",
+    "spend": {
+      "amount_usd_cents": 1198,
+      "display": "US$11.98"
+    },
+    "whois_privacy": true
+  },
+  "human_gates_completed": [
+    {
+      "gate_id": "cg_purchase_approval",
+      "opened": "2026-08-02T12:05:00.000000Z",
+      "type": "action_approval",
+      "verified": "2026-08-02T12:06:00.000000Z"
+    },
+    {
+      "gate_id": "cg_store_creation",
+      "opened": "2026-08-02T12:07:00.000000Z",
+      "type": "store_creation",
+      "verified": "2026-08-02T12:10:00.000000Z"
+    }
+  ],
+  "job_id": "cj_42424242_4242_4242_abcd_efabcdefabcd",
+  "no_payment_collected": true,
+  "objective": "AMD GPU waitlist store launch",
+  "public_url": "https://siliconcurrent.com/",
+  "shopify": {
+    "admin_url": "https://admin.shopify.com/store/silicon-current",
+    "myshopify_domain": "silicon-current.myshopify.com",
+    "plan": "Basic",
+    "shop_id": "gid://shopify/Shop/1"
+  },
+  "state_machine_version": 2,
+  "total_spend": [
+    {
+      "amount": "US$11.98",
+      "provider": "porkbun"
+    },
+    {
+      "amount": "Basic billed to Cal's card at trial end",
+      "provider": "shopify"
+    }
+  ],
+  "unresolved": [
+    ".com.au deferred pending ABN"
+  ],
+  "verification": {
+    "all_green": true,
+    "checklist": "9.3",
+    "evidence_bundle": "evidence/cj_42424242_4242_4242_abcd_efabcdefabcd/verification/"
+  },
+  "waitlist_test": {
+    "consent_recorded": true,
+    "result": "pass",
+    "test_address_used": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "test_subscriber_deleted": true
+  }
+}

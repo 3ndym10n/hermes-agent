@@ -30,6 +30,7 @@ from hermes_attention import (
     validate_public_url,
 )
 from hermes_cli.config import cfg_get, load_config
+from virgil_gate_routes import install_gate_routes
 
 
 STATIC_DIR = Path(__file__).parent / "virgil_mobile"
@@ -109,6 +110,7 @@ def create_app(
     public_url: str,
     *,
     db_path: Path | str | None = None,
+    commerce_db_path: Path | str | None = None,
     trusted_proxy_hosts: frozenset[str] = frozenset({"127.0.0.1", "::1"}),
 ) -> FastAPI:
     """Build the app with an explicit identity and trusted local proxy boundary."""
@@ -144,7 +146,7 @@ def create_app(
         response.headers["Permissions-Policy"] = (
             "camera=(), microphone=(), geolocation=(), payment=(), usb=()"
         )
-        if path.startswith("/api/"):
+        if path.startswith(("/api/", "/gate/")):
             response.headers["Cache-Control"] = "no-store"
             response.headers["Pragma"] = "no-cache"
         return response
@@ -304,12 +306,24 @@ def create_app(
         _audit(str(payload["action"]), item_id)
         return {"item": result}
 
+    install_gate_routes(
+        app,
+        commerce_db_path=commerce_db_path,
+        authorized_user=authorized,
+        public_url=public_url,
+        expected_host=expected_host,
+        trusted_proxy_hosts=trusted_proxy_hosts,
+        audit=lambda action, gate_id, outcome: _audit(action, gate_id, outcome),
+    )
+
     assets = {
         "/": ("index.html", "text/html; charset=utf-8"),
         "/index.html": ("index.html", "text/html; charset=utf-8"),
         "/app.css": ("app.css", "text/css; charset=utf-8"),
         "/app.js": ("app.js", "text/javascript; charset=utf-8"),
         "/manifest.webmanifest": ("manifest.webmanifest", "application/manifest+json"),
+        "/gate.css": ("gate.css", "text/css; charset=utf-8"),
+        "/gate.js": ("gate.js", "text/javascript; charset=utf-8"),
         "/sw.js": ("sw.js", "text/javascript; charset=utf-8"),
         "/icons/virgil-192.png": ("icons/virgil-192.png", "image/png"),
         "/icons/virgil-512.png": ("icons/virgil-512.png", "image/png"),

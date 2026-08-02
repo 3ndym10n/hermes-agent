@@ -1,0 +1,10 @@
+{
+  "platform": "telegram",
+  "allowlisted": true,
+  "chat_id": "-10042",
+  "user_id": "4242",
+  "message_id": "99",
+  "text": "Set up the AMD GPU waitlist store.",
+  "expected_job_state": "requested",
+  "expected_intake_packets": 0
+}

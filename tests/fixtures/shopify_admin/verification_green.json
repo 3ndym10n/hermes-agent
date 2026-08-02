@@ -1,0 +1,13 @@
+{
+  "expected_dns": {
+    "A": ["23.227.38.65"],
+    "AAAA": ["2620:0127:f00f:5::"],
+    "CNAME": ["shops.myshopify.com."]
+  },
+  "waitlist_probe": {
+    "customer_found": true,
+    "consent_recorded": true,
+    "confirmation_shown": true,
+    "subscriber_deleted": true
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "status": "ERROR",
+  "message": "The idempotency key was reused with a different body.",
+  "code": "IDEMPOTENCY_KEY_MISMATCH",
+  "requestId": "019e04fa-0000-7000-8000-000000000014"
+}

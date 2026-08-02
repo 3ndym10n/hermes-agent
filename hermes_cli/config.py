@@ -1629,6 +1629,12 @@ DEFAULT_CONFIG = {
         "public_url": "",
     },
 
+    # Governed ecommerce operator. Disabled until its inert-installed worker
+    # and Telegram control surface have been explicitly enabled.
+    "commerce": {
+        "enabled": False,
+    },
+
     # Privacy settings
     "privacy": {
         "redact_pii": False,  # When True, hash user IDs and strip phone numbers from LLM context

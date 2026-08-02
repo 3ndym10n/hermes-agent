@@ -3253,6 +3253,98 @@ class TelegramAdapter(BasePlatformAdapter):
             )
             return SendResult(success=False, error=str(e))
 
+    async def edit_commerce_approval_message(
+        self, *, chat_id: str, message_id: str, text: str, button_rows,
+    ) -> SendResult:
+        """Attach opaque commerce decision buttons to an existing message."""
+        if not self._bot:
+            return SendResult(success=False, error="Not connected")
+        try:
+            keyboard = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(str(label), callback_data=f"co:{token}")
+                    for label, token in row
+                ]
+                for row in button_rows
+            ])
+            await self._bot.edit_message_text(
+                chat_id=int(chat_id),
+                message_id=int(message_id),
+                text=self.format_message(text),
+                parse_mode=ParseMode.MARKDOWN_V2,
+                reply_markup=keyboard,
+            )
+            return SendResult(success=True, message_id=str(message_id))
+        except Exception:
+            logger.warning("[%s] commerce approval edit failed", self.name)
+            return SendResult(success=False, error="commerce_approval_edit_failed")
+
+    async def _handle_commerce_callback(
+        self,
+        query,
+        data,
+        *,
+        query_chat_id,
+        query_chat_type,
+        query_thread_id,
+        query_user_name,
+    ) -> None:
+        """Resolve one opaque commerce decision before the first await."""
+        runner = getattr(getattr(self, "_message_handler", None), "__self__", None)
+        action_fn = getattr(runner, "handle_commerce_button_action", None)
+        if not callable(action_fn):
+            await query.answer(text="Commerce approvals are unavailable.")
+            return
+        caller_id = str(getattr(query.from_user, "id", ""))
+        if not self._is_callback_user_authorized(
+            caller_id,
+            chat_id=query_chat_id,
+            chat_type=str(query_chat_type) if query_chat_type is not None else None,
+            thread_id=str(query_thread_id) if query_thread_id is not None else None,
+            user_name=query_user_name,
+        ):
+            await query.answer(text="⛔ You are not authorized to approve this action.")
+            return
+        token = data.split(":", 1)[1] if ":" in data else ""
+        message_id = str(getattr(getattr(query, "message", None), "message_id", ""))
+        try:
+            result = action_fn(
+                token,
+                user_id=caller_id,
+                chat_id=str(query_chat_id),
+                message_id=message_id,
+            )
+        except Exception as exc:
+            code = str(getattr(exc, "code", "approval_failed"))
+            text = {
+                "expired_token": "These approval buttons have expired.",
+                "replayed_token": "This decision was already recorded.",
+                "token_in_flight": "This decision is already being recorded.",
+                "wrong_user": "⛔ You are not authorized to approve this action.",
+                "wrong_chat": "This approval belongs to another chat.",
+                "wrong_message": "This approval belongs to another message.",
+                "stale_binding": "The plan changed; use the newest approval card.",
+            }.get(code, "This approval is no longer current.")
+            await query.answer(text=text)
+            return
+        await query.answer()
+        decision = "Approved" if result.get("approved") else "Denied"
+        replacement = (
+            f"🛒 Virgil Commerce\n{decision}.\n"
+            f"Job: {result.get('job_id', '')}"
+        )
+        try:
+            await query.edit_message_text(
+                text=self.format_message(replacement),
+                parse_mode=ParseMode.MARKDOWN_V2,
+                reply_markup=None,
+            )
+        except Exception:
+            try:
+                await self.send(str(query_chat_id), replacement)
+            except Exception:
+                pass
+
     async def _handle_intelligent_review_callback(
         self, query, data, *, query_chat_id, query_chat_type,
         query_thread_id, query_user_name,
@@ -4017,6 +4109,18 @@ class TelegramAdapter(BasePlatformAdapter):
         # --- Gmail-triage callbacks (gt:verb:arg) ---
         if data.startswith("gt:"):
             await self._handle_gmail_triage_callback(
+                query,
+                data,
+                query_chat_id=query_chat_id,
+                query_chat_type=query_chat_type,
+                query_thread_id=query_thread_id,
+                query_user_name=query_user_name,
+            )
+            return
+
+        # --- Governed commerce approval callbacks (co:<opaque-token>) ---
+        if data.startswith("co:"):
+            await self._handle_commerce_callback(
                 query,
                 data,
                 query_chat_id=query_chat_id,

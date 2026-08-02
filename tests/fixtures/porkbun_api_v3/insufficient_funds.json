@@ -1,0 +1,11 @@
+{
+  "status": "ERROR",
+  "message": "Account credit is insufficient.",
+  "code": "INSUFFICIENT_FUNDS",
+  "next_action": {
+    "type": "add_funds",
+    "hint": "Add account credit, then run a new dry run.",
+    "url": "https://porkbun.com/account/billing"
+  },
+  "requestId": "019e04fa-0000-7000-8000-000000000012"
+}
