@@ -55,3 +55,16 @@ def test_browser_subprocess_environment_is_allowlisted_and_secret_free(
     assert child_envs == [expected, expected]
     assert secret_names.isdisjoint(child_envs[0])
     assert "sentinel-worker-secret" not in child_envs[0].values()
+
+
+def test_session_socket_path_fits_the_unix_socket_limit():
+    """agent-browser refuses a session whose socket path exceeds 103 bytes.
+
+    The session name is derived from the job UUID and is not shortenable, so
+    the budget is spent entirely by SOCKET_DIR. A longer default would fail
+    only in production, at the first browser launch.
+    """
+    longest_session = "commerce_cj_" + "0" * 8 + "_0000_0000_0000_" + "0" * 12
+    socket_path = f"{browser.SOCKET_DIR}/{longest_session}.sock"
+
+    assert len(socket_path.encode("utf-8")) <= 103, socket_path
