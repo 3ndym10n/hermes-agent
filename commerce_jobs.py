@@ -616,6 +616,17 @@ class CommerceJobStore:
         self._prepare_path()
         connection = self._connect()
         try:
+            # Read the table before the version, never the other way round.
+            # A concurrent initializer creates the tables and stamps
+            # user_version in one transaction, so a stale `has_jobs` is
+            # harmless but a stale `version` read before a fresh `has_jobs`
+            # read looks exactly like a downgrade and fails a healthy fresh
+            # database. Reading in this order makes `version` no older than
+            # `has_jobs`, so that false positive cannot occur; a genuinely
+            # stale database still fails both checks below.
+            has_jobs = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='jobs'"
+            ).fetchone()
             version = int(connection.execute("PRAGMA user_version").fetchone()[0])
             if version > SCHEMA_VERSION:
                 _fail(
@@ -623,9 +634,6 @@ class CommerceJobStore:
                     "future_schema_version",
                     "user_version",
                 )
-            has_jobs = connection.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='jobs'"
-            ).fetchone()
             if has_jobs and version < SCHEMA_VERSION:
                 _fail(
                     CommerceConfigurationError,

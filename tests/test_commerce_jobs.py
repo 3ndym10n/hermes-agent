@@ -3254,3 +3254,38 @@ def test_delivery_snapshot_and_checkpoint_are_durable_and_idempotent(tmp_path):
 
     with pytest.raises(commerce.CommerceJobError, match="delivery_key"):
         store.record_delivery(job["job_id"], "not-a-digest", actor="gateway")
+
+
+def test_initialize_reads_table_presence_before_schema_version(tmp_path):
+    """Pin the read order that keeps concurrent initializers from false-failing.
+
+    A concurrent initializer creates the tables and stamps `user_version` in
+    one transaction. Reading the version first and the table second can
+    observe (old version, new table) — indistinguishable from a downgraded
+    database — and fails a perfectly healthy fresh one. Reading the table
+    first makes the version no older than it, so that pairing is impossible.
+    """
+    store = commerce.CommerceJobStore(tmp_path / "order.db")
+    statements: list[str] = []
+    real_connect = store._connect
+
+    def recording_connect():
+        connection = real_connect()
+        connection.set_trace_callback(
+            lambda sql: statements.append(" ".join(str(sql).split()))
+        )
+        return connection
+
+    store._connect = recording_connect
+    store.initialize()
+
+    presence = next(
+        index for index, sql in enumerate(statements) if "sqlite_master" in sql
+    )
+    version = next(
+        index
+        for index, sql in enumerate(statements)
+        if sql.upper().startswith("PRAGMA USER_VERSION")
+        and "=" not in sql
+    )
+    assert presence < version, statements
