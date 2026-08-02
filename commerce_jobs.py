@@ -188,12 +188,9 @@ _FORBIDDEN_KEY_PARTS = frozenset({
     "driverlicense",
     "customercard",
 })
-# Boundaries are non-alphanumeric, not merely non-digit. A 13-19 digit run
-# buried inside a longer hex token is a sha256 or an evidence digest, not a
-# card number -- roughly 5% of receipts carry one that also passes Luhn, and
-# screening those out rejected legitimate receipts. Real card data is always
-# delimited (quote, colon, equals, space), so it still matches.
-_PAN_RE = re.compile(r"(?<![0-9A-Za-z])(?:\d[ -]?){13,19}(?![0-9A-Za-z])")
+_PAN_RE = re.compile(r"(?<!\d)(?:\d[ -]?){13,19}(?!\d)")
+_HEX_CHARS = frozenset("0123456789abcdefABCDEF")
+SHA256_HEX_LENGTH = 64
 _EXPIRY_RE = re.compile(r"(?<![\d/-])(?:0[1-9]|1[0-2])\s*[/\-]\s*\d{2,4}(?![\d/-])")
 _CVV_RE = re.compile(
     r"\b(?:cvv|cvc|security\s*code)\s*[:=]?\s*\d{3,4}\b", re.IGNORECASE
@@ -362,6 +359,29 @@ def _luhn(digits: str) -> bool:
     return total % 10 == 0
 
 
+def _inside_sha256_token(value: str, start: int, end: int) -> bool:
+    """True only when the candidate sits inside an exact SHA-256 hex token.
+
+    Ordinary digests carry a Luhn-valid 13-19 digit run often enough
+    (~0.5% each) that screening them rejected legitimate receipts. The
+    exemption is deliberately narrow: the *complete* contiguous hex token
+    around the candidate must be exactly 64 characters. Any other adjacency
+    -- `card4111111111111111`, a short hex blob, a padded token of the wrong
+    length -- stays a card candidate and is still rejected.
+    """
+
+    if any(character not in _HEX_CHARS for character in value[start:end]):
+        # Spaced or hyphenated digits cannot be part of one hex token.
+        return False
+    left = start
+    while left > 0 and value[left - 1] in _HEX_CHARS:
+        left -= 1
+    right = end
+    while right < len(value) and value[right] in _HEX_CHARS:
+        right += 1
+    return right - left == SHA256_HEX_LENGTH
+
+
 def _reject_text(value: str, field: str) -> None:
     if (
         _EXPIRY_RE.search(value)
@@ -372,8 +392,11 @@ def _reject_text(value: str, field: str) -> None:
         _fail(CommerceForbiddenDataError, "forbidden_sensitive_value", field)
     for match in _PAN_RE.finditer(value):
         digits = re.sub(r"\D", "", match.group(0))
-        if 13 <= len(digits) <= 19 and _luhn(digits):
-            _fail(CommerceForbiddenDataError, "forbidden_card_value", field)
+        if not (13 <= len(digits) <= 19 and _luhn(digits)):
+            continue
+        if _inside_sha256_token(value, match.start(), match.end()):
+            continue
+        _fail(CommerceForbiddenDataError, "forbidden_card_value", field)
 
 
 def reject_forbidden_data(value: Any, field: str = "payload") -> None:

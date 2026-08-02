@@ -3285,39 +3285,62 @@ def test_initialize_reads_table_presence_before_schema_version(tmp_path):
     version = next(
         index
         for index, sql in enumerate(statements)
-        if sql.upper().startswith("PRAGMA USER_VERSION")
-        and "=" not in sql
+        if sql.upper().startswith("PRAGMA USER_VERSION") and "=" not in sql
     )
     assert presence < version, statements
 
 
-# A real sha256 whose digits contain a Luhn-valid 17-digit run bounded by hex
-# letters. Roughly one receipt in twenty carries a digest like this, which is
-# what made the acceptance rehearsal fail intermittently.
+# A real sha256 whose digits contain a Luhn-valid 17-digit run. Roughly one
+# receipt in twenty carries a digest like this, which is what made the
+# acceptance rehearsal fail intermittently.
 LUHN_COLLIDING_DIGEST = (
     "15f2dd6ac97954004419818681e5a30ade16e5d5d4b4238d3eb5fb29c8a535e9"
 )
+VALID_PAN = "4111111111111111"
+# The PAN itself buried in an exact 64-character hex token.
+PAN_INSIDE_SHA256 = "a" * 24 + VALID_PAN + "b" * 24
 
 
-def test_hex_digests_are_not_mistaken_for_card_numbers():
-    """The card screen must not reject an ordinary content fingerprint."""
-    commerce.reject_forbidden_data(
-        {
-            "content_sha256": LUHN_COLLIDING_DIGEST,
-            "evidence_ref": f"evidence/cj_1/porkbun-{LUHN_COLLIDING_DIGEST[:16]}.json",
-        },
-        "snapshot",
-    )
+@pytest.mark.parametrize(
+    "payload",
+    (
+        LUHN_COLLIDING_DIGEST,
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855",
+        PAN_INSIDE_SHA256,
+    ),
+)
+def test_exact_sha256_tokens_are_not_mistaken_for_card_numbers(payload):
+    """Only a complete 64-character hex token is exempt from the card screen."""
+    assert len(payload) == commerce.SHA256_HEX_LENGTH
+    commerce.reject_forbidden_data({"content_sha256": payload}, "snapshot")
 
 
-def test_delimited_card_numbers_are_still_rejected():
-    """Narrowing the boundary must not blind the screen to real card data."""
-    for payload in (
-        {"note": "4111111111111111"},
-        {"note": "card: 4111111111111111"},
-        {"note": "4111-1111-1111-1111"},
-        {"note": "pan=4111 1111 1111 1111"},
-        {"note": '"4111111111111111"'},
-    ):
-        with pytest.raises(commerce.CommerceForbiddenDataError):
-            commerce.reject_forbidden_data(payload, "snapshot")
+@pytest.mark.parametrize(
+    ("label", "payload"),
+    (
+        ("bare", VALID_PAN),
+        ("spaced", "4111 1111 1111 1111"),
+        ("hyphenated", "4111-1111-1111-1111"),
+        ("labelled", f"card: {VALID_PAN}"),
+        ("quoted", f'"{VALID_PAN}"'),
+        ("letter prefix word", f"card{VALID_PAN}"),
+        ("single letter prefix", f"x{VALID_PAN}"),
+        ("letter suffix", f"{VALID_PAN}suffix"),
+        ("short hex blob", f"abc{VALID_PAN}def"),
+        ("hex token one short of sha256", "a" * 23 + VALID_PAN + "b" * 24),
+        ("hex token one over sha256", "a" * 25 + VALID_PAN + "b" * 24),
+    ),
+)
+def test_card_numbers_are_rejected_however_they_are_embedded(label, payload):
+    """Adjacency to letters must never buy a PAN an exemption."""
+    with pytest.raises(commerce.CommerceForbiddenDataError):
+        commerce.reject_forbidden_data({"note": payload}, "snapshot")
+
+
+def test_sha256_exemption_needs_the_whole_token_not_just_hex_adjacency():
+    """A digest-shaped prefix does not launder a PAN in a longer token."""
+    oversized = "a" * 24 + VALID_PAN + "b" * 40
+    assert len(oversized) > commerce.SHA256_HEX_LENGTH
+    with pytest.raises(commerce.CommerceForbiddenDataError):
+        commerce.reject_forbidden_data({"note": oversized}, "snapshot")
