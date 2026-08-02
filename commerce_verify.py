@@ -21,6 +21,12 @@ FETCH_TIMEOUT_SECONDS = 20.0
 DNS_TIMEOUT_SECONDS = 10.0
 # Two independent public resolvers, per the §9.3 "two resolvers" requirement.
 PUBLIC_RESOLVERS = ("8.8.8.8", "1.1.1.1")
+# Mirrors commerce_workflow.SHOPIFY_DNS_BUNDLE; kept in sync by a test.
+EXPECTED_SHOPIFY_DNS = {
+    "A": ["23.227.38.65"],
+    "AAAA": ["2620:0127:f00f:5::"],
+    "CNAME": ["shops.myshopify.com."],
+}
 PLACEHOLDER = re.compile(r"⟨[^⟩]+⟩")
 _DOMAIN = re.compile(
     r"(?a)^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+"
@@ -496,6 +502,43 @@ def _registration_facts(store: object, job_id: str) -> dict:
     raise VerificationConfigurationError("no succeeded registration in the ledger")
 
 
+def _prepublish_report(
+    client: object,
+    surface: Mapping[str, object],
+    domain: str,
+    dns_lookup: DNSLookup,
+) -> dict:
+    """Report the pre-publication truths, all readable through the lock."""
+    locked = client.storefront_probe("/")  # type: ignore[attr-defined]
+    products = int(surface["products_count"])  # type: ignore[arg-type]
+    paid = bool(surface["payment_provider_configured"])
+    commerce_absent = products == 0 and not paid
+    checks = (
+        (
+            "storefront_locked",
+            locked.get("password_protected") is True,
+            "storefront still returns the password page",
+        ),
+        ("no_products", products == 0, "shop publishes zero products"),
+        ("no_payment_provider", not paid, "no payment provider is configured"),
+        (
+            "dns",
+            _dns_green(dns_lookup, domain, EXPECTED_SHOPIFY_DNS),
+            "A, AAAA and www CNAME match at two or more resolvers",
+        ),
+    )
+    return {
+        "checklist": "9.3-prepublish",
+        "checks": [
+            {"name": name, "passed": passed, "evidence": evidence}
+            for name, passed, evidence in checks
+        ],
+        "all_green": all(passed for _, passed, _ in checks),
+        "checkout_absent_verified": commerce_absent,
+        "no_payment_collected": commerce_absent,
+    }
+
+
 def production_verify(
     *,
     store: object | None = None,
@@ -536,6 +579,13 @@ def production_verify(
         if not isinstance(landing, Mapping):
             raise VerificationConfigurationError("content package has no landing page")
         surface = client.commerce_surface()  # type: ignore[attr-defined]
+        if phase != "final":
+            # Pre-publication the storefront is still password-locked, so the
+            # public checklist cannot go green by construction. Verify what is
+            # actually true now: nothing is exposed, nothing is sellable, and
+            # DNS already points at Shopify. Content was fingerprinted by the
+            # build step, so it is not re-fetched through the password page.
+            return _prepublish_report(client, surface, domain, dns_lookup)
         probe = dict(
             waitlist_probe(job, client, domain)
             if waitlist_probe is not None
@@ -554,11 +604,7 @@ def production_verify(
             approved_html=str(landing["body_html"]),
             fetch=fetch,
             dns_lookup=dns_lookup,
-            expected_dns={
-                "A": ["23.227.38.65"],
-                "AAAA": ["2620:0127:f00f:5::"],
-                "CNAME": ["shops.myshopify.com."],
-            },
+            expected_dns=EXPECTED_SHOPIFY_DNS,
             registrar_active=registrar_active(domain),
             waitlist_probe=probe,
             mobile_screenshot_ok=(

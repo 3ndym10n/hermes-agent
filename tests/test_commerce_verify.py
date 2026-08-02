@@ -274,8 +274,19 @@ def _registration_action(**result_overrides):
 
 
 class _ShopStub:
+    def __init__(self, password_protected=True, products=0, paid=False):
+        self._locked = password_protected
+        self._products = products
+        self._paid = paid
+
     def commerce_surface(self):
-        return {"products_count": 0, "payment_provider_configured": False}
+        return {
+            "products_count": self._products,
+            "payment_provider_configured": self._paid,
+        }
+
+    def storefront_probe(self, _path="/"):
+        return {"status": 200, "password_protected": self._locked}
 
 
 def _production_job():
@@ -338,7 +349,8 @@ def test_production_verify_builds_receipt_facts_from_the_ledger():
     assert facts["waitlist_test"]["test_subscriber_deleted"] is True
 
 
-def test_production_verify_prepublish_emits_no_receipt_facts():
+def test_production_verify_prepublish_greens_through_the_storefront_lock():
+    """Pre-publication the public checklist cannot pass; this one must."""
     verify = _production_verify([_registration_action()])
     package = build_content({
         "contact_email": "launch@example.test",
@@ -350,7 +362,68 @@ def test_production_verify_prepublish_emits_no_receipt_facts():
 
     report = verify(_production_job(), _ShopStub(), package, "prepublish")
 
+    assert report["all_green"] is True
+    assert report["checklist"] == "9.3-prepublish"
+    assert report["checkout_absent_verified"] is True
     assert "receipt_facts" not in report
+    assert {check["name"] for check in report["checks"]} == {
+        "storefront_locked",
+        "no_products",
+        "no_payment_provider",
+        "dns",
+    }
+
+
+def test_production_verify_prepublish_is_red_if_the_store_is_already_public():
+    verify = _production_verify([_registration_action()])
+    package = build_content({
+        "contact_email": "launch@example.test",
+        "business_identity_sentence": "Silicon Current is operated by Example Trading.",
+        "double_opt_in": True,
+        "brand_signoff": True,
+        "privacy_signoff": True,
+    })
+
+    report = verify(
+        _production_job(), _ShopStub(password_protected=False), package, "prepublish"
+    )
+
+    assert report["all_green"] is False
+
+
+def test_production_verify_prepublish_is_red_with_a_sellable_product():
+    verify = _production_verify([_registration_action()])
+    package = build_content({
+        "contact_email": "launch@example.test",
+        "business_identity_sentence": "Silicon Current is operated by Example Trading.",
+        "double_opt_in": True,
+        "brand_signoff": True,
+        "privacy_signoff": True,
+    })
+
+    report = verify(
+        _production_job(), _ShopStub(products=1, paid=True), package, "prepublish"
+    )
+
+    assert report["all_green"] is False
+    assert report["checkout_absent_verified"] is False
+
+
+def test_expected_dns_matches_the_workflow_bundle():
+    """The verifier and the DNS writer must not drift apart."""
+    from commerce_verify import EXPECTED_SHOPIFY_DNS
+    from commerce_workflow import SHOPIFY_DNS_BUNDLE
+
+    bundle = {
+        record["type"]: [record["content"]] for record in SHOPIFY_DNS_BUNDLE
+    }
+    assert {
+        key: [value.rstrip(".").lower() for value in values]
+        for key, values in EXPECTED_SHOPIFY_DNS.items()
+    } == {
+        key: [value.rstrip(".").lower() for value in values]
+        for key, values in bundle.items()
+    }
 
 
 def test_production_verify_refuses_a_registration_the_money_authority_never_saw():
