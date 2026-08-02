@@ -172,7 +172,9 @@ async def test_operational_incidents_fall_through_to_normal_gateway_execution(me
     assert result == "normal execution"
     runner.handle_intelligent_intake.assert_not_awaited()
     runner._handle_message_with_agent.assert_awaited_once()
-    event = runner._handle_message_with_agent.await_args.args[0]
+    await_args = runner._handle_message_with_agent.await_args
+    assert await_args is not None
+    event = await_args.args[0]
     assert event.text == message
 
 
