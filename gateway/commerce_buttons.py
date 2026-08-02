@@ -326,21 +326,9 @@ class CommercePurchaseGovernance:
         self._operator_call = operator_call
         self._executor_call = executor_call
 
-    @classmethod
-    def from_runtime(
-        cls, *, bridge_url: str, bridge_token: str
-    ) -> CommercePurchaseGovernance:
-        """Wire the existing role-separated bridge clients for production use."""
-
-        from purchase_executor import bridge_post_factory
-        from scripts.purchase_operator_cli import bridge_call
-
-        executor_call = bridge_post_factory(bridge_url, bridge_token)
-        return cls(
-            bridge_url=bridge_url,
-            operator_call=bridge_call,
-            executor_call=executor_call,
-        )
+    # Construction from deployed config lives in `commerce_governance`, outside
+    # this package: the gateway coordinates approved decisions but must not own
+    # or import purchase-executor machinery. Callers inject the built clients.
 
     def __repr__(self) -> str:
         return "CommercePurchaseGovernance()"

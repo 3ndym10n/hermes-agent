@@ -10,13 +10,11 @@ import asyncio
 import hashlib
 import json
 import logging
-import os
 import re
 from datetime import datetime, timezone
 from typing import Any
 
 from commerce_jobs import CommerceJobError, CommerceJobStore
-from gateway.cogitator_intake_bridge import TOKEN_ENV
 from gateway.commerce_buttons import (
     CommerceButtonError,
     CommerceButtonStore,
@@ -460,17 +458,13 @@ class GatewayCommerceWatcherMixin:
         governance = getattr(self, "_commerce_purchase_governance", None)
         if governance is not None:
             return governance
-        config = load_config_readonly()
-        bridge_url = str(
-            cfg_get(config, "intake", "base_url", default="") or ""
-        ).strip()
-        bridge_token = str(os.environ.get(TOKEN_ENV, "") or "").strip()
-        if not bridge_url or not bridge_token:
+        # Built outside gateway/: this surface coordinates the approved
+        # decision, it does not own the executor client that carries it.
+        from commerce_governance import purchase_governance_from_config
+
+        governance = purchase_governance_from_config()
+        if governance is None:
             raise CommerceButtonError("governance_not_configured")
-        governance = CommercePurchaseGovernance.from_runtime(
-            bridge_url=bridge_url,
-            bridge_token=bridge_token,
-        )
         self._commerce_purchase_governance = governance
         return governance
 

@@ -1295,19 +1295,10 @@ def _purchase_recorder() -> Callable[..., Mapping[str, Any]] | None:
     rather than the worker refusing to start.
     """
 
-    from gateway.commerce_buttons import CommercePurchaseGovernance
+    from commerce_governance import purchase_governance_from_config
 
-    bridge_url = str(
-        cfg_get(load_config_readonly(), "intake", "base_url", default="") or ""
-    ).strip()
-    bridge_token = str(os.environ.get(TOKEN_ENV, "") or "").strip()
-    if not bridge_url or not bridge_token:
-        return None
-    governance = CommercePurchaseGovernance.from_runtime(
-        bridge_url=bridge_url,
-        bridge_token=bridge_token,
-    )
-    return governance.record_completion
+    governance = purchase_governance_from_config()
+    return None if governance is None else governance.record_completion
 
 
 def production_operator(
