@@ -29,16 +29,16 @@ from utils import atomic_json_write
 
 WORKFLOW = "virgil_ecommerce_v1"
 CANDIDATE_DOMAINS = (
-    "siliconcurrent.com",
-    "siliconcurrent.net",
-    "siliconcurrentgpu.com",
-    "siliconcurrentau.com",
-    "siliconcurrenttech.com",
-    "siliconcurrentstore.com",
-    "siliconcurrentshop.com",
-    "siliconcurrenthardware.com",
-    "getsiliconcurrent.com",
-    "joinsiliconcurrent.com",
+    "warpsupply.com",
+    "warpsupply.net",
+    "warpsupplygpu.com",
+    "warpsupplyau.com",
+    "warpsupplytech.com",
+    "warpsupplyhardware.com",
+    "getwarpsupply.com",
+    "joinwarpsupply.com",
+    "shopwarpsupply.com",
+    "warpsupplystore.com",
 )
 SHOPIFY_DNS_BUNDLE = (
     {"type": "A", "name": "", "content": "23.227.38.65"},

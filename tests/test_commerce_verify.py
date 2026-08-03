@@ -14,13 +14,13 @@ from commerce_verify import (
 FIXTURE = (
     Path(__file__).parent / "fixtures" / "shopify_admin" / "verification_green.json"
 )
-DOMAIN = "siliconcurrent.com"
+DOMAIN = "warpsupply.com"
 
 
 def _content():
     return build_content({
         "contact_email": "launch@example.test",
-        "business_identity_sentence": "Silicon Current is operated by Example Trading.",
+        "business_identity_sentence": "Warp Supply is operated by Example Trading.",
         "double_opt_in": True,
         "brand_signoff": True,
         "privacy_signoff": True,
@@ -294,7 +294,7 @@ def _production_job():
             "domain": DOMAIN,
             "shopify": {
                 "shop_id": "gid://shopify/Shop/1",
-                "myshopify_domain": "silicon-current.myshopify.com",
+                "myshopify_domain": "warp-supply.myshopify.com",
                 "plan": "Basic",
             },
         },
@@ -325,7 +325,7 @@ def test_production_verify_builds_receipt_facts_from_the_ledger():
     verify = _production_verify([_registration_action()])
     package = build_content({
         "contact_email": "launch@example.test",
-        "business_identity_sentence": "Silicon Current is operated by Example Trading.",
+        "business_identity_sentence": "Warp Supply is operated by Example Trading.",
         "double_opt_in": True,
         "brand_signoff": True,
         "privacy_signoff": True,
@@ -352,7 +352,7 @@ def test_production_verify_prepublish_greens_through_the_storefront_lock():
     verify = _production_verify([_registration_action()])
     package = build_content({
         "contact_email": "launch@example.test",
-        "business_identity_sentence": "Silicon Current is operated by Example Trading.",
+        "business_identity_sentence": "Warp Supply is operated by Example Trading.",
         "double_opt_in": True,
         "brand_signoff": True,
         "privacy_signoff": True,
@@ -375,7 +375,7 @@ def test_production_verify_prepublish_is_red_if_the_store_is_already_public():
     verify = _production_verify([_registration_action()])
     package = build_content({
         "contact_email": "launch@example.test",
-        "business_identity_sentence": "Silicon Current is operated by Example Trading.",
+        "business_identity_sentence": "Warp Supply is operated by Example Trading.",
         "double_opt_in": True,
         "brand_signoff": True,
         "privacy_signoff": True,
@@ -392,7 +392,7 @@ def test_production_verify_prepublish_is_red_with_a_sellable_product():
     verify = _production_verify([_registration_action()])
     package = build_content({
         "contact_email": "launch@example.test",
-        "business_identity_sentence": "Silicon Current is operated by Example Trading.",
+        "business_identity_sentence": "Warp Supply is operated by Example Trading.",
         "double_opt_in": True,
         "brand_signoff": True,
         "privacy_signoff": True,
@@ -429,7 +429,7 @@ def test_production_verify_refuses_a_registration_the_money_authority_never_saw(
     verify = _production_verify([action])
     package = build_content({
         "contact_email": "launch@example.test",
-        "business_identity_sentence": "Silicon Current is operated by Example Trading.",
+        "business_identity_sentence": "Warp Supply is operated by Example Trading.",
         "double_opt_in": True,
         "brand_signoff": True,
         "privacy_signoff": True,

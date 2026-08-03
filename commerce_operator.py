@@ -59,7 +59,7 @@ REQUIRED_FACTS = (
 )
 
 LAUNCH_FACT_RECORD_TYPE = "commerce_launch_fact"
-LAUNCH_FACT_SCOPE = "silicon_current_v1"
+LAUNCH_FACT_SCOPE = "warp_supply_v1"
 
 MAX_RETRIEVED_LAUNCH_FACTS = 64
 
@@ -214,7 +214,7 @@ def load_approved_launch_facts() -> dict[str, Any]:
             token=token,
             task_description=(
                 "Retrieve only typed approved or promoted commerce launch facts. "
-                "Require record_type commerce_launch_fact, scope silicon_current_v1, "
+                "Require record_type commerce_launch_fact, scope warp_supply_v1, "
                 "fact_code, scalar fact_value, and provenance metadata. Exclude "
                 "superseded or conflicting records. Do not infer from prose."
             ),
@@ -1346,12 +1346,12 @@ def production_operator(
     """
 
     from commerce_verify import (
+        dig_lookup,
         https_fetch,
         production_gate_probes,
         production_mobile_screenshot,
         production_verify,
         production_waitlist_probe,
-        dig_lookup,
     )
     from commerce_workflow import (
         production_gate_verifiers,

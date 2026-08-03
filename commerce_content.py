@@ -8,7 +8,7 @@ import json
 import re
 from collections.abc import Mapping
 
-BRAND = "Silicon Current"
+BRAND = "Warp Supply"
 FORBIDDEN_CLAIM_TERMS = (
     "supplier cost",
     "90% discount",
@@ -132,11 +132,11 @@ def build_content(facts: Mapping[str, object]) -> dict:
         f"<h3>Who are you?</h3><p>{safe_identity}</p>",
         '<section id="priority-signup">',
         "<h2>Join the priority list</h2>",
-        "<p>Email me about AMD GPU priority access from Silicon Current. Unsubscribe anytime.</p>",
+        "<p>Email me about AMD GPU priority access from Warp Supply. Unsubscribe anytime.</p>",
         "</section>",
         "<p>You're on the list. We'll email you only about AMD GPU priority access. Unsubscribe anytime.</p>",
         "<footer>",
-        "<p>Silicon Current is an independent Australian retailer-in-formation. AMD and Radeon are trademarks of Advanced Micro Devices, Inc. This site is not affiliated with or endorsed by AMD. Joining the list is free and creates no obligation for either party. No payments are accepted on this site.</p>",
+        "<p>Warp Supply is an independent Australian retailer-in-formation. AMD and Radeon are trademarks of Advanced Micro Devices, Inc. This site is not affiliated with or endorsed by AMD. Joining the list is free and creates no obligation for either party. No payments are accepted on this site.</p>",
         f'<p>Contact: <a href="mailto:{safe_contact}">{safe_contact}</a></p>',
         '<p><a href="/policies/privacy-policy">Privacy Policy</a> · <a href="/pages/contact">Contact</a></p>',
         "</footer>",
@@ -173,7 +173,7 @@ def build_content(facts: Mapping[str, object]) -> dict:
         "email_signup": {
             "native_dawn_section": True,
             "anchor": "priority-signup",
-            "consent": "Email me about AMD GPU priority access from Silicon Current. Unsubscribe anytime.",
+            "consent": "Email me about AMD GPU priority access from Warp Supply. Unsubscribe anytime.",
             "confirmation": "You're on the list. We'll email you only about AMD GPU priority access. Unsubscribe anytime.",
             "double_opt_in": double_opt_in,
             "prechecked": False,

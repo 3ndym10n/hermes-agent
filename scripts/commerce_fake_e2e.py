@@ -447,13 +447,13 @@ def main() -> int:
         porkbun.price = "11.98"
         shopify_transport = FakeShopify()
         shopify = ShopifyAdminClient(
-            "silicon-current.myshopify.com",
+            "warp-supply.myshopify.com",
             TOKEN,
             transport=shopify_transport,
             storefront_transport=lambda _url, _timeout, _limit: (
                 200,
                 {"Content-Type": "text/html"},
-                b"<html><body>Silicon Current</body></html>",
+                b"<html><body>Warp Supply</body></html>",
             ),
         )
         evidence_root = root / "evidence"

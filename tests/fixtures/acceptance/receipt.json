@@ -28,7 +28,7 @@
       "proposal_id": "pp_receipt_test",
       "receipt_ref": "purchase-receipts/domain-1"
     },
-    "name": "siliconcurrent.com",
+    "name": "warpsupply.com",
     "order_id": "porkbun-order-1",
     "registrar": "porkbun",
     "spend": {
@@ -54,10 +54,10 @@
   "job_id": "cj_42424242_4242_4242_abcd_efabcdefabcd",
   "no_payment_collected": true,
   "objective": "AMD GPU waitlist store launch",
-  "public_url": "https://siliconcurrent.com/",
+  "public_url": "https://warpsupply.com/",
   "shopify": {
-    "admin_url": "https://admin.shopify.com/store/silicon-current",
-    "myshopify_domain": "silicon-current.myshopify.com",
+    "admin_url": "https://admin.shopify.com/store/warp-supply",
+    "myshopify_domain": "warp-supply.myshopify.com",
     "plan": "Basic",
     "shop_id": "gid://shopify/Shop/1"
   },

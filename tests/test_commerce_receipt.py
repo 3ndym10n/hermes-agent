@@ -235,7 +235,7 @@ def test_every_provider_receipt_field_is_required(path):
         ),
         (
             lambda data: data["actions"][1]["result"]["receipt_facts"].update(
-                public_url="http://siliconcurrent.com/"
+                public_url="http://warpsupply.com/"
             ),
             "invalid_receipt_url",
         ),
@@ -243,7 +243,7 @@ def test_every_provider_receipt_field_is_required(path):
             lambda data: data["actions"][1]["result"]["receipt_facts"][
                 "shopify"
             ].update(
-                admin_url="https://admin.shopify.com/store/silicon-current?token=x"
+                admin_url="https://admin.shopify.com/store/warp-supply?token=x"
             ),
             "invalid_receipt_url",
         ),
