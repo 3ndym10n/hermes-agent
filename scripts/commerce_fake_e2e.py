@@ -153,8 +153,17 @@ def assert_decision_packet(
 ) -> None:
     plan = job["plan"]
     require(plan["workflow"] == fixture["workflow"], "workflow name is exact")
-    require(plan["availability"] == fixture["availability"], "ten-candidate table")
-    require(len(plan["availability"]) == len(CANDIDATE_DOMAINS) == 10, "ten candidates")
+    require(plan["availability"] == fixture["availability"], "availability table")
+    require(len(CANDIDATE_DOMAINS) == 10, "ten approved candidates")
+    checked = [row["domain"] for row in plan["availability"]]
+    require(
+        checked == list(CANDIDATE_DOMAINS[: len(checked)]), "candidates stay ordered"
+    )
+    require(
+        all(not row["available"] for row in plan["availability"][:-1])
+        and plan["availability"][-1]["available"] is True,
+        "scan stops at the first available candidate",
+    )
     require(plan["recommendation"] == fixture["recommendation"], "recommendation")
 
     registration = next(
@@ -597,7 +606,7 @@ def main() -> int:
                     "tick_ceiling": ABSOLUTE_TICK_CEILING,
                     "actions": len(actual["actions_completed"]),
                     "browser_handoffs": len(attaches),
-                    "candidate_domains": len(decision["availability"]),
+                    "availability_checks": len(decision["availability"]),
                     "dns_writes": porkbun.writes,
                     "golden_receipt": "exact",
                     "network": "loopback-only",

@@ -67,6 +67,8 @@ _IDEMPOTENCY_ERROR_CODES = frozenset({
     "IDEMPOTENCY_KEY_IN_USE",
     "IDEMPOTENCY_KEY_MISMATCH",
 })
+_RATE_LIMIT_ERROR_CODES = frozenset({"RATE_LIMIT_EXCEEDED"})
+MAX_RETRY_SECONDS = 86_400
 _READ_ONLY_ROUTES = (
     ("GET", True, re.compile(r"^ping$")),
     ("GET", False, re.compile(r"^pricing/get$")),
@@ -103,17 +105,38 @@ class PorkbunResponseError(PorkbunError):
 
 
 class PorkbunAPIError(PorkbunError):
-    """Validated provider-declared error."""
+    """Validated provider-declared error.
 
-    def __init__(self, code: str, http_status: int | None = None):
+    The safe diagnostic fields travel on the exception because the caller
+    persists them: a stable provider code, the HTTP status, the retry budget
+    the provider itself declared and its request id. Never a header block, a
+    response body or a credential.
+    """
+
+    def __init__(
+        self,
+        code: str,
+        http_status: int | None = None,
+        *,
+        ttl_remaining: int | None = None,
+        rate_limit_reset: int | None = None,
+        request_id: str = "",
+    ):
         self.code = code
         self.http_status = http_status
+        self.ttl_remaining = ttl_remaining
+        self.rate_limit_reset = rate_limit_reset
+        self.request_id = request_id
         suffix = f" (HTTP {http_status})" if http_status is not None else ""
         super().__init__(f"Porkbun API error: {code}{suffix}")
 
 
 class PorkbunAuthenticationError(PorkbunAPIError):
     """Validated authentication or API-key scope failure."""
+
+
+class PorkbunRateLimitError(PorkbunAPIError):
+    """Provider-declared rate limit; retry only after the declared window."""
 
 
 class PorkbunIdempotencyError(PorkbunAPIError):
@@ -133,6 +156,21 @@ class PorkbunMutationUncertainError(PorkbunTransportError):
             "Porkbun mutation outcome is uncertain; reconcile provider state "
             "before any retry"
         )
+
+
+_REQUEST_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$")
+_MAX_EPOCH_SECONDS = 4_102_444_800  # year 2100
+
+
+def _header_integer(headers: Any, name: str, maximum: int) -> int | None:
+    """Read one plain non-negative integer header; never keep the raw text."""
+
+    getter = getattr(headers, "get", None)
+    raw = getter(name) if callable(getter) else None
+    if not isinstance(raw, str) or not raw.strip().isdigit():
+        return None
+    value = int(raw.strip())
+    return value if value <= maximum else None
 
 
 def redact(text: str, secrets: tuple[str, ...] = ()) -> str:
@@ -897,7 +935,9 @@ class PorkbunClient:
     def base_url(self) -> str:
         return self._base
 
-    def _provider_error(self, payload: object, http_status: int | None) -> None:
+    def _provider_error(
+        self, payload: object, http_status: int | None, headers: Any = None
+    ) -> None:
         data = _object(
             payload,
             "error response",
@@ -925,13 +965,29 @@ class PorkbunClient:
             _string(action["hint"], "error response.next_action.hint")
             if "url" in action:
                 _string(action["url"], "error response.next_action.url")
+        ttl_remaining = data.get("ttlRemaining")
+        if not isinstance(ttl_remaining, int) or ttl_remaining > MAX_RETRY_SECONDS:
+            ttl_remaining = _header_integer(headers, "Retry-After", MAX_RETRY_SECONDS)
+        request_id = data.get("requestId", "")
+        if not isinstance(request_id, str) or not _REQUEST_ID.fullmatch(request_id):
+            request_id = ""
         if code in _AUTH_ERROR_CODES:
             error_type = PorkbunAuthenticationError
+        elif code in _RATE_LIMIT_ERROR_CODES:
+            error_type = PorkbunRateLimitError
         elif http_status == 409 and code in _IDEMPOTENCY_ERROR_CODES:
             error_type = PorkbunIdempotencyError
         else:
             error_type = PorkbunAPIError
-        raise error_type(code, http_status)
+        raise error_type(
+            code,
+            http_status,
+            ttl_remaining=ttl_remaining,
+            rate_limit_reset=_header_integer(
+                headers, "X-RateLimit-Reset", _MAX_EPOCH_SECONDS
+            ),
+            request_id=request_id,
+        )
 
     def _request(
         self,
@@ -993,12 +1049,15 @@ class PorkbunClient:
             f"{self._base}/{path}", data=data, headers=headers, method=method
         )
         replayed: str | None = None
+        response_headers: Any = None
         try:
             with self._opener.open(request, timeout=self._timeout) as response:
                 raw = response.read(MAX_RESPONSE_BYTES + 1)
                 replayed = response.headers.get("Idempotent-Replayed")
+                response_headers = response.headers
         except urllib.error.HTTPError as error:
             raw = error.read(MAX_RESPONSE_BYTES + 1)
+            response_headers = error.headers
             if len(raw) > MAX_RESPONSE_BYTES:
                 if mutation:
                     raise PorkbunMutationUncertainError(path) from None
@@ -1014,7 +1073,7 @@ class PorkbunClient:
                     f"Porkbun HTTP failure for {path}: {error.code}"
                 ) from None
             try:
-                self._provider_error(payload, error.code)
+                self._provider_error(payload, error.code, response_headers)
             except PorkbunResponseError:
                 if mutation:
                     raise PorkbunMutationUncertainError(path) from None
@@ -1041,7 +1100,7 @@ class PorkbunClient:
             ) from None
         if isinstance(payload, dict) and payload.get("status") == "ERROR":
             try:
-                self._provider_error(payload, None)
+                self._provider_error(payload, None, response_headers)
             except PorkbunResponseError:
                 if mutation:
                     raise PorkbunMutationUncertainError(path) from None
