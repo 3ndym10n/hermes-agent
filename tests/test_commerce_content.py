@@ -16,7 +16,7 @@ from commerce_content import (
 def facts():
     return {
         "contact_email": "launch@example.test",
-        "business_identity_sentence": "Silicon Current is operated by Example Trading.",
+        "business_identity_sentence": "Warp Supply is operated by Example Trading.",
         "double_opt_in": True,
         "brand_signoff": True,
         "privacy_signoff": True,
@@ -25,7 +25,7 @@ def facts():
 
 def test_content_is_claim_free_escaped_and_byte_stable(facts):
     facts["business_identity_sentence"] = (
-        "Example Trading & its owner operate Silicon Current."
+        "Example Trading & its owner operate Warp Supply."
     )
     first = build_content(facts)
     second = build_content(copy.deepcopy(facts))

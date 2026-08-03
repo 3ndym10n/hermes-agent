@@ -38,7 +38,7 @@ class FakeShopify:
 
     def __call__(self, request, timeout, limit):
         assert request.full_url == (
-            "https://silicon-current.myshopify.com/admin/api/"
+            "https://warp-supply.myshopify.com/admin/api/"
             f"{API_VERSION}/graphql.json"
         )
         assert request.method == "POST"
@@ -192,7 +192,7 @@ class FakeShopify:
 def content():
     return build_content({
         "contact_email": "launch@example.test",
-        "business_identity_sentence": "Silicon Current is operated by Example Trading.",
+        "business_identity_sentence": "Warp Supply is operated by Example Trading.",
         "double_opt_in": True,
         "brand_signoff": True,
         "privacy_signoff": True,
@@ -201,15 +201,15 @@ def content():
 
 def test_identity_domain_customer_and_explicit_fallback_capabilities():
     fake = FakeShopify()
-    client = ShopifyAdminClient("silicon-current.myshopify.com", TOKEN, transport=fake)
+    client = ShopifyAdminClient("warp-supply.myshopify.com", TOKEN, transport=fake)
 
     identity = client.shop_identity()
     assert identity["id"] == "gid://shopify/Shop/1"
     assert identity["currency"] == "AUD"
-    assert client.domain_status("siliconcurrent.com") == {
+    assert client.domain_status("warpsupply.com") == {
         "id": "gid://shopify/Domain/1",
-        "host": "siliconcurrent.com",
-        "url": "https://siliconcurrent.com",
+        "host": "warpsupply.com",
+        "url": "https://warpsupply.com",
         "ssl_enabled": True,
         "connected": True,
         "primary": True,
@@ -238,7 +238,7 @@ def test_client_credentials_exchange_is_pinned_strict_and_secret_safe():
 
     def issue_token(request, timeout, limit):
         assert request.full_url == (
-            "https://silicon-current.myshopify.com/admin/oauth/access_token"
+            "https://warp-supply.myshopify.com/admin/oauth/access_token"
         )
         assert request.method == "POST"
         assert request.get_header("Content-type") == "application/x-www-form-urlencoded"
@@ -256,7 +256,7 @@ def test_client_credentials_exchange_is_pinned_strict_and_secret_safe():
         }).encode()
 
     client = ShopifyAdminClient.from_client_credentials(
-        "silicon-current.myshopify.com",
+        "warp-supply.myshopify.com",
         client_id,
         client_secret,
         token_transport=issue_token,
@@ -287,14 +287,14 @@ def test_client_credentials_fail_closed_on_expiry_scopes_size_and_exception_text
     }
     with pytest.raises(ShopifyResponseError, match="expiry"):
         ShopifyAdminClient.from_client_credentials(
-            "silicon-current.myshopify.com",
+            "warp-supply.myshopify.com",
             "test-client-id",
             client_secret,
             token_transport=response({**base, "expires_in": 86_400}),
         )
     with pytest.raises(ShopifyAuthorizationError, match="scopes"):
         ShopifyAdminClient.from_client_credentials(
-            "silicon-current.myshopify.com",
+            "warp-supply.myshopify.com",
             "test-client-id",
             client_secret,
             token_transport=response({
@@ -308,7 +308,7 @@ def test_client_credentials_fail_closed_on_expiry_scopes_size_and_exception_text
 
     with pytest.raises(ShopifyResponseError, match="too large"):
         ShopifyAdminClient.from_client_credentials(
-            "silicon-current.myshopify.com",
+            "warp-supply.myshopify.com",
             "test-client-id",
             client_secret,
             token_transport=oversized,
@@ -319,7 +319,7 @@ def test_client_credentials_fail_closed_on_expiry_scopes_size_and_exception_text
 
     with pytest.raises(ShopifyTransportError) as captured:
         ShopifyAdminClient.from_client_credentials(
-            "silicon-current.myshopify.com",
+            "warp-supply.myshopify.com",
             "test-client-id",
             client_secret,
             token_transport=leaking,
@@ -330,7 +330,7 @@ def test_client_credentials_fail_closed_on_expiry_scopes_size_and_exception_text
 def test_test_customer_cleanup_is_prefix_bound_and_idempotent():
     fake = FakeShopify()
     fake.customer_email = "waitlist-test+job-1@example.test"
-    client = ShopifyAdminClient("silicon-current.myshopify.com", TOKEN, transport=fake)
+    client = ShopifyAdminClient("warp-supply.myshopify.com", TOKEN, transport=fake)
 
     with pytest.raises(ShopifyConfigurationError, match="waitlist-test"):
         client.delete_test_customer("ordinary-customer@example.test")
@@ -346,14 +346,14 @@ def test_test_customer_cleanup_is_prefix_bound_and_idempotent():
 def test_identity_rejects_provider_boolean_coercion():
     fake = FakeShopify()
     fake.identity["data"]["shop"]["checkoutApiSupported"] = "false"
-    client = ShopifyAdminClient("silicon-current.myshopify.com", TOKEN, transport=fake)
+    client = ShopifyAdminClient("warp-supply.myshopify.com", TOKEN, transport=fake)
     with pytest.raises(ShopifyResponseError, match="boolean"):
         client.shop_identity()
 
 
 def test_page_and_menu_upserts_are_idempotent(content):
     fake = FakeShopify()
-    client = ShopifyAdminClient("silicon-current.myshopify.com", TOKEN, transport=fake)
+    client = ShopifyAdminClient("warp-supply.myshopify.com", TOKEN, transport=fake)
     page = content["pages"]["priority-access"]
     first_page = client.upsert_page(
         handle="priority-access",
@@ -378,7 +378,7 @@ def test_page_and_menu_upserts_are_idempotent(content):
 
 def test_menu_accepts_exactly_three_levels_and_rejects_a_fourth():
     fake = FakeShopify()
-    client = ShopifyAdminClient("silicon-current.myshopify.com", TOKEN, transport=fake)
+    client = ShopifyAdminClient("warp-supply.myshopify.com", TOKEN, transport=fake)
     items = [
         {
             "title": "One",
@@ -416,12 +416,12 @@ def test_menu_accepts_exactly_three_levels_and_rejects_a_fourth():
 
 def test_theme_settings_require_exemption_and_double_apply_is_read_only():
     fake = FakeShopify()
-    client = ShopifyAdminClient("silicon-current.myshopify.com", TOKEN, transport=fake)
+    client = ShopifyAdminClient("warp-supply.myshopify.com", TOKEN, transport=fake)
     with pytest.raises(ShopifyUnsupportedError, match="exemption"):
         client.upsert_theme_settings({"current": {}})
 
     authorized = ShopifyAdminClient(
-        "silicon-current.myshopify.com",
+        "warp-supply.myshopify.com",
         TOKEN,
         transport=fake,
         theme_file_write_authorized=True,
@@ -447,7 +447,7 @@ def test_storefront_probe_is_bounded_pinned_and_detects_password_page():
         return 200, {}, b'<main class="shopify-section-main-password"></main>'
 
     client = ShopifyAdminClient(
-        "silicon-current.myshopify.com",
+        "warp-supply.myshopify.com",
         TOKEN,
         transport=FakeShopify(),
         storefront_transport=storefront,
@@ -458,7 +458,7 @@ def test_storefront_probe_is_bounded_pinned_and_detects_password_page():
         "password_protected": True,
         "body_bytes": 51,
     }
-    assert seen[0][0] == "https://silicon-current.myshopify.com/"
+    assert seen[0][0] == "https://warp-supply.myshopify.com/"
     with pytest.raises(ShopifyConfigurationError):
         client.storefront_probe("//evil.test/")
 
@@ -466,7 +466,7 @@ def test_storefront_probe_is_bounded_pinned_and_detects_password_page():
 def test_storefront_probe_rejects_script_and_cross_port_redirects():
     for location in (
         "javascript:alert(1)",
-        "https://silicon-current.myshopify.com:444/",
+        "https://warp-supply.myshopify.com:444/",
         "//evil.test/",
     ):
 
@@ -474,7 +474,7 @@ def test_storefront_probe_rejects_script_and_cross_port_redirects():
             return 302, {"Location": location}, b""
 
         client = ShopifyAdminClient(
-            "silicon-current.myshopify.com",
+            "warp-supply.myshopify.com",
             TOKEN,
             transport=FakeShopify(),
             storefront_transport=redirected,
@@ -487,13 +487,13 @@ def test_host_errors_and_secrets_fail_closed():
     with pytest.raises(ShopifyConfigurationError):
         ShopifyAdminClient("evil.test", TOKEN)
     with pytest.raises(ShopifyConfigurationError):
-        ShopifyAdminClient("silicon-current.myshopify.com.evil.test", TOKEN)
+        ShopifyAdminClient("warp-supply.myshopify.com.evil.test", TOKEN)
 
     def leaking_transport(request, timeout, limit):
         raise RuntimeError(f"upstream included {TOKEN}")
 
     client = ShopifyAdminClient(
-        "silicon-current.myshopify.com", TOKEN, transport=leaking_transport
+        "warp-supply.myshopify.com", TOKEN, transport=leaking_transport
     )
     with pytest.raises(ShopifyConfigurationError, match="domain host"):
         client.domain_status("invalid host")
@@ -516,7 +516,7 @@ def test_graphql_errors_are_typed_without_provider_text_or_response_overflow():
         }).encode()
 
     client = ShopifyAdminClient(
-        "silicon-current.myshopify.com", TOKEN, transport=denied
+        "warp-supply.myshopify.com", TOKEN, transport=denied
     )
     with pytest.raises(ShopifyAuthorizationError) as captured:
         client.shop_identity()
@@ -526,7 +526,7 @@ def test_graphql_errors_are_typed_without_provider_text_or_response_overflow():
         return 200, b"x" * (limit + 1)
 
     client = ShopifyAdminClient(
-        "silicon-current.myshopify.com", TOKEN, transport=oversized
+        "warp-supply.myshopify.com", TOKEN, transport=oversized
     )
     with pytest.raises(ShopifyResponseError, match="too large"):
         client.shop_identity()
@@ -534,7 +534,7 @@ def test_graphql_errors_are_typed_without_provider_text_or_response_overflow():
 
 def test_navigation_hard_fails_checkout_and_product_links():
     client = ShopifyAdminClient(
-        "silicon-current.myshopify.com", TOKEN, transport=FakeShopify()
+        "warp-supply.myshopify.com", TOKEN, transport=FakeShopify()
     )
     for path in ("/cart", "/checkout", "/products/card", "/collections/all"):
         with pytest.raises(ShopifyConfigurationError, match="no-checkout"):
@@ -549,7 +549,7 @@ def test_commerce_surface_sends_the_schema_faithful_document():
     """paymentSettings lives under shop; a QueryRoot selection is invalid."""
     fake = FakeShopify()
     client = ShopifyAdminClient(
-        "silicon-current.myshopify.com", TOKEN, transport=fake
+        "warp-supply.myshopify.com", TOKEN, transport=fake
     )
 
     result = client.commerce_surface()
@@ -569,7 +569,7 @@ def test_commerce_surface_reports_wallets_without_inferring_a_provider():
     fake = FakeShopify()
     fake.digital_wallets = ["SHOPIFY_PAY", "APPLE_PAY"]
     client = ShopifyAdminClient(
-        "silicon-current.myshopify.com", TOKEN, transport=fake
+        "warp-supply.myshopify.com", TOKEN, transport=fake
     )
 
     result = client.commerce_surface()
@@ -584,7 +584,7 @@ def test_commerce_surface_reports_wallets_without_inferring_a_provider():
 def test_commerce_surface_reports_the_zero_checkout_truths():
     fake = FakeShopify()
     client = ShopifyAdminClient(
-        "silicon-current.myshopify.com", TOKEN, transport=fake
+        "warp-supply.myshopify.com", TOKEN, transport=fake
     )
 
     assert client.commerce_surface() == {
@@ -598,7 +598,7 @@ def test_commerce_surface_reports_a_nonzero_product_count():
     fake = FakeShopify()
     fake.products_count = 3
     client = ShopifyAdminClient(
-        "silicon-current.myshopify.com", TOKEN, transport=fake
+        "warp-supply.myshopify.com", TOKEN, transport=fake
     )
 
     assert client.commerce_surface() == {
@@ -611,7 +611,7 @@ def test_commerce_surface_rejects_a_nonsense_product_count():
     fake = FakeShopify()
     fake.products_count = -1
     client = ShopifyAdminClient(
-        "silicon-current.myshopify.com", TOKEN, transport=fake
+        "warp-supply.myshopify.com", TOKEN, transport=fake
     )
 
     with pytest.raises(ShopifyResponseError):

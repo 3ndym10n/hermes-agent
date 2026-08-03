@@ -280,12 +280,12 @@ def test_facts_are_append_only_versioned_and_latest_is_readable(tmp_path):
 
     first = store.record_facts(
         job["job_id"],
-        {"brand_name": "Silicon Current", "currency": "GBP"},
+        {"brand_name": "Warp Supply", "currency": "GBP"},
         expected_version=0,
         actor="cal",
         now=NOW + timedelta(minutes=1),
     )
-    second_facts = {"brand_name": "Silicon Current", "currency": "USD"}
+    second_facts = {"brand_name": "Warp Supply", "currency": "USD"}
     second = store.record_facts(
         job["job_id"],
         second_facts,
@@ -303,7 +303,7 @@ def test_facts_are_append_only_versioned_and_latest_is_readable(tmp_path):
         if event["event_type"] == "facts_answered"
     ]
     assert [event["evidence"]["facts"] for event in fact_events] == [
-        {"brand_name": "Silicon Current", "currency": "GBP"},
+        {"brand_name": "Warp Supply", "currency": "GBP"},
         second_facts,
     ]
 
@@ -326,7 +326,7 @@ def test_facts_reject_forbidden_data_and_stale_versions_without_changes(tmp_path
     with pytest.raises(commerce.CommerceStaleVersionError, match="stale_row_version"):
         store.record_facts(
             job["job_id"],
-            {"brand_name": "Silicon Current"},
+            {"brand_name": "Warp Supply"},
             expected_version=7,
             actor="cal",
             now=NOW,

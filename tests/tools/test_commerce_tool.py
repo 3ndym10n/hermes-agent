@@ -190,7 +190,7 @@ def test_answer_facts_completes_only_the_active_facts_gate_and_worker_resumes(
         job_id=started["job_id"],
         facts={
             "contact_email": "ops@example.invalid",
-            "business_identity_sentence": "Silicon Current test operator",
+            "business_identity_sentence": "Warp Supply test operator",
             "double_opt_in": True,
             "brand_signoff": True,
             "privacy_signoff": True,

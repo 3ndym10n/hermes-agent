@@ -89,7 +89,7 @@ def approved_record(fact_code: str, fact_value, **overrides) -> dict:
     record = {
         "lifecycle_state": "approved",
         "record_type": "commerce_launch_fact",
-        "scope": "silicon_current_v1",
+        "scope": "warp_supply_v1",
         "provenance": "approved packet fact-1",
         "fact_code": fact_code,
         "fact_value": fact_value,
@@ -435,7 +435,7 @@ def test_only_typed_current_approved_launch_fact_metadata_is_accepted():
     records = [
         approved_record(
             "business_identity_sentence",
-            "Silicon Current is operated by Example Trading.",
+            "Warp Supply is operated by Example Trading.",
         ),
         approved_record("business_identity", "legacy alias must not satisfy the gate"),
         approved_record("privacy_signoff", True, lifecycle_state="promoted"),
@@ -457,7 +457,7 @@ def test_only_typed_current_approved_launch_fact_metadata_is_accepted():
     ]
 
     assert commerce._approved_launch_facts(records) == {
-        "business_identity_sentence": "Silicon Current is operated by Example Trading.",
+        "business_identity_sentence": "Warp Supply is operated by Example Trading.",
         "privacy_signoff": True,
     }
 
@@ -496,7 +496,7 @@ def test_approved_fact_loader_uses_existing_intake_config_and_bridge_token(
     ]
     task_description = calls[0]["task_description"]
     assert "record_type commerce_launch_fact" in task_description
-    assert "scope silicon_current_v1" in task_description
+    assert "scope warp_supply_v1" in task_description
     assert "Do not infer from prose" in task_description
 
     def failed_retrieval(**_kwargs):
@@ -518,7 +518,7 @@ def test_local_job_facts_override_approved_retrieved_facts(tmp_path):
     )
     retrieved = {
         "contact_email": "retrieved@example.com",
-        "business_identity_sentence": "Silicon Current is operated by Example Trading.",
+        "business_identity_sentence": "Warp Supply is operated by Example Trading.",
         "double_opt_in": True,
         "brand_signoff": True,
         "privacy_signoff": True,
@@ -829,7 +829,7 @@ def test_verified_fact_gate_auto_resumes_without_fabricated_done(tmp_path):
 
     facts.update({
         "contact_email": "launch@example.com",
-        "business_identity_sentence": "Silicon Current is operated by Example Trading.",
+        "business_identity_sentence": "Warp Supply is operated by Example Trading.",
         "double_opt_in": True,
         "brand_signoff": True,
         "privacy_signoff": True,
@@ -992,7 +992,7 @@ def test_plan_replacement_and_receipt_control_are_durable(tmp_path):
     initial = {"provider_account": "fake-provider", "steps": [discovery]}
     replacement = {
         "provider_account": "fake-provider",
-        "domain": "siliconcurrent.com",
+        "domain": "warpsupply.com",
         "steps": [discovery, final],
     }
     receipts = []
@@ -1024,7 +1024,7 @@ def test_plan_replacement_and_receipt_control_are_durable(tmp_path):
 
     current = store.get_job(job["job_id"])
     assert current["current_state"] == "completed"
-    assert current["plan"]["domain"] == "siliconcurrent.com"
+    assert current["plan"]["domain"] == "warpsupply.com"
     assert receipts == [(job["job_id"], {"verification": "all_green"})]
     actions = store.list_actions(job["job_id"])
     discovery_action = next(
@@ -1095,7 +1095,7 @@ def _production_shopify(**overrides):
     fake = FakeShopify()
     fake.identity["data"]["shop"].update(overrides.pop("identity", {}))
     client = ShopifyAdminClient(
-        "silicon-current.myshopify.com", TOKEN, transport=fake
+        "warp-supply.myshopify.com", TOKEN, transport=fake
     )
     for name, value in overrides.items():
         setattr(fake, name, value)
@@ -1172,7 +1172,7 @@ def _record_facts(store, job_id):
         {
             "contact_email": "launch@example.test",
             "business_identity_sentence": (
-                "Silicon Current is operated by Example Trading."
+                "Warp Supply is operated by Example Trading."
             ),
             "double_opt_in": True,
             "brand_signoff": True,
@@ -1322,7 +1322,7 @@ def test_production_final_verification_completes_and_writes_a_receipt(tmp_path):
     _record_facts(store, job["job_id"])
     facts = store.latest_facts(job["job_id"])
     package = build_content(facts)
-    domain = "siliconcurrent.com"
+    domain = "warpsupply.com"
     approved = package["pages"]["priority-access"]["body_html"]
     root = f"<html><body>{approved}</body></html>".encode()
     pages = {
@@ -1371,7 +1371,7 @@ def test_production_final_verification_completes_and_writes_a_receipt(tmp_path):
         "content_sha256": content_fingerprint(package),
         "shopify": {
             "shop_id": "gid://shopify/Shop/1",
-            "myshopify_domain": "silicon-current.myshopify.com",
+            "myshopify_domain": "warp-supply.myshopify.com",
             "plan": "Basic",
         },
     }

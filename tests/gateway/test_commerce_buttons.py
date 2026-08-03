@@ -299,7 +299,7 @@ def _governance_job() -> dict[str, object]:
         "requester": "telegram:4242",
         "plan_fingerprint": GOVERNANCE_PLAN_FINGERPRINT,
         "plan": {
-            "domain": "siliconcurrent.com",
+            "domain": "warpsupply.com",
             "prices": {
                 "registration_usd_cents": 1200,
                 "renewal_usd_cents": 1300,
@@ -324,7 +324,7 @@ def _governance_action() -> dict[str, object]:
             "step_id": "register-domain",
             "provider_idempotency_key": "register-domain",
             "input": {
-                "domain": "siliconcurrent.com",
+                "domain": "warpsupply.com",
                 "cost_usd_cents": 1200,
                 "currency": "USD",
                 "quote_timestamp": "2026-08-02T12:00:00+00:00",
@@ -355,7 +355,7 @@ def _checkout_target() -> dict[str, object]:
     return {
         "merchant_id": "porkbun.com",
         "product_kind": "domain_registration",
-        "product_id": "siliconcurrent.com",
+        "product_id": "warpsupply.com",
         "session_requirement": "authenticated",
     }
 
@@ -375,7 +375,7 @@ def _recurrence() -> dict[str, object]:
 
 def _checkout_terms() -> dict[str, object]:
     return {
-        "product_or_service": "siliconcurrent.com domain registration",
+        "product_or_service": "warpsupply.com domain registration",
         "quantity": 1,
         "quoted_subtotal": "12.00",
         "tax": "0.00",
@@ -463,7 +463,7 @@ class FakeGovernanceBridges:
                 "policy_name": "commerce_launch_v1",
                 "policy_version": "1",
                 "canonical_merchant_domain": "porkbun.com",
-                "approved_item": "siliconcurrent.com domain registration",
+                "approved_item": "warpsupply.com domain registration",
                 "quantity": 1,
                 "maximum_total": "12.00",
                 "currency": "USD",
@@ -510,7 +510,7 @@ class FakeGovernanceBridges:
             "state": "claimed",
             "audience": "virgil_website_pilot",
             "canonical_merchant_domain": "porkbun.com",
-            "approved_item": "siliconcurrent.com domain registration",
+            "approved_item": "warpsupply.com domain registration",
             "quantity": 1,
             "maximum_total": "12.00",
             "currency": "USD",
@@ -530,13 +530,13 @@ class FakeGovernanceBridges:
             "purchase_approval": {
                 "proposal_id": PROPOSAL_ID,
                 "purpose": (
-                    "Register siliconcurrent.com and connect it to the "
+                    "Register warpsupply.com and connect it to the "
                     "Shopify waitlist store."
                 ),
                 "merchant": "Porkbun",
                 "merchant_domain": "porkbun.com",
                 "checkout_target": _checkout_target(),
-                "item": "siliconcurrent.com domain registration",
+                "item": "warpsupply.com domain registration",
                 "quantity": 1,
                 "final_quoted_amount": {"amount": "12.00", "currency": "USD"},
                 "tax": {"amount": "0.00", "currency": "USD"},
@@ -642,7 +642,7 @@ def test_governance_approve_revalidates_then_claims_and_returns_safe_evidence(
     }
     assert result["approved_amount_usd_cents"] == 1200
     assert result["approval_reference"] == APPROVAL_REFERENCE
-    assert result["domain"] == "siliconcurrent.com"
+    assert result["domain"] == "warpsupply.com"
     assert result["dns_records"] == [
         {"type": "A", "name": "", "content": "23.227.38.65"},
         {"type": "AAAA", "name": "", "content": "2620:127:f00f:5::"},
@@ -675,7 +675,7 @@ def test_governance_deny_creates_no_proposal():
 
     assert result == {
         "approval_granted": False,
-        "domain": "siliconcurrent.com",
+        "domain": "warpsupply.com",
         "action_fingerprint": GOVERNANCE_ACTION_FINGERPRINT,
     }
     assert fake.operator_actions == []
@@ -910,7 +910,7 @@ def test_record_completion_reports_exact_terms_and_returns_receipt_refs():
     assert context["ticket_id"] == TICKET_ID
     assert context["final_amount"] == "12.00"
     assert context["currency"] == "USD"
-    assert context["receipt"] == {"order_id": "1234", "domain": "siliconcurrent.com"}
+    assert context["receipt"] == {"order_id": "1234", "domain": "warpsupply.com"}
     # The registrar response never travels to the money authority verbatim.
     assert set(context["receipt"]) == {"order_id", "domain"}
 

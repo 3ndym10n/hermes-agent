@@ -19,7 +19,7 @@ from registrar_porkbun import PorkbunMutationUncertainError
 
 FACTS = {
     "contact_email": "hello@example.com",
-    "business_identity_sentence": "Silicon Current is operated by Example Trading.",
+    "business_identity_sentence": "Warp Supply is operated by Example Trading.",
     "double_opt_in": True,
     "brand_signoff": True,
     "privacy_signoff": True,
@@ -140,7 +140,7 @@ class Shopify:
     def shop_identity(self):
         return {
             "id": "gid://shopify/Shop/1",
-            "myshopify_domain": "silicon-current.myshopify.com",
+            "myshopify_domain": "warp-supply.myshopify.com",
             "currency": "AUD",
             "timezone": "Australia/Sydney",
             "plan": "Basic",
@@ -235,7 +235,7 @@ def test_discovery_expands_one_read_into_exact_governed_packet(tmp_path):
     assert provider.checks == list(CANDIDATE_DOMAINS)
     assert len(provider.checks) == 10
     assert provider.dry_runs == 1
-    assert current["plan"]["recommendation"] == "siliconcurrent.com"
+    assert current["plan"]["recommendation"] == "warpsupply.com"
     assert len(current["plan"]["availability"]) == 10
     assert current["plan"]["prices"] == {
         "registration_usd_cents": 1200,
@@ -255,7 +255,7 @@ def test_discovery_expands_one_read_into_exact_governed_packet(tmp_path):
         "auto_renew",
         "whois_privacy",
     }
-    assert request["domain"] == "siliconcurrent.com"
+    assert request["domain"] == "warpsupply.com"
     assert request["cost_usd_cents"] == 1200
     assert request["renewal_usd_cents"] == 1425
     assert request["auto_renew"] is request["whois_privacy"] is True
@@ -370,7 +370,7 @@ def test_verification_hash_binds_publication_and_final_receipt_inputs(tmp_path):
     current, _provider, _handlers = expanded(tmp_path)
     receipt_facts = {
         "domain": {
-            "name": "siliconcurrent.com",
+            "name": "warpsupply.com",
             "registrar": "porkbun",
             "order_id": "1234",
             "spend": {"amount_usd_cents": 1200, "display": "12.00"},
@@ -383,12 +383,12 @@ def test_verification_hash_binds_publication_and_final_receipt_inputs(tmp_path):
             "whois_privacy": True,
         },
         "shopify": {
-            "myshopify_domain": "silicon-current.myshopify.com",
+            "myshopify_domain": "warp-supply.myshopify.com",
             "shop_id": "gid://shopify/Shop/1",
             "plan": "Basic",
-            "admin_url": "https://admin.shopify.com/store/silicon-current",
+            "admin_url": "https://admin.shopify.com/store/warp-supply",
         },
-        "public_url": "https://siliconcurrent.com/",
+        "public_url": "https://warpsupply.com/",
         "dns": {"status": "propagated", "records": ["A", "AAAA", "CNAME www"]},
         "waitlist_test": {
             "result": "pass",
@@ -456,7 +456,7 @@ def test_every_emitted_human_gate_has_a_provider_truth_verifier():
     )
     current = {
         "plan": {
-            "domain": "siliconcurrent.com",
+            "domain": "warpsupply.com",
             "prices": {"registration_usd_cents": 1200},
         }
     }
@@ -481,7 +481,7 @@ def test_every_emitted_human_gate_has_a_provider_truth_verifier():
 def test_mutation_reconcilers_use_only_provider_truth():
     porkbun = Porkbun()
     porkbun.account_domains = [
-        {"domain": "siliconcurrent.com", "autoRenew": 1, "whoisPrivacy": 1}
+        {"domain": "warpsupply.com", "autoRenew": 1, "whoisPrivacy": 1}
     ]
     for index, record in enumerate(SHOPIFY_DNS_BUNDLE, start=1):
         porkbun.records.append({
@@ -497,10 +497,10 @@ def test_mutation_reconcilers_use_only_provider_truth():
         clock=lambda: NOW,
     )
     registration = {
-        "request": {"input": {"domain": "siliconcurrent.com"}},
+        "request": {"input": {"domain": "warpsupply.com"}},
         "dispatched_at": "2026-08-02T11:00:00Z",
     }
-    dns = {"request": {"input": {"domain": "siliconcurrent.com"}}}
+    dns = {"request": {"input": {"domain": "warpsupply.com"}}}
 
     assert set(reconcilers) == {
         "porkbun_register_domain",
@@ -581,7 +581,7 @@ def test_registration_reconciliation_restores_cogitator_truth(tmp_path):
 
     # 4-5. Reconciliation confirms the domain and retries the report.
     provider.account_domains = [
-        {"domain": "siliconcurrent.com", "autoRenew": 1, "whoisPrivacy": 1}
+        {"domain": "warpsupply.com", "autoRenew": 1, "whoisPrivacy": 1}
     ]
     reconcilers = production_reconcilers(
         porkbun_factory=lambda: provider,
@@ -615,7 +615,7 @@ def test_registration_stays_parked_when_cogitator_cannot_be_reconciled(tmp_path)
     porkbun = Porkbun()
     current, provider, _handlers = expanded(tmp_path, porkbun=porkbun)
     provider.account_domains = [
-        {"domain": "siliconcurrent.com", "autoRenew": 1, "whoisPrivacy": 1}
+        {"domain": "warpsupply.com", "autoRenew": 1, "whoisPrivacy": 1}
     ]
 
     def always_fails(**_kwargs):
@@ -630,7 +630,7 @@ def test_registration_stays_parked_when_cogitator_cannot_be_reconciled(tmp_path)
     verdict = reconcilers["porkbun_register_domain"](
         current,
         {
-            "request": {"input": {"domain": "siliconcurrent.com"}},
+            "request": {"input": {"domain": "warpsupply.com"}},
             "dispatched_at": "2026-08-02T11:00:00Z",
             "result": {"order_id": "1234", "amount_usd_cents": 1200},
         },

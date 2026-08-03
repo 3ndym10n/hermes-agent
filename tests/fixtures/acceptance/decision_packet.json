@@ -26,68 +26,68 @@
   "availability": [
     {
       "available": true,
-      "domain": "siliconcurrent.com",
+      "domain": "warpsupply.com",
       "registration_usd_cents": 1198,
       "renewal_usd_cents": 1425
     },
     {
       "available": true,
-      "domain": "siliconcurrent.net",
+      "domain": "warpsupply.net",
       "registration_usd_cents": 1198,
       "renewal_usd_cents": 1550
     },
     {
       "available": true,
-      "domain": "siliconcurrentgpu.com",
+      "domain": "warpsupplygpu.com",
       "registration_usd_cents": 1198,
       "renewal_usd_cents": 1425
     },
     {
       "available": true,
-      "domain": "siliconcurrentau.com",
+      "domain": "warpsupplyau.com",
       "registration_usd_cents": 1198,
       "renewal_usd_cents": 1425
     },
     {
       "available": true,
-      "domain": "siliconcurrenttech.com",
+      "domain": "warpsupplytech.com",
       "registration_usd_cents": 1198,
       "renewal_usd_cents": 1425
     },
     {
       "available": true,
-      "domain": "siliconcurrentstore.com",
+      "domain": "warpsupplyhardware.com",
       "registration_usd_cents": 1198,
       "renewal_usd_cents": 1425
     },
     {
       "available": true,
-      "domain": "siliconcurrentshop.com",
+      "domain": "getwarpsupply.com",
       "registration_usd_cents": 1198,
       "renewal_usd_cents": 1425
     },
     {
       "available": true,
-      "domain": "siliconcurrenthardware.com",
+      "domain": "joinwarpsupply.com",
       "registration_usd_cents": 1198,
       "renewal_usd_cents": 1425
     },
     {
       "available": true,
-      "domain": "getsiliconcurrent.com",
+      "domain": "shopwarpsupply.com",
       "registration_usd_cents": 1198,
       "renewal_usd_cents": 1425
     },
     {
       "available": true,
-      "domain": "joinsiliconcurrent.com",
+      "domain": "warpsupplystore.com",
       "registration_usd_cents": 1198,
       "renewal_usd_cents": 1425
     }
   ],
   "dry_run": {
     "cost_usd_cents": 1198,
-    "domain": "siliconcurrent.com",
+    "domain": "warpsupply.com",
     "sufficient_funds": true,
     "would_succeed": true
   },
@@ -104,7 +104,7 @@
     "renewal_usd_cents": 1425,
     "whois_privacy": true
   },
-  "recommendation": "siliconcurrent.com",
+  "recommendation": "warpsupply.com",
   "schema_version": 1,
   "workflow": "virgil_ecommerce_v1"
 }
