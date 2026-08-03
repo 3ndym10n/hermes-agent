@@ -18,11 +18,15 @@ from commerce_content import build_content, content_fingerprint
 from commerce_jobs import canonical_json, reject_forbidden_data
 from hermes_constants import get_hermes_home
 from registrar_porkbun import (
+    MAX_RETRY_SECONDS,
     PorkbunAPIError,
     PorkbunClient,
     PorkbunConfigurationError,
     PorkbunIdempotencyError,
     PorkbunMutationUncertainError,
+    PorkbunRateLimitError,
+    PorkbunResponseError,
+    PorkbunTransportError,
 )
 from shopify_admin import ShopifyAdminClient
 from utils import atomic_json_write
@@ -68,6 +72,9 @@ _PROTECTED_DNS_TYPES = frozenset({
 
 Verify = Callable[[Mapping[str, Any], Any, Mapping[str, Any], str], Mapping[str, Any]]
 Publish = Callable[[Mapping[str, Any], Any], Mapping[str, Any]]
+
+# Used only when the provider declares a rate limit without a usable window.
+DEFAULT_RATE_LIMIT_SECONDS = 900
 
 
 def _error(
@@ -170,6 +177,32 @@ def _iso_z(now: datetime) -> str:
     )
 
 
+def _porkbun_evidence(
+    error: PorkbunAPIError, now: datetime, *, retry: bool = False
+) -> dict[str, Any]:
+    """Safe provider facts for the job database.
+
+    Only the validated scalars the adapter already typed survive here: the
+    stable provider code, the HTTP status, the provider's own retry window and
+    its request id. Headers, bodies and exception prose never reach a caller.
+    """
+
+    safe: dict[str, Any] = {"provider_error_code": error.code}
+    if isinstance(error.http_status, int):
+        safe["http_status"] = error.http_status
+    if error.request_id:
+        safe["provider_request_id"] = error.request_id
+    if not retry:
+        return safe
+    seconds = error.ttl_remaining
+    if seconds is None and error.rate_limit_reset is not None:
+        seconds = error.rate_limit_reset - int(now.timestamp())
+    if seconds is None or not 0 <= seconds <= MAX_RETRY_SECONDS:
+        seconds = DEFAULT_RATE_LIMIT_SECONDS
+    safe["retry_after"] = _iso_z(now + timedelta(seconds=seconds))
+    return safe
+
+
 def _action_input(action: Mapping[str, Any]) -> dict[str, Any]:
     request = action.get("request")
     if not isinstance(request, Mapping):
@@ -212,25 +245,34 @@ def _write_evidence(
 ) -> str:
     if not _JOB_ID.fullmatch(job_id) or not _SAFE_LABEL.fullmatch(label):
         raise _error("evidence_reference_invalid")
-    reject_forbidden_data(payload, "commerce_evidence")
-    encoded = canonical_json(payload)
+    # Every handler writes evidence through here, so both guards live here
+    # rather than in each caller: a forbidden payload and an unwritable
+    # evidence root are distinct, nameable failures, not "the provider failed".
+    try:
+        reject_forbidden_data(payload, "commerce_evidence")
+        encoded = canonical_json(payload)
+    except Exception:
+        raise _error("evidence_payload_forbidden") from None
     if _EMAIL.search(encoded):
         raise _error("evidence_pii_forbidden")
     digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
-    root.mkdir(parents=True, exist_ok=True, mode=0o700)
-    if root.is_symlink() or not root.is_dir():
-        raise _error("evidence_root_unsafe")
-    os.chmod(root, 0o700)
-    job_root = root / job_id
-    job_root.mkdir(mode=0o700, exist_ok=True)
-    if job_root.is_symlink() or not job_root.is_dir():
-        raise _error("evidence_root_unsafe")
-    os.chmod(job_root, 0o700)
     filename = f"{label}-{digest[:16]}.json"
-    target = job_root / filename
-    if target.is_symlink() or (target.exists() and not target.is_file()):
-        raise _error("evidence_path_unsafe")
-    atomic_json_write(target, payload, mode=0o600, sort_keys=True, allow_nan=False)
+    try:
+        root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if root.is_symlink() or not root.is_dir():
+            raise _error("evidence_root_unsafe")
+        os.chmod(root, 0o700)
+        job_root = root / job_id
+        job_root.mkdir(mode=0o700, exist_ok=True)
+        if job_root.is_symlink() or not job_root.is_dir():
+            raise _error("evidence_root_unsafe")
+        os.chmod(job_root, 0o700)
+        target = job_root / filename
+        if target.is_symlink() or (target.exists() and not target.is_file()):
+            raise _error("evidence_path_unsafe")
+        atomic_json_write(target, payload, mode=0o600, sort_keys=True, allow_nan=False)
+    except OSError:
+        raise _error("evidence_write_failed") from None
     return f"evidence/{job_id}/{filename}"
 
 
@@ -562,6 +604,10 @@ def production_handlers(
     evidence_root: str | Path | None = None,
 ) -> dict[str, Callable[[Mapping[str, Any], Mapping[str, Any]], Mapping[str, Any]]]:
     """Build operator handlers; real Shopify auth is client-credentials env only."""
+    # Imported here, not at module scope, for the same reason `_error` does:
+    # commerce_operator must stay able to import this module without a cycle.
+    from commerce_operator import ProviderStepError
+
     root = (
         Path(evidence_root)
         if evidence_root is not None
@@ -625,20 +671,28 @@ def production_handlers(
             }
             pricing = client.get_default_pricing()
             account_domains = client.list_domains()
-            table = []
+            # Candidates stay in their approved order, but the first available
+            # one wins and ends the scan. Every further check spends a live
+            # rate-limit token on a domain this launch will never buy, and the
+            # limit it exhausts is the same one the purchase leg needs.
+            table: list[dict[str, Any]] = []
+            selected: dict[str, Any] | None = None
             for index, domain in enumerate(CANDIDATE_DOMAINS):
+                if index:
+                    sleep(check_interval)
                 checked = client.check_domain(domain)["response"]
                 tld = domain.partition(".")[2]
                 renewal = pricing["pricing"][tld]["renewal"]
-                table.append({
+                row: dict[str, Any] = {
                     "domain": domain,
                     "available": checked["avail"] == "yes",
                     "registration_usd_cents": _cents(checked["price"]),
                     "renewal_usd_cents": _cents(renewal),
-                })
-                if index + 1 < len(CANDIDATE_DOMAINS):
-                    sleep(check_interval)
-            selected = next((row for row in table if row["available"]), None)
+                }
+                table.append(row)
+                if row["available"]:
+                    selected = row
+                    break
             if selected is None:
                 raise _error("no_candidate_domain_available")
             dry_run = client.create_domain(
@@ -648,28 +702,36 @@ def production_handlers(
             )
         except PorkbunMutationUncertainError:
             raise _error("porkbun_dry_run_invalid") from None
-        except Exception as exc:
-            from commerce_operator import ProviderStepError
-
-            if isinstance(exc, ProviderStepError):
-                raise
-            code = (
-                "porkbun_credentials_missing"
-                if isinstance(exc, PorkbunConfigurationError)
-                else "porkbun_discovery_failed"
-            )
-            if code == "porkbun_credentials_missing":
-                ref = evidence(job, "porkbun_credentials_gate", {"configured": False})
-                return {
-                    "evidence_ref": ref,
-                    "_human_gate": _human_gate(
-                        "porkbun_credentials",
-                        "Create or restrict the Porkbun API key, then stage it in the mode-0600 credentials file.",
-                        "porkbun.ping",
-                        "https://porkbun.com/account/api",
-                    ),
-                }
-            raise _error(code) from None
+        except PorkbunConfigurationError:
+            ref = evidence(job, "porkbun_credentials_gate", {"configured": False})
+            return {
+                "evidence_ref": ref,
+                "_human_gate": _human_gate(
+                    "porkbun_credentials",
+                    "Create or restrict the Porkbun API key, then stage it in the mode-0600 credentials file.",
+                    "porkbun.ping",
+                    "https://porkbun.com/account/api",
+                ),
+            }
+        except PorkbunRateLimitError as exc:
+            raise _error(
+                "porkbun_rate_limited",
+                evidence=_porkbun_evidence(exc, clock(), retry=True),
+            ) from None
+        except PorkbunAPIError as exc:
+            raise _error(
+                "porkbun_read_failed", evidence=_porkbun_evidence(exc, clock())
+            ) from None
+        except PorkbunResponseError:
+            raise _error("porkbun_response_invalid") from None
+        except PorkbunTransportError:
+            raise _error("porkbun_read_failed") from None
+        except ProviderStepError:
+            raise
+        except Exception:
+            # A malformed provider payload surfaces here as a KeyError or a
+            # TypeError while reading it, not as a read failure.
+            raise _error("porkbun_response_invalid") from None
         if (
             dry_run.get("domain") != selected["domain"]
             or dry_run.get("cost") != selected["registration_usd_cents"]
@@ -693,17 +755,22 @@ def production_handlers(
             },
         }
         ref = evidence(job, "porkbun_discovery", payload)
-        plan = _expanded_plan(
-            job,
-            table=table,
-            domain=selected["domain"],
-            registration_cents=selected["registration_usd_cents"],
-            renewal_cents=selected["renewal_usd_cents"],
-            quote_timestamp=_iso_z(now),
-            renewal_date=renewal.isoformat(),
-            cancellation_deadline=(renewal - timedelta(days=30)).isoformat(),
-            discovery_evidence=ref,
-        )
+        try:
+            plan = _expanded_plan(
+                job,
+                table=table,
+                domain=selected["domain"],
+                registration_cents=selected["registration_usd_cents"],
+                renewal_cents=selected["renewal_usd_cents"],
+                quote_timestamp=_iso_z(now),
+                renewal_date=renewal.isoformat(),
+                cancellation_deadline=(renewal - timedelta(days=30)).isoformat(),
+                discovery_evidence=ref,
+            )
+        except ProviderStepError:
+            raise
+        except Exception:
+            raise _error("porkbun_plan_replacement_failed") from None
         result: dict[str, Any] = {
             "evidence_ref": ref,
             "candidate_count": len(table),

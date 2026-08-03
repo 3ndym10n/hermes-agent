@@ -14,7 +14,7 @@ from commerce_workflow import (
     production_plan,
     production_reconcilers,
 )
-from registrar_porkbun import PorkbunMutationUncertainError
+from registrar_porkbun import PorkbunMutationUncertainError, PorkbunRateLimitError
 
 
 FACTS = {
@@ -198,20 +198,24 @@ def action(step, *, approval_status=None):
     return value
 
 
+def discovery_handlers(tmp_path, provider, *, store=None, sleeps=None):
+    return production_handlers(
+        store or Store(),
+        porkbun_factory=lambda: provider,
+        shopify_factory=lambda: Shopify(),
+        facts_loader=lambda _job: FACTS,
+        clock=lambda: NOW,
+        sleep=(sleeps.append if sleeps is not None else lambda _seconds: None),
+        evidence_root=tmp_path,
+    )
+
+
 def expanded(tmp_path, porkbun=None):
     provider = porkbun or Porkbun()
     store = Store()
     current = job()
     current["plan"] = production_plan(current, FACTS)
-    handlers = production_handlers(
-        store,
-        porkbun_factory=lambda: provider,
-        shopify_factory=lambda: Shopify(),
-        facts_loader=lambda _job: FACTS,
-        clock=lambda: NOW,
-        sleep=lambda _seconds: None,
-        evidence_root=tmp_path,
-    )
+    handlers = discovery_handlers(tmp_path, provider, store=store)
     discovery = current["plan"]["steps"][0]
     result = handlers["porkbun_discover"](current, action(discovery))
     current["plan"] = result["_replace_plan"]
@@ -232,11 +236,17 @@ def find_step(current, step_id):
 def test_discovery_expands_one_read_into_exact_governed_packet(tmp_path):
     current, provider, _handlers = expanded(tmp_path)
 
-    assert provider.checks == list(CANDIDATE_DOMAINS)
-    assert len(provider.checks) == 10
+    assert provider.checks == ["warpsupply.com"]
     assert provider.dry_runs == 1
     assert current["plan"]["recommendation"] == "warpsupply.com"
-    assert len(current["plan"]["availability"]) == 10
+    assert current["plan"]["availability"] == [
+        {
+            "domain": "warpsupply.com",
+            "available": True,
+            "registration_usd_cents": 1200,
+            "renewal_usd_cents": 1425,
+        }
+    ]
     assert current["plan"]["prices"] == {
         "registration_usd_cents": 1200,
         "renewal_usd_cents": 1425,
@@ -267,6 +277,118 @@ def test_discovery_expands_one_read_into_exact_governed_packet(tmp_path):
         "verification_sha256",
     }
     assert len(CommerceOperator._normalize_plan(current["plan"])["steps"]) == 15
+
+
+def test_preferred_available_domain_costs_exactly_one_availability_call(tmp_path):
+    provider = Porkbun()
+    sleeps: list[float] = []
+    current = job()
+    current["plan"] = production_plan(current, FACTS)
+    handlers = discovery_handlers(tmp_path, provider, sleeps=sleeps)
+
+    result = handlers["porkbun_discover"](current, action(current["plan"]["steps"][0]))
+
+    assert CANDIDATE_DOMAINS[0] == "warpsupply.com"
+    assert provider.checks == ["warpsupply.com"]
+    assert sleeps == []
+    assert result["candidate_count"] == 1
+    assert result["recommended_domain"] == "warpsupply.com"
+
+
+def test_discovery_walks_on_only_while_candidates_are_unavailable(tmp_path):
+    class FirstTaken(Porkbun):
+        def check_domain(self, domain):
+            self.checks.append(domain)
+            available = domain != "warpsupply.com"
+            return {
+                "response": {
+                    "avail": "yes" if available else "no",
+                    "price": self.price,
+                }
+            }
+
+    current, provider, _handlers = expanded(tmp_path, porkbun=FirstTaken())
+
+    assert provider.checks == ["warpsupply.com", "warpsupply.net"]
+    assert current["plan"]["recommendation"] == "warpsupply.net"
+    assert [row["available"] for row in current["plan"]["availability"]] == [
+        False,
+        True,
+    ]
+    assert current["plan"]["prices"]["renewal_usd_cents"] == 1550
+
+
+def test_rate_limited_check_is_typed_and_carries_only_safe_retry_facts(tmp_path):
+    class Limited(Porkbun):
+        def check_domain(self, domain):
+            self.checks.append(domain)
+            error = PorkbunRateLimitError(
+                "RATE_LIMIT_EXCEEDED",
+                429,
+                ttl_remaining=45,
+                request_id="req_abc",
+            )
+            error.args = ("apikey=pk1_live_leak raw body {...}",)
+            raise error
+
+    provider = Limited()
+    current = job()
+    current["plan"] = production_plan(current, FACTS)
+    handlers = discovery_handlers(tmp_path, provider)
+
+    with pytest.raises(ProviderStepError) as caught:
+        handlers["porkbun_discover"](current, action(current["plan"]["steps"][0]))
+
+    assert caught.value.code == "porkbun_rate_limited"
+    assert caught.value.evidence == {
+        "provider_error_code": "RATE_LIMIT_EXCEEDED",
+        "http_status": 429,
+        "provider_request_id": "req_abc",
+        "retry_after": "2026-08-02T12:00:45Z",
+    }
+    assert "pk1_live_leak" not in str(caught.value.evidence)
+    assert provider.checks == ["warpsupply.com"]
+
+
+def test_rate_limit_without_a_declared_window_still_records_a_retry_time(tmp_path):
+    class Limited(Porkbun):
+        def check_domain(self, domain):
+            self.checks.append(domain)
+            raise PorkbunRateLimitError("RATE_LIMIT_EXCEEDED", 429)
+
+    current = job()
+    current["plan"] = production_plan(current, FACTS)
+    handlers = discovery_handlers(tmp_path, Limited())
+
+    with pytest.raises(ProviderStepError) as caught:
+        handlers["porkbun_discover"](current, action(current["plan"]["steps"][0]))
+
+    assert caught.value.evidence["retry_after"] == "2026-08-02T12:15:00Z"
+    assert "provider_request_id" not in caught.value.evidence
+
+
+def test_expanded_plan_failure_gets_its_own_stage_code(tmp_path):
+    current = job()
+    current["plan"] = production_plan(current, FACTS)
+    discovery = current["plan"]["steps"][0]
+    del current["plan"]["content_sha256"]
+
+    with pytest.raises(ProviderStepError, match="porkbun_plan_replacement_failed"):
+        discovery_handlers(tmp_path, Porkbun())["porkbun_discover"](
+            current, action(discovery)
+        )
+
+
+def test_unreadable_evidence_root_is_named_not_collapsed(tmp_path):
+    blocked = tmp_path / "blocked"
+    blocked.write_text("not a directory")
+    current = job()
+    current["plan"] = production_plan(current, FACTS)
+
+    with pytest.raises(ProviderStepError, match="evidence_write_failed"):
+        discovery_handlers(blocked, Porkbun())["porkbun_discover"](
+            current, action(current["plan"]["steps"][0])
+        )
 
 
 def test_registration_requotes_before_the_only_real_mutation(tmp_path):

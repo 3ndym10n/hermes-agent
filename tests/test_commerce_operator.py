@@ -49,6 +49,7 @@ def operator(
     gate_verifiers=None,
     reconcilers=None,
     completion_handler=None,
+    clock=lambda: NOW,
 ) -> CommerceOperator:
     options = dict(
         store=store,
@@ -56,7 +57,7 @@ def operator(
         step_handlers=handlers,
         enabled_fn=enabled,
         lock_path=tmp_path / "worker.lock",
-        clock=lambda: NOW,
+        clock=clock,
         approved_facts_loader=approved_facts_loader,
         gate_verifiers=gate_verifiers,
         reconcilers=reconcilers,
@@ -411,6 +412,131 @@ def test_exception_text_is_never_persisted(tmp_path):
     }
     assert "hunter2" not in str(store.list_events(job["job_id"]))
     assert "hunter2" not in str(actions)
+
+
+RATE_LIMIT_EVIDENCE = {
+    "provider_error_code": "RATE_LIMIT_EXCEEDED",
+    "http_status": 429,
+    "provider_request_id": "req_abc",
+    "retry_after": "2026-08-02T12:15:00Z",
+}
+
+
+def porkbun_step(action_type: str = "porkbun_discover") -> dict:
+    discovery = step("s01_porkbun_discovery", action_type, "read_only")
+    discovery["provider"] = "porkbun"
+    return discovery
+
+
+def test_rate_limited_step_pauses_after_one_attempt_and_defers_early_resume(tmp_path):
+    store = make_store(tmp_path)
+    job = make_job(store)
+    calls: list[str] = []
+    now = [NOW]
+
+    def limited(_job, _action):
+        calls.append("porkbun")
+        raise commerce.ProviderStepError(
+            "porkbun_rate_limited", evidence=dict(RATE_LIMIT_EVIDENCE)
+        )
+
+    def resume():
+        current = store.get_job(job["job_id"])
+        store.resume(
+            job["job_id"],
+            expected_version=int(current["row_version"]),
+            actor="cal",
+            now=now[0],
+        )
+
+    worker = operator(
+        store,
+        tmp_path,
+        planner=lambda _job, _facts: {
+            "provider_account": "porkbun",
+            "steps": [porkbun_step()],
+        },
+        handlers={"porkbun_discover": limited},
+        clock=lambda: now[0],
+    )
+    worker.tick()
+
+    actions = store.list_actions(job["job_id"])
+    assert calls == ["porkbun"]
+    assert len(actions) == 1
+    assert actions[0]["result"] == {
+        "error_code": "porkbun_rate_limited",
+        **RATE_LIMIT_EVIDENCE,
+    }
+    assert store.get_job(job["job_id"])["current_state"] == "paused"
+
+    resume()
+    worker.tick()
+
+    assert calls == ["porkbun"]
+    assert len(store.list_actions(job["job_id"])) == 1
+    assert store.get_job(job["job_id"])["current_state"] == "paused"
+
+    now[0] = datetime(2026, 8, 2, 12, 20, tzinfo=timezone.utc)
+    resume()
+    worker.tick()
+
+    assert calls == ["porkbun", "porkbun"]
+    assert len(store.list_actions(job["job_id"])) == 2
+    assert store.get_job(job["job_id"])["current_state"] == "paused"
+
+
+def test_rate_limit_evidence_carries_no_credentials_or_raw_provider_data(tmp_path):
+    store = make_store(tmp_path)
+    job = make_job(store)
+
+    def limited(_job, _action):
+        error = commerce.ProviderStepError(
+            "porkbun_rate_limited", evidence=dict(RATE_LIMIT_EVIDENCE)
+        )
+        error.args = ("apikey=pk1_live_leak secretapikey=sk1_live_leak {raw body}",)
+        raise error
+
+    operator(
+        store,
+        tmp_path,
+        planner=lambda _job, _facts: {
+            "provider_account": "porkbun",
+            "steps": [porkbun_step()],
+        },
+        handlers={"porkbun_discover": limited},
+    ).tick()
+
+    persisted = str(store.list_actions(job["job_id"])) + str(
+        store.list_events(job["job_id"])
+    )
+    assert "pk1_live_leak" not in persisted
+    assert "sk1_live_leak" not in persisted
+    assert "raw body" not in persisted
+    assert "porkbun_rate_limited" in persisted
+
+
+def test_plan_replacement_failure_is_not_a_generic_provider_step_failure(tmp_path):
+    store = make_store(tmp_path)
+    job = make_job(store)
+
+    def replaces(_job, _action):
+        return {"ok": True, "_replace_plan": {"steps": [{"not": "a step"}]}}
+
+    operator(
+        store,
+        tmp_path,
+        planner=lambda _job, _facts: {
+            "provider_account": "porkbun",
+            "steps": [porkbun_step()],
+        },
+        handlers={"porkbun_discover": replaces},
+    ).tick()
+
+    assert {
+        action["result"]["error_code"] for action in store.list_actions(job["job_id"])
+    } == {"porkbun_plan_replacement_failed"}
+    assert store.get_job(job["job_id"])["current_state"] == "paused"
 
 
 def test_worker_cannot_complete_without_receipt_persistence(tmp_path):

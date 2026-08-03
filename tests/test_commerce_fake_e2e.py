@@ -23,8 +23,10 @@ def test_offline_commerce_acceptance_rehearsal():
     ceiling = report.pop("tick_ceiling")
     assert report == {
         "actions": 15,
+        # The preferred domain is available, so discovery spends exactly one
+        # live availability call instead of walking all ten candidates.
+        "availability_checks": 1,
         "browser_handoffs": 2,
-        "candidate_domains": 10,
         "dns_writes": 3,
         "fake_e2e": "PASS",
         "golden_receipt": "exact",

@@ -680,6 +680,8 @@ class CommerceOperator:
         if step is not None:
             if exhausted and action is None:
                 return self._pause(job, "step_attempts_exhausted")
+            if action is None and self._retry_deferred(job, step):
+                return self._pause(job, "provider_retry_not_due")
             action = action or self._record_action(job, step)
             if action["action_status"] != "planned":
                 return False
@@ -732,6 +734,25 @@ class CommerceOperator:
             return step, active, exhausted
         return None, None, False
 
+    def _retry_deferred(self, job: Mapping[str, Any], step: Mapping[str, Any]) -> bool:
+        """True while a provider-declared retry window on this step is open.
+
+        Read before a *new* attempt is recorded, so an early `/store resume`
+        re-pauses instead of spending one of the three attempts on a request
+        the provider has already said it will reject.
+        """
+
+        for prior in self._step_actions(str(job["job_id"]), step):
+            result = prior.get("result")
+            retry_at = (
+                _parse_time(result.get("retry_after"))
+                if isinstance(result, Mapping)
+                else None
+            )
+            if retry_at is not None and retry_at > self.clock():
+                return True
+        return False
+
     def _record_action(
         self, job: Mapping[str, Any], step: Mapping[str, Any]
     ) -> dict[str, Any]:
@@ -764,6 +785,8 @@ class CommerceOperator:
             return False
         if exhausted and action is None:
             return self._pause(job, "step_attempts_exhausted")
+        if action is None and self._retry_deferred(job, step):
+            return self._pause(job, "provider_retry_not_due")
         action = action or self._record_action(job, step)
         if action["action_status"] != "planned":
             return False
@@ -1074,6 +1097,11 @@ class CommerceOperator:
             result={"error_code": error.code, **error.evidence},
             now=self.clock(),
         )
+        if not uncertain and _parse_time(error.evidence.get("retry_after")) is not None:
+            # A provider retry window is a wait, not a defect. Going back to
+            # `ready` would dispatch attempts two and three inside the same
+            # window and exhaust the step without a single usable retry.
+            return self._pause(job, error.code)
         self.store.transition(
             str(job["job_id"]),
             "uncertain_external_state" if uncertain else "ready",
@@ -1106,15 +1134,26 @@ class CommerceOperator:
         if replacement is not None:
             if not isinstance(replacement, Mapping):
                 raise ProviderStepError("replacement_plan_invalid")
-            normalized = self._normalize_plan(replacement)
-            current = self.store.get_job(str(job["job_id"]))
-            self.store.set_plan(
-                str(job["job_id"]),
-                normalized,
-                expected_version=int(current["row_version"]),
-                actor=WORKER_ACTOR,
-                now=self.clock(),
-            )
+            # Replacing the plan is its own stage. A normalisation or store
+            # failure here is not a provider read failure, and reporting it as
+            # the generic code hid which half of the step actually broke.
+            try:
+                normalized = self._normalize_plan(replacement)
+                current = self.store.get_job(str(job["job_id"]))
+                self.store.set_plan(
+                    str(job["job_id"]),
+                    normalized,
+                    expected_version=int(current["row_version"]),
+                    actor=WORKER_ACTOR,
+                    now=self.clock(),
+                )
+            except Exception:
+                raise ProviderStepError(
+                    _code(
+                        f"{step['provider']}_plan_replacement_failed",
+                        "plan_replacement_failed",
+                    )
+                ) from None
         control: dict[str, Any] = {}
         if human_gate is not None:
             control["human_gate"] = self._normalize_human_gate(human_gate)

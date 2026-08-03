@@ -220,6 +220,55 @@ def test_provider_declared_failure_is_typed(monkeypatch):
     assert error.value.http_status is None
 
 
+def rate_limit_body(**extra) -> bytes:
+    payload = {
+        "status": "ERROR",
+        "message": "too many requests for api key",
+        "code": "RATE_LIMIT_EXCEEDED",
+    }
+    payload.update(extra)
+    return json.dumps(payload).encode("utf-8")
+
+
+def test_rate_limit_keeps_the_safe_retry_facts_and_nothing_else(monkeypatch):
+    routes = {
+        ("POST", "/domain/checkDomain/example.com"): (
+            429,
+            rate_limit_body(ttlRemaining=45, requestId="req_abc-123"),
+            {"X-RateLimit-Reset": "1900000000", "Retry-After": "600"},
+        )
+    }
+    with fake_server(monkeypatch, routes) as client:
+        with pytest.raises(porkbun.PorkbunRateLimitError) as error:
+            client.check_domain("example.com")
+
+    assert error.value.code == "RATE_LIMIT_EXCEEDED"
+    assert error.value.http_status == 429
+    assert error.value.ttl_remaining == 45  # the body wins over Retry-After
+    assert error.value.rate_limit_reset == 1_900_000_000
+    assert error.value.request_id == "req_abc-123"
+    text = str(error.value)
+    assert "too many requests" not in text
+    assert FAKE_API_KEY not in text and FAKE_SECRET_KEY not in text
+
+
+def test_rate_limit_falls_back_to_headers_and_drops_unusable_values(monkeypatch):
+    routes = {
+        ("POST", "/domain/checkDomain/example.com"): (
+            429,
+            rate_limit_body(requestId="req id with spaces"),
+            {"Retry-After": "600", "X-RateLimit-Reset": "soon"},
+        )
+    }
+    with fake_server(monkeypatch, routes) as client:
+        with pytest.raises(porkbun.PorkbunRateLimitError) as error:
+            client.check_domain("example.com")
+
+    assert error.value.ttl_remaining == 600
+    assert error.value.rate_limit_reset is None
+    assert error.value.request_id == ""
+
+
 def test_http_failure_is_typed(monkeypatch):
     routes = {("GET", "/ping"): (503, b"temporarily unavailable")}
     with fake_server(monkeypatch, routes) as client:

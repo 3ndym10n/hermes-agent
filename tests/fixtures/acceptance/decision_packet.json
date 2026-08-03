@@ -29,60 +29,6 @@
       "domain": "warpsupply.com",
       "registration_usd_cents": 1198,
       "renewal_usd_cents": 1425
-    },
-    {
-      "available": true,
-      "domain": "warpsupply.net",
-      "registration_usd_cents": 1198,
-      "renewal_usd_cents": 1550
-    },
-    {
-      "available": true,
-      "domain": "warpsupplygpu.com",
-      "registration_usd_cents": 1198,
-      "renewal_usd_cents": 1425
-    },
-    {
-      "available": true,
-      "domain": "warpsupplyau.com",
-      "registration_usd_cents": 1198,
-      "renewal_usd_cents": 1425
-    },
-    {
-      "available": true,
-      "domain": "warpsupplytech.com",
-      "registration_usd_cents": 1198,
-      "renewal_usd_cents": 1425
-    },
-    {
-      "available": true,
-      "domain": "warpsupplyhardware.com",
-      "registration_usd_cents": 1198,
-      "renewal_usd_cents": 1425
-    },
-    {
-      "available": true,
-      "domain": "getwarpsupply.com",
-      "registration_usd_cents": 1198,
-      "renewal_usd_cents": 1425
-    },
-    {
-      "available": true,
-      "domain": "joinwarpsupply.com",
-      "registration_usd_cents": 1198,
-      "renewal_usd_cents": 1425
-    },
-    {
-      "available": true,
-      "domain": "shopwarpsupply.com",
-      "registration_usd_cents": 1198,
-      "renewal_usd_cents": 1425
-    },
-    {
-      "available": true,
-      "domain": "warpsupplystore.com",
-      "registration_usd_cents": 1198,
-      "renewal_usd_cents": 1425
     }
   ],
   "dry_run": {
